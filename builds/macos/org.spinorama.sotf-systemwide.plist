@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.spinorama.sotf-systemwide</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Applications/sotf-systemwide.app/Contents/MacOS/sotf-systemwide</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>LimitLoadToSessionType</key>
+	<array>
+		<string>Aqua</string>
+	</array>
+	<key>StandardOutPath</key>
+	<string>__SOTF_LOG_DIR__/sotf-systemwide.log</string>
+	<key>StandardErrorPath</key>
+	<string>__SOTF_LOG_DIR__/sotf-systemwide.error.log</string>
+</dict>
+</plist>

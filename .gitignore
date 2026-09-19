@@ -1,0 +1,6 @@
+/target/
+swift/configbar/.build/
+*.snap.new
+*~
+**/*~
+.DS_Store

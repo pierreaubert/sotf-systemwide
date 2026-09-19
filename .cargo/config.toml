@@ -1,0 +1,77 @@
+[env]
+# macOS-specific configuration
+MACOSX_DEPLOYMENT_TARGET = "15.0"
+
+[build]
+rustflags = ["-Ctarget-cpu=native"]
+
+# macOS Apple Silicon (M1-M5) - using Accelerate framework
+[target.aarch64-apple-darwin]
+rustflags = [
+  "-C", 'target-cpu=native',
+  "-C", 'target-feature=+neon',
+  # "-C", "link-arg=-mmacosx-version-min=25.0",
+  "-C", "link-arg=-framework",
+  "-C", "link-arg=Accelerate",
+  "-C", "link-arg=-L /Applications/Xcode.app/Contents/Frameworks",
+  # for clang but why?
+  "-C", "link-arg=-L /opt/homebrew/Cellar/llvm/22.1.8/lib",
+  # link with llvm or sold (commented out - using system default linker)
+  # "-C", "link-arg=-fuse-ld=/opt/homebrew/opt/llvm/bin/ld64.lld",
+  # "-C", "link-arg=-fuse-ld=/usr/local/bin/ld64.sold",
+]
+
+# macOS Intel - using Accelerate framework, untested
+[target.x86_64-apple-darwin]
+rustflags = [
+  "-C", "target-feature=+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2",
+  "-C", "link-arg=-mmacosx-version-min=15.0",
+  "-C", "link-arg=-framework", "-C", "link-arg=Accelerate"
+]
+
+# Linux x86_64 configuration
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+  "-C", "target-feature=+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2",
+]
+
+# Linux ARM64 configuration
+[target.aarch64-unknown-linux-gnu]
+rustflags = [
+  "-C", 'target-feature=+neon',
+]
+
+# Windows MSVC x86_64 configuration. No native deps -- nlopt was the only
+# vcpkg-provided lib and cobyla is pure Rust now. Default CRT linkage
+# (dynamic) is fine; the MSIX declares the VCLibs framework dependency.
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+  "-C", "target-feature=+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2",
+]
+
+# Windows MSVC ARM configuration.
+[target.aarch64-pc-windows-msvc]
+rustflags = [
+  "-C", 'target-feature=+neon',
+]
+
+# Windows GNU x86_64 configuration, untested
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+]
+
+# Linux x86_64 musl configuration (static linking)
+[target.x86_64-unknown-linux-musl]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "target-feature=+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2",
+]
+
+# Linux ARM64 musl configuration (static linking)
+[target.aarch64-unknown-linux-musl]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "target-feature=+neon",
+]
+
+
