@@ -40,7 +40,7 @@ require_arm64() {
 
 test_rust_common() {
     phase "driver-common tests"
-    cargo test --locked -p driver-common
+    cargo test --locked --manifest-path ../sotf-daw/Cargo.toml -p driver-common
 
     phase "sotf-daemon tests (including real local IPC)"
     cargo test --locked -p sotf-daemon
@@ -50,14 +50,20 @@ test_macos() {
     require_platform Darwin
 
     phase "macOS HAL Rust tests"
-    cargo test --locked -p driver-hal
+    cargo test --locked --manifest-path ../sotf-daw/Cargo.toml -p driver-hal
 
     test_rust_common
 
     phase "strict Rust lint"
     cargo clippy --locked \
+        --manifest-path ../sotf-daw/Cargo.toml \
         -p driver-common \
         -p driver-hal \
+        --all-targets \
+        --no-deps \
+        -- \
+        -D warnings
+    cargo clippy --locked \
         -p sotf-daemon \
         --all-targets \
         --no-deps \
@@ -100,14 +106,20 @@ test_linux() {
     require_arm64
 
     phase "portable HAL streaming regression tests"
-    cargo test --locked -p driver-hal --test streaming_regression_tests
+    cargo test --locked --manifest-path ../sotf-daw/Cargo.toml -p driver-hal --test streaming_regression_tests
 
     test_rust_common
 
     phase "strict Rust lint"
     cargo clippy --locked \
+        --manifest-path ../sotf-daw/Cargo.toml \
         -p driver-common \
         -p driver-hal \
+        --all-targets \
+        --no-deps \
+        -- \
+        -D warnings
+    cargo clippy --locked \
         -p sotf-daemon \
         --all-targets \
         --no-deps \

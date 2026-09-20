@@ -1,6 +1,119 @@
-/target/
-swift/configbar/.build/
-*.snap.new
-*~
-**/*~
+# rust
+target
+target-static
+coverage
+mutants.out
+fuzzer_output
+
+# installers
+/appimage-builder-*
+/dist
+/.docker-target
+/tools
+
+# signing certificates (NEVER commit private keys), remove everything that looks like a .env
+/certs/
+.env
+
+# dont let claude and friends change git config
+/.git/config
+.git-index-*
+
+# marketing/product/insights ...
+/product
+
+# python
+__pycache__
+/venv
+/.venv
+/.ruff_cache
+
+# generated data
+/data
+/data_cached
+/data_generated
+/*.csv
+/*.html
+!/ui-plugins.html
+!/ui-listening.html
+!/ui-pages.html
+!/ui-recording.html
+!/ui-roomeq.html
+!/ui-headphoneeq.html
+!/ui-spinoramaeq.html
+!/ui-autoeq.html
+!/ui-plugin-graph.html
+!/ui-spectrum.html
+!/ui-specialist-screens.html
+/*.json
+/*.wav
+/*.json.bz2
+/todos.md
+/reviews
+.r2factor
+*.bak
+
+# node
+/site/node_modules
+/site/dist
+.sass-cache
+
+# docs
+.jekyll-cache
+.jekyll-metadata
+_site
+/README.html
+/README_files
+
+# MCP and Agents
+/.chunkhound
+autoeq_*.html
+autoeq_*.png
+bugs.md
+src/unused.rs
+/plans
+check_output_*.txt
+/.claude/worktrees/
+/.worktrees/
+/.tokensave
+/.qwen
+/.opencode
+/.superpowers
+/docs/superpowers
+
+# Logs
+logs
+*.log
+/*.csv
+/*.wav
+
+
+# Editor directories and files
+/.vs
+/.vscode/*
+/.zed
+/.idea
+/.fleet
 .DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+vendor
+TAGS
+ETAGS
+CTAGS
+*~
+.*~
+*#
+.#*
+.idea
+
+/roadmap-*.md
+.clauge-worktrees/
+.worktrees/
+
+# Terminal UI design proposals
+!/ui-tui.html
+!/ui-tui-*.html

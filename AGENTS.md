@@ -44,7 +44,9 @@ Clients: Swift menubar app (`configbar/`), GPUI configbar, CLI tools.
 
 ## Dependencies
 
-- `sotf-plugins`, `sotf-engine` -- audio processing
+- `sotf-plugins`, `sotf-engine` -- audio processing (from `../sotf-daw`)
+- `sotf-player` -- playback/library logic (from `../sotf`)
+- `driver-common`, `driver-hal` -- driver transport (from `../sotf-daw`)
 - `cpal` -- audio output
 - `memmap2`, `chacha20poly1305` -- shared memory + encryption (driver-hal)
 - `std::thread`, `parking_lot` -- daemon client handlers, polling, and state synchronization
@@ -54,16 +56,16 @@ Clients: Swift menubar app (`configbar/`), GPUI configbar, CLI tools.
 ```bash
 just test-systemwide-macos          # full macOS gate (scripts/test-systemwide.sh)
 just systemwide-lab                 # isolated daemon/HAL lab, no installed HAL bundle
-cargo test -p driver-common --lib
-cargo test -p driver-hal --lib
+cargo test --manifest-path ../sotf-daw/Cargo.toml -p driver-common --lib
+cargo test --manifest-path ../sotf-daw/Cargo.toml -p driver-hal --lib
 cargo check -p sotf-daemon && cargo clippy -p sotf-daemon
 ```
 
-SOTF crates (`sotf-engine`, `sotf-player`, `sotf-plugins`) resolve via
-`../sotf` path dependencies, so this repo builds inside the `all_of_sotf`
-sibling layout. `cargo` commands with `--locked` need a `Cargo.lock` first;
-it is generated on the first full resolve (any `cargo build`/`test`) once the
-sotf-side split is applied.
+SOTF crates resolve via `../sotf` (`sotf-player`) and `../sotf-daw`
+(`sotf-engine`, `sotf-plugins`, drivers) path dependencies, so this repo
+builds inside the `all_of_sotf` sibling layout. `cargo` commands with
+`--locked` need a `Cargo.lock` first; it is generated on the first full
+resolve (any `cargo build`/`test`).
 
 ## Security
 

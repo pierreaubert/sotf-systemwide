@@ -1,9 +1,9 @@
 # --------------------------------------------------------- -*- just -*-
 # sotf-systemwide: OS audio capture, plugin-chain processing, hardware output.
 #
-# SOTF crates (sotf-engine, sotf-player, sotf-plugins) are taken from the
-# sibling `sotf` checkout: a standalone clone of this repo needs `../sotf`
-# next to it (the all_of_sotf layout).
+# SOTF crates are taken from the sibling `sotf` (sotf-player) and `sotf-daw`
+# (sotf-engine, sotf-plugins, drivers) checkouts: a standalone clone of this
+# repo needs both next to it (the all_of_sotf layout).
 # ----------------------------------------------------------------------
 
 _default:
@@ -38,8 +38,8 @@ systemwide-lab:
 	cargo test -p sotf-daemon --bin sotf-daemon testkit
 	cargo test -p sotf-daemon --test daemon_state_tests
 	cargo test -p sotf-daemon --features hal --test ipc_line_tests -- --test-threads=1
-	cargo test -p driver-hal --lib
-	cargo test -p driver-hal --test streaming_regression_tests
+	cargo test --manifest-path ../sotf-daw/Cargo.toml -p driver-hal --lib
+	cargo test --manifest-path ../sotf-daw/Cargo.toml -p driver-hal --test streaming_regression_tests
 	swift test --package-path swift/configbar --scratch-path target/configbar-swiftpm
 
 # ----------------------------------------------------------------------

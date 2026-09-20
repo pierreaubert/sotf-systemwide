@@ -1,7 +1,5 @@
 [workspace]
 members = [
-    "crates/driver-common",
-    "crates/driver-hal",
     "crates/daemon",
 ]
 resolver = "3"
@@ -51,15 +49,21 @@ cpal = "0.17"
 objc2-core-audio = { version = "0.3", default-features = false }
 objc2-core-foundation = { version = "0.3", default-features = false }
 
-# SOTF crates live in the sibling `sotf` checkout (all_of_sotf layout).
-# A standalone clone of this repo needs `../sotf` next to it.
-sotf-engine = { path = "../sotf/crates/sotf-engine", default-features = false }
+# SOTF crates live in the sibling `sotf` and `sotf-daw` checkouts
+# (all_of_sotf layout). A standalone clone of this repo needs both next to it.
+sotf-engine = { path = "../sotf-daw/crates/sotf-engine", default-features = false }
 sotf-player = { path = "../sotf/crates/sotf-player" }
-sotf-plugins = { path = "../sotf/crates/sotf-plugins", default-features = false }
+sotf-plugins = { path = "../sotf-daw/crates/sotf-plugins", default-features = false }
 
-# Local crates
-driver-common = { path = "crates/driver-common" }
-driver-hal = { path = "crates/driver-hal" }  # macOS only
+# Driver transport lives in sotf-daw.
+driver-common = { path = "../sotf-daw/crates/driver-common" }
+driver-hal = { path = "../sotf-daw/crates/driver-hal" }  # macOS only
+
+# Same vendored forks as sotf/sotf-daw: daemon builds daw crates (denoiser,
+# engine) that rely on the fork API. Paths relative to this workspace root.
+[patch.crates-io]
+nnnoiseless = { path = "../sotf/crates/3rdparties/nnnoiseless" }
+coreaudio-rs = { path = "../sotf/crates/3rdparties/coreaudio-rs" }
 
 [profile.dev]
 opt-level = 1
