@@ -39,7 +39,7 @@ systemwide-lab:
 	cargo test -p sotf-daemon --test daemon_state_tests
 	cargo test -p sotf-daemon --features hal --test ipc_line_tests -- --test-threads=1
 	cargo test --manifest-path ../sotf-daw/Cargo.toml -p driver-hal --lib
-	cargo test --manifest-path ../sotf-daw/Cargo.toml -p driver-hal --test streaming_regression_tests
+	cargo test -p sotf-daemon --test hal_driver_contract_tests
 	swift test --package-path swift/configbar --scratch-path target/configbar-swiftpm
 
 # ----------------------------------------------------------------------
@@ -49,6 +49,48 @@ systemwide-lab:
 [group('lint')]
 lint:
 	cargo clippy --workspace --all-targets --no-deps -- -- -D warnings
+
+# ----------------------------------------------------------------------
+# QA (same target name as sotf: lint + tests + the isolated macOS lab)
+# ----------------------------------------------------------------------
+
+# The lab never installs or touches the machine-wide CoreAudio HAL bundle
+# (see systemwide-lab above); other platforms run lint + tests only.
+[group('qa')]
+[macos]
+qa: lint test systemwide-lab
+
+[group('qa')]
+[linux]
+qa: lint test
+
+[group('qa')]
+[windows]
+qa: lint test
+
+# ----------------------------------------------------------------------
+# COVERAGE (same target names as sotf)
+# ----------------------------------------------------------------------
+
+# Requires: cargo install cargo-llvm-cov
+[group('coverage')]
+coverage:
+	cargo llvm-cov --workspace --lib --bins --tests --examples --lcov --output-path target/lcov.info
+
+# Generates an HTML coverage report and opens it.
+[group('coverage')]
+coverage-html:
+	cargo llvm-cov --workspace --lib --bins --tests --examples --html --open
+
+# Prints a text summary to stdout (fastest coverage recipe).
+[group('coverage')]
+coverage-summary:
+	cargo llvm-cov --workspace --lib --bins --tests --examples --text --summary-only
+
+# Removes stale coverage artifacts.
+[group('coverage')]
+coverage-clean:
+	cargo llvm-cov clean
 
 # ----------------------------------------------------------------------
 # FORMAT

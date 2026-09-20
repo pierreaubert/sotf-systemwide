@@ -106,7 +106,7 @@ test_linux() {
     require_arm64
 
     phase "portable HAL streaming regression tests"
-    cargo test --locked --manifest-path ../sotf-daw/Cargo.toml -p driver-hal --test streaming_regression_tests
+    cargo test --locked -p sotf-daemon --test hal_driver_contract_tests
 
     test_rust_common
 
