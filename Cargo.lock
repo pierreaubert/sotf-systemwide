@@ -5793,7 +5793,7 @@ dependencies = [
 
 [[package]]
 name = "sotf-plugins"
-version = "0.1.0"
+version = "0.7.14"
 dependencies = [
  "anyhow",
  "arc-swap",

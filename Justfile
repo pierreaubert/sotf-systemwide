@@ -48,7 +48,7 @@ systemwide-lab:
 
 [group('lint')]
 lint:
-	cargo clippy --workspace --all-targets --no-deps -- -- -D warnings
+	cargo clippy --workspace --all-targets --no-deps -- -D warnings
 
 # ----------------------------------------------------------------------
 # QA (same target name as sotf: lint + tests + the isolated macOS lab)
