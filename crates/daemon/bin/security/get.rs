@@ -8,6 +8,10 @@ use std::path::PathBuf;
 /// On macOS, $TMPDIR is per-user and already secured.
 /// On Linux, $XDG_RUNTIME_DIR provides similar isolation.
 /// Fallback uses UID in the path.
+///
+/// On Windows this names the loopback port file instead of a socket; see
+/// `ipc_transport::windows_socket_path_from_env`.
+#[cfg(unix)]
 pub fn get_secure_socket_path() -> PathBuf {
     secure_socket_path_from_env(
         std::env::var_os("SOTF_DAEMON_SOCKET_PATH"),
@@ -15,6 +19,19 @@ pub fn get_secure_socket_path() -> PathBuf {
         std::env::var_os("TMPDIR"),
         std::env::var_os("XDG_RUNTIME_DIR"),
         get_current_uid(),
+    )
+}
+
+/// Get the Windows per-user IPC path (loopback port-file location).
+///
+/// Priority: explicit `SOTF_DAEMON_SOCKET_PATH`, then
+/// `SOTF_SYSTEMWIDE_RUNTIME_DIR`, then `%LOCALAPPDATA%\sotf\daemon.sock`.
+#[cfg(windows)]
+pub fn get_secure_socket_path() -> PathBuf {
+    crate::ipc_transport::windows_socket_path_from_env(
+        std::env::var_os("SOTF_DAEMON_SOCKET_PATH"),
+        std::env::var_os("SOTF_SYSTEMWIDE_RUNTIME_DIR"),
+        std::env::var_os("LOCALAPPDATA"),
     )
 }
 

@@ -65,6 +65,9 @@ driver-hal = { path = "../sotf-daw/crates/driver-hal" }  # macOS only
 nnnoiseless = { path = "../sotf/crates/3rdparties/nnnoiseless" }
 coreaudio-rs = { path = "../sotf/crates/3rdparties/coreaudio-rs" }
 
+[workspace.lints.clippy]
+perf = { level = "warn", priority = -1 }
+
 [profile.dev]
 opt-level = 1
 split-debuginfo = "packed"

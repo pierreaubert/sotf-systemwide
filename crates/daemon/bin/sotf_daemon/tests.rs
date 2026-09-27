@@ -45,6 +45,7 @@ use sotf_audio::engine::{PluginGraphConfig, PluginGraphEdgeConfig, PluginGraphNo
 use sotf_audio::manager::AudioEngineManager;
 use sotf_audio::plugins::PluginType;
 use std::io::{BufRead, BufReader, Cursor, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
@@ -788,6 +789,8 @@ mod ipc_safety_tests {
         let source = include_str!("audio_daemon.rs");
         assert!(source.contains("set_read_timeout(Some(std::time::Duration::from_secs("));
         assert!(source.contains("IPC_CLIENT_IDLE_TIMEOUT_SECS"));
+        assert!(source.contains("set_write_timeout(Some(std::time::Duration::from_secs("));
+        assert!(source.contains("IPC_CLIENT_WRITE_TIMEOUT_SECS"));
         assert!(source.contains("std::io::ErrorKind::TimedOut"));
         assert!(source.contains("Closing idle IPC client after read timeout"));
     }
@@ -1021,8 +1024,32 @@ mod ipc_safety_tests {
         }
     }
 
+    /// Connected IPC test pair: `UnixStream::pair` on Unix, loopback TCP
+    /// accept on Windows. Keeps `handle_client` round-trip tests portable.
+    #[cfg(unix)]
+    fn ipc_test_pair() -> (
+        crate::ipc_transport::IpcStream,
+        crate::ipc_transport::IpcStream,
+    ) {
+        UnixStream::pair().expect("unix stream pair")
+    }
+
+    /// Connected IPC test pair: `UnixStream::pair` on Unix, loopback TCP
+    /// accept on Windows. Keeps `handle_client` round-trip tests portable.
+    #[cfg(windows)]
+    fn ipc_test_pair() -> (
+        crate::ipc_transport::IpcStream,
+        crate::ipc_transport::IpcStream,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("test listener addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect test client");
+        let (server, _) = listener.accept().expect("accept test client");
+        (client, server)
+    }
+
     fn send_owner_ipc_command(daemon: &AudioDaemon, raw: &str) -> serde_json::Value {
-        let (mut client, server) = UnixStream::pair().expect("unix stream pair");
+        let (mut client, server) = ipc_test_pair();
         let daemon = daemon.clone();
         let handle = std::thread::spawn(move || daemon.handle_client(server, PeerClass::Owner));
 

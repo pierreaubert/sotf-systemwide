@@ -1,6 +1,7 @@
 use driver_common::DriverStatus;
 use serde_json::Value;
 use sotf_audio::PluginConfig;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
 /// Process-lifetime locks serialize ownership of every runtime resource that
@@ -483,6 +484,10 @@ pub(super) fn build_driver_plugin_graph(
 /// 4. Retry `bind` once after a successful unlink. If a racing process
 ///    re-creates the entry between unlink and bind, the second bind
 ///    fails and we return the error to the caller (no infinite retry).
+///
+/// Unix-only. On Windows the daemon binds a loopback TCP listener instead;
+/// see `crate::ipc_transport::bind_windows_listener`.
+#[cfg(unix)]
 pub(super) fn bind_unix_socket(socket_path: &std::path::Path) -> std::io::Result<UnixListener> {
     match UnixListener::bind(socket_path) {
         Ok(l) => Ok(l),
@@ -514,6 +519,10 @@ pub(super) fn bind_unix_socket(socket_path: &std::path::Path) -> std::io::Result
 
 /// Return true iff `path` is a Unix-domain socket (lstat, does NOT
 /// follow symlinks).
+///
+/// Unix-only. On Windows the daemon uses a port file instead; see
+/// `crate::ipc_transport::windows_port_file_is_live`.
+#[cfg(unix)]
 pub(super) fn socket_is_unix_socket(path: &std::path::Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
     match std::fs::symlink_metadata(path) {
@@ -678,9 +687,10 @@ pub(super) fn list_audio_devices() -> Result<Vec<serde_json::Value>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_daemon_instance_lock, bind_unix_socket, socket_is_unix_socket,
-        startup_error_is_device_availability, wait_for_output_device,
+        acquire_daemon_instance_lock, startup_error_is_device_availability, wait_for_output_device,
     };
+    #[cfg(unix)]
+    use super::{bind_unix_socket, socket_is_unix_socket};
     use std::fs;
     use tempfile::tempdir;
 
@@ -727,6 +737,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn bind_unix_socket_accepts_a_fresh_path_and_reports_socket_type() {
         let directory = tempdir().expect("create temporary directory");
@@ -737,6 +748,7 @@ mod tests {
         drop(listener);
     }
 
+    #[cfg(unix)]
     #[test]
     fn bind_unix_socket_rejects_a_live_daemon_without_unlinking_it() {
         let directory = tempdir().expect("create temporary directory");
@@ -749,6 +761,7 @@ mod tests {
         drop(listener);
     }
 
+    #[cfg(unix)]
     #[test]
     fn bind_unix_socket_rejects_regular_files_without_removing_them() {
         let directory = tempdir().expect("create temporary directory");
@@ -780,6 +793,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn bind_unix_socket_reclaims_a_stale_socket_only() {
         let directory = tempdir().expect("create temporary directory");

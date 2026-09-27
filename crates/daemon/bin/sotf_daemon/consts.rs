@@ -14,6 +14,10 @@ pub(super) const MAX_IPC_COMMAND_BYTES: usize = 64 * 1024;
 
 pub(super) const IPC_CLIENT_IDLE_TIMEOUT_SECS: u64 = 5;
 
+/// Bound how long an IPC response write may block on a slow or dead client.
+/// Without this, one wedged peer pins a client slot and handler thread.
+pub(super) const IPC_CLIENT_WRITE_TIMEOUT_SECS: u64 = 5;
+
 /// Bound the number of blocking client handlers created by the accept loop.
 /// A client can remain connected for the idle timeout, so unbounded thread
 /// creation would otherwise let local connection churn exhaust resources.

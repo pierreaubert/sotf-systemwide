@@ -1,21 +1,23 @@
 //! Audio Engine Control Daemon
 //!
-//! A Unix socket daemon that provides IPC control for the AudioEngineManager.
+//! An IPC daemon that provides control for the AudioEngineManager.
 //! This allows external processes (like the Swift menubar app or GPUI configbar)
-//! to control audio playback, query status, and configure plugins via JSON messages
-//! over a Unix domain socket.
+//! to control audio playback, query status, and configure plugins via JSON messages.
 //!
-//! Protocol: JSON messages over Unix socket (one JSON object per line)
+//! Protocol: JSON messages (one JSON object per line) over a Unix domain
+//! socket on Unix and a loopback TCP listener on Windows (see `ipc_transport`).
 //!
 //! The daemon is cross-platform:
 //! - macOS: Uses CoreAudio HAL driver for system audio capture
-//! - Linux: Will use PipeWire filter node (future)
-//! - Windows: Will use APO + shared memory (future)
+//! - Linux: Uses the cpal capture driver (PipeWire monitor source)
+//! - Windows: Uses the cpal capture driver (WASAPI capture endpoint)
 //! - Fallback: NullDriver (no capture, status-only)
 
 use std::sync::Arc;
 
+mod cpal_capture;
 mod driver_manager;
+mod ipc_transport;
 mod lock_order;
 mod plugin_artifact;
 mod security;
@@ -161,9 +163,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if status.platform_supported && status.driver_installed {
                     println!();
                     println!("Audio flow (capture mode):");
+                    // The HAL build moves audio through the encrypted shared
+                    // memory transport; cpal/NullDriver builds capture
+                    // straight from the input device.
+                    #[cfg(all(target_os = "macos", feature = "hal"))]
                     println!(
                         "   System Audio -> Driver -> SharedMemory -> Daemon -> cpal -> Hardware"
                     );
+                    #[cfg(not(all(target_os = "macos", feature = "hal")))]
+                    println!("   Input Device -> Driver -> Daemon -> Hardware");
                 }
             }
             Err(e) => {

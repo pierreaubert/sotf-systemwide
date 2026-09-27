@@ -10,11 +10,13 @@ use super::device_registry::DeviceRegistry;
 use super::driver_manager::{DriverManager, get_driver_status};
 use super::loudness::loudness_data_to_json;
 use super::loudness::loudness_info_to_json;
+#[cfg(unix)]
 use super::misc::bind_unix_socket;
 use super::misc::build_driver_plugin_chain;
 use super::misc::elevate_daemon_thread_to_audio_work;
 use super::misc::is_safe_output_device_name;
 use super::misc::push_metering_faults;
+#[cfg(unix)]
 use super::misc::socket_is_unix_socket;
 use super::misc::transport_snapshot_and_faults;
 use super::output_profiles::{OutputProfile, OutputProfileStore, StartupChain};
@@ -36,6 +38,11 @@ use super::systemwide_state::SystemwideState;
 use super::types::IpcLine;
 use super::types::PipelinePlan;
 use super::types::read_ipc_line_bounded;
+use crate::ipc_transport::IpcStream;
+#[cfg(windows)]
+use crate::ipc_transport::bind_windows_listener;
+#[cfg(windows)]
+use crate::ipc_transport::windows_port_file_is_live as socket_is_unix_socket;
 use driver_common::DriverConfig;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -47,7 +54,6 @@ use sotf_audio::plugins::PluginType;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Write};
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -3307,11 +3313,16 @@ impl SystemwideController {
         }
     }
 
-    pub(super) fn handle_client(&self, mut stream: UnixStream, peer_class: PeerClass) {
+    pub(super) fn handle_client(&self, mut stream: IpcStream, peer_class: PeerClass) {
         if let Err(e) = stream.set_read_timeout(Some(std::time::Duration::from_secs(
             super::consts::IPC_CLIENT_IDLE_TIMEOUT_SECS,
         ))) {
             log::warn!("Failed to set IPC client idle timeout: {}", e);
+        }
+        if let Err(e) = stream.set_write_timeout(Some(std::time::Duration::from_secs(
+            super::consts::IPC_CLIENT_WRITE_TIMEOUT_SECS,
+        ))) {
+            log::warn!("Failed to set IPC client write timeout: {}", e);
         }
         let reader_stream = match stream.try_clone() {
             Ok(s) => s,
@@ -3428,14 +3439,21 @@ impl SystemwideController {
         // Start driver config watcher thread
         let config_watcher = self.spawn_driver_config_watcher();
 
-        // Bind the socket. To avoid a TOCTOU race window between an
-        // existence check and a follow-up unlink (which would allow a
-        // same-UID hostile actor to swap in their own socket or unrelated
-        // file at the path), we try `bind()` first and only fall back to
-        // unlinking when we have positively confirmed the existing entry
-        // is a stale `AF_UNIX` socket -- never a regular file, FIFO, or
-        // symlink. See `bind_unix_socket` below for the full strategy.
+        // Bind the IPC transport. On Unix this is an `AF_UNIX` socket with
+        // a TOCTOU-safe stale-socket discipline (try `bind()` first, only
+        // unlink a positively confirmed stale socket -- never a regular
+        // file, FIFO, or symlink; see `bind_unix_socket`). On Windows it is
+        // a loopback TCP listener whose OS-assigned port is published in
+        // the port file at `socket_path` (see `bind_windows_listener`).
+        #[cfg(unix)]
         let listener = bind_unix_socket(&socket_path).map_err(|error| {
+            format!(
+                "failed to bind daemon socket {}: {error}",
+                socket_path.display()
+            )
+        })?;
+        #[cfg(windows)]
+        let listener = bind_windows_listener(&socket_path).map_err(|error| {
             format!(
                 "failed to bind daemon socket {}: {error}",
                 socket_path.display()
@@ -3458,7 +3476,7 @@ impl SystemwideController {
         listener.set_nonblocking(true)?;
         let initial_playback_thread = self.spawn_initial_driver_playback();
         let active_clients = Arc::new(AtomicUsize::new(0));
-        let mut client_threads: Vec<(std::thread::JoinHandle<()>, UnixStream)> = Vec::new();
+        let mut client_threads: Vec<(std::thread::JoinHandle<()>, IpcStream)> = Vec::new();
 
         loop {
             if !*self.running.lock() {

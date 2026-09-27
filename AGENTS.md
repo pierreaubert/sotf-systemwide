@@ -4,7 +4,7 @@ System-wide audio processing subsystem: OS audio capture, plugin-chain processin
 
 ## Purpose
 
-Provides a background daemon (`sotf-daemon`) that intercepts system audio via a platform driver, runs it through the SOTF plugin chain, and outputs to physical devices. External GUIs control it over a Unix socket with JSON messages.
+Provides a background daemon (`sotf-daemon`) that intercepts system audio via a platform driver, runs it through the SOTF plugin chain, and outputs to physical devices. External GUIs control it over a Unix socket (loopback TCP on Windows) with JSON messages.
 
 ## Sub-crates
 
@@ -19,6 +19,8 @@ Provides a background daemon (`sotf-daemon`) that intercepts system audio via a 
 - `driver_common::DriverStatus` / `DriverConfig` / `ConfigResult` -- driver status and configuration
 - `driver_hal::HalInputReader` / `HalOutputWriter` -- shared-memory reader/writer (macOS)
 - `daemon::DriverManager` -- runtime driver lifecycle management
+- `daemon::CpalCaptureDriver` -- cpal input capture for Linux/Windows (bounded queue, drop-oldest on overflow)
+- `daemon::ipc_transport` -- `IpcStream`/`IpcListener` aliases (Unix socket vs loopback TCP) plus bounded dials; per-client read-idle (5s) and write (5s) timeouts
 
 ## Data flow
 
@@ -26,11 +28,14 @@ Provides a background daemon (`sotf-daemon`) that intercepts system audio via a 
 OS audio apps → Swift HAL Driver → shared memory → daemon (read) → plugin chain → daemon (write) → shared memory → HAL Driver → physical output
 ```
 
-On non-macOS platforms, `NullDriver` is used and capture is inactive.
+On Linux/Windows the daemon captures through the cpal-backed driver
+(`SOTF_CAPTURE_DEVICE` selects the endpoint, default input otherwise);
+`NullDriver` remains as the status-only fallback (`SOTF_SYSTEMWIDE_DRIVER=null`).
 
 ## IPC
 
-The daemon listens on a Unix socket. Protocol: one JSON object per line.
+The daemon listens on a Unix socket (macOS/Linux) or a loopback TCP listener
+with a port file at the same per-user path (Windows). Protocol: one JSON object per line.
 
 Commands include: `load_plugins`, `get_status`, `set_volume`, `stop`.
 
@@ -38,9 +43,10 @@ Clients: Swift menubar app (`configbar/`), GPUI configbar, CLI tools.
 
 ## Platform notes
 
-- macOS: requires `--features hal` for real audio capture
-- Linux/Windows: planned (PipeWire, APO), `AudioDriver` trait is ready
-- All platforms: daemon compiles and runs with `NullDriver`
+- macOS: requires `--features hal` for HAL audio capture
+- Linux: cpal capture driver (PipeWire monitor source via default input)
+- Windows: cpal capture driver (WASAPI capture endpoint; render-endpoint loopback is not exposed via cpal -- system-audio capture needs a virtual-cable device via `SOTF_CAPTURE_DEVICE`)
+- All platforms: daemon compiles and runs; `NullDriver` is the status-only fallback
 
 ## Dependencies
 
@@ -71,5 +77,5 @@ resolve (any `cargo build`/`test`).
 
 - Per-user shared memory path (`/tmp/sotf-{uid}/`)
 - Audio data encrypted in shared memory (ChaCha20-Poly1305)
-- Unix socket peer credential verification
+- Peer credential verification: `SO_PEERCRED` (Linux), `getpeereid` (macOS), loopback-only (Windows)
 - Secure socket directory permissions

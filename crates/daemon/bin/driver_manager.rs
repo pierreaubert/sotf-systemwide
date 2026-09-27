@@ -1,9 +1,11 @@
 //! Platform Audio Driver Manager
 //!
 //! Manages the lifecycle of the platform-specific audio capture driver.
-//! On macOS, uses the CoreAudio HAL driver. On Linux (future), PipeWire.
-//! On Windows (future), APO. Falls back to NullDriver when no driver is available.
+//! On macOS with the `hal` feature, uses the CoreAudio HAL driver. On Linux
+//! and Windows, uses the `cpal`-backed capture driver (PipeWire monitor /
+//! WASAPI capture). Falls back to NullDriver when no driver is available.
 
+use crate::cpal_capture::CpalCaptureDriver;
 use driver_common::{AudioDriver, ConfigResult, DriverConfig, DriverError, DriverStatus};
 
 const DRIVER_OVERRIDE_ENV: &str = "SOTF_SYSTEMWIDE_DRIVER";
@@ -105,6 +107,10 @@ fn create_platform_driver_for_choice(choice: Option<&str>) -> Box<dyn AudioDrive
             );
             return Box::new(driver_common::NullDriver::new());
         }
+        Some(choice) if choice == "cpal" => {
+            log::info!("[DriverManager] Forcing cpal capture driver via {DRIVER_OVERRIDE_ENV}");
+            return Box::new(CpalCaptureDriver::new());
+        }
         Some(choice) if !choice.is_empty() => {
             log::warn!(
                 "[DriverManager] Ignoring unknown {}={}",
@@ -121,13 +127,14 @@ fn create_platform_driver_for_choice(choice: Option<&str>) -> Box<dyn AudioDrive
         return Box::new(driver_hal::HalDriver::new());
     }
 
-    // Future: Linux PipeWire driver
-    // #[cfg(all(target_os = "linux", feature = "pipewire"))]
-    // { return Box::new(driver_linux::PipeWireDriver::new()); }
-
-    // Future: Windows APO driver
-    // #[cfg(all(target_os = "windows", feature = "apo"))]
-    // { return Box::new(driver_windows::WindowsDriver::new()); }
+    // Linux/Windows capture through cpal input streams (PipeWire monitor /
+    // WASAPI capture). The driver degrades to installed=false when no input
+    // device exists, so headless machines keep status-only behavior.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        log::info!("[DriverManager] Creating cpal capture driver");
+        return Box::new(CpalCaptureDriver::new());
+    }
 
     #[allow(unreachable_code)]
     {
@@ -314,13 +321,29 @@ mod tests {
     fn test_driver_manager_creation() {
         let manager = DriverManager::new();
         let status = manager.status();
-        // On macOS with hal feature, platform_supported should be true
-        // On other platforms, NullDriver returns false
-        #[cfg(all(target_os = "macos", feature = "hal"))]
+        // macOS+hal selects the HAL driver, Linux/Windows select the cpal
+        // capture driver; both report platform support. Other configurations
+        // fall back to NullDriver.
+        #[cfg(any(
+            all(target_os = "macos", feature = "hal"),
+            target_os = "linux",
+            target_os = "windows"
+        ))]
         assert!(status.platform_supported);
-        #[cfg(not(all(target_os = "macos", feature = "hal")))]
+        #[cfg(not(any(
+            all(target_os = "macos", feature = "hal"),
+            target_os = "linux",
+            target_os = "windows"
+        )))]
         assert!(!status.platform_supported);
         let _ = status;
+    }
+
+    #[test]
+    fn driver_override_can_force_cpal_capture_driver() {
+        let driver = create_platform_driver_for_choice(Some("cpal"));
+        let status = driver.status();
+        assert!(status.platform_supported);
     }
 
     #[test]

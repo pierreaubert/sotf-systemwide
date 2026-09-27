@@ -6,12 +6,12 @@ dyld_fallback_library_path := '/Applications/Xcode.app/Contents/Framework'
 
 [group('build-macos')]
 prod-hal:
-	cargo build --release -p driver-hal
+	{{cargo}} build --release -p driver-hal
 
 # Build the sotf-daemon binary (macOS with HAL support)
 [group('build-macos')]
 prod-daemon:
-	cargo build --release -p sotf-daemon --features hal
+	{{cargo}} build --release -p sotf-daemon --features hal
 
 # Build the SotF Systemwide Swift app
 [group('build-macos')]
@@ -84,7 +84,7 @@ test-hal-driver-swift:
 	BUILD_DIR="target/debug/SotFHALTests.bundle"
 	mkdir -p "$BUILD_DIR/Contents/MacOS" "$BUILD_DIR/Contents/Resources"
 	WORKER_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
-	cargo build -p driver-hal --features swift-stress-worker --bin hal-transport-worker
+	{{cargo}} build -p driver-hal --features swift-stress-worker --bin hal-transport-worker
 	if [[ "$WORKER_TARGET_DIR" = /* ]]; then
 		WORKER_PATH="$WORKER_TARGET_DIR/debug/hal-transport-worker"
 	else
@@ -129,7 +129,7 @@ prod-macos-daemon: prod-daemon prod-systemwide prod-hal-driver
 
 [group('dist')]
 dist-daemon:
-	cargo build --profile dist -p sotf-daemon --features hal
+	{{cargo}} build --profile dist -p sotf-daemon --features hal
 
 [group('dist')]
 dist-systemwide:

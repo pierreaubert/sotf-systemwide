@@ -1,20 +1,43 @@
 //! End-to-end IPC round-trip tests for the sotf-daemon binary.
 //!
-//! These tests spawn the daemon as a subprocess with the null HAL driver and a
-//! private Unix socket, then send JSON commands and verify JSON responses.
-//! They do not require a real audio capture driver.
-
-#![cfg(unix)]
+//! These tests spawn the daemon as a subprocess with the null HAL driver and
+//! a private IPC endpoint, then send JSON commands and verify JSON
+//! responses. They do not require a real audio capture driver.
+//!
+//! The endpoint is `SOTF_DAEMON_SOCKET_PATH` on every platform: a Unix
+//! socket path on Unix, a loopback-TCP port file on Windows (see
+//! `ipc_transport`).
 
 use serial_test::serial;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 static DAEMON_PROCESS_LOCK: Mutex<()> = Mutex::new(());
+
+/// Connect to the fixture daemon's IPC endpoint: dial the Unix socket at
+/// `socket_path` on Unix; on Windows read the loopback port back from the
+/// port file at `socket_path` and dial `127.0.0.1:port` with a timeout.
+#[cfg(unix)]
+fn connect_daemon(socket_path: &Path) -> std::os::unix::net::UnixStream {
+    std::os::unix::net::UnixStream::connect(socket_path).expect("connect to daemon socket")
+}
+
+#[cfg(windows)]
+fn connect_daemon(socket_path: &Path) -> std::net::TcpStream {
+    let port: u16 = std::fs::read_to_string(socket_path)
+        .expect("read daemon port file")
+        .trim()
+        .parse()
+        .expect("parse daemon port number");
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_secs(5),
+    )
+    .expect("connect to daemon loopback port")
+}
 
 struct DaemonFixture {
     child: Child,
@@ -71,7 +94,7 @@ impl DaemonFixture {
     }
 
     fn send(&self, command_json: &str) -> serde_json::Value {
-        let mut stream = UnixStream::connect(&self.socket_path).expect("connect to daemon socket");
+        let mut stream = connect_daemon(&self.socket_path);
         writeln!(stream, "{}", command_json).expect("write command");
 
         let mut reader = BufReader::new(stream);
@@ -98,7 +121,7 @@ impl DaemonFixture {
 
 #[test]
 #[serial]
-fn daemon_status_roundtrip_over_unix_socket() {
+fn daemon_status_roundtrip_over_ipc() {
     let daemon = DaemonFixture::start();
 
     let response = daemon.send(r#"{"command":"status"}"#);
@@ -114,7 +137,7 @@ fn daemon_status_roundtrip_over_unix_socket() {
 
 #[test]
 #[serial]
-fn daemon_ping_roundtrip_over_unix_socket() {
+fn daemon_ping_roundtrip_over_ipc() {
     let daemon = DaemonFixture::start();
     let response = daemon.send(r#"{"command":"ping"}"#);
     assert_eq!(response["success"], true, "{response}");
@@ -228,7 +251,7 @@ fn second_daemon_with_distinct_socket_cannot_rotate_shared_transport_key() {
 
 #[test]
 #[serial]
-fn daemon_get_metering_roundtrip_over_unix_socket() {
+fn daemon_get_metering_roundtrip_over_ipc() {
     let daemon = DaemonFixture::start();
 
     let response = daemon.send(r#"{"command":"get_metering"}"#);
@@ -244,7 +267,7 @@ fn daemon_get_metering_roundtrip_over_unix_socket() {
 
 #[test]
 #[serial]
-fn daemon_set_volume_roundtrip_over_unix_socket() {
+fn daemon_set_volume_roundtrip_over_ipc() {
     let daemon = DaemonFixture::start();
 
     let response = daemon.send(r#"{"command":"set_volume","volume":0.37}"#);
@@ -264,12 +287,12 @@ fn daemon_set_volume_roundtrip_over_unix_socket() {
 
 #[test]
 #[serial]
-fn daemon_shutdown_over_unix_socket_stops_process() {
+fn daemon_shutdown_over_ipc_stops_process() {
     let mut daemon = DaemonFixture::start();
 
     // Send shutdown; the daemon may exit before writing a response, so we
     // only verify that the process terminates afterwards.
-    let mut stream = UnixStream::connect(&daemon.socket_path).expect("connect to daemon socket");
+    let mut stream = connect_daemon(&daemon.socket_path);
     writeln!(stream, r#"{{"command":"shutdown"}}"#).expect("write shutdown");
     drop(stream);
 
@@ -289,16 +312,14 @@ fn daemon_shutdown_drains_clients_and_allows_immediate_restart() {
     let mut daemon = DaemonFixture::start();
     let mut idle_clients = Vec::new();
     for _ in 0..32 {
-        idle_clients.push(
-            UnixStream::connect(&daemon.socket_path).expect("connect persistent idle client"),
-        );
+        idle_clients.push(connect_daemon(&daemon.socket_path));
     }
     for _ in 0..32 {
-        drop(UnixStream::connect(&daemon.socket_path).expect("connect churn client"));
+        drop(connect_daemon(&daemon.socket_path));
     }
 
     let started = Instant::now();
-    let mut shutdown = UnixStream::connect(&daemon.socket_path).expect("connect shutdown client");
+    let mut shutdown = connect_daemon(&daemon.socket_path);
     writeln!(shutdown, r#"{{"command":"shutdown"}}"#).expect("write shutdown");
     drop(shutdown);
 
@@ -363,6 +384,9 @@ fn daemon_shutdown_drains_clients_and_allows_immediate_restart() {
     panic!("restarted daemon did not shut down");
 }
 
+// SIGTERM delivery via `/bin/kill` is Unix-only; graceful shutdown itself is
+// covered on every platform by the shutdown-command tests above.
+#[cfg(unix)]
 #[test]
 #[serial]
 fn daemon_sigterm_clears_runtime_socket_and_reaps_process() {
@@ -393,7 +417,7 @@ fn daemon_sigterm_clears_runtime_socket_and_reaps_process() {
 
 #[test]
 #[serial]
-fn systemwide_lab_scenario_matrix_over_unix_socket() {
+fn systemwide_lab_scenario_matrix_over_ipc() {
     let daemon = DaemonFixture::start_with_driver("lab");
 
     let initial = daemon.send(r#"{"command":"get_snapshot"}"#);

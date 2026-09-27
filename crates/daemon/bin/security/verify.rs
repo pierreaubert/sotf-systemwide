@@ -47,8 +47,23 @@ pub fn verify_peer_credentials(stream: &UnixStream) -> Result<u32, String> {
     ))
 }
 
-#[cfg(not(unix))]
-pub fn verify_peer_credentials(_stream: &UnixStream) -> Result<u32, String> {
-    // Non-Unix platforms: no credential verification available
-    Ok(0)
+/// Verify that the connecting peer is authorized (Windows).
+///
+/// Windows has no `SO_PEERCRED` equivalent for loopback TCP. The daemon binds
+/// `127.0.0.1` only, so authorization reduces to a loopback check: peers
+/// arriving on a loopback address are the local user by construction and map
+/// to the daemon UID class; anything else is denied. Returns the daemon UID
+/// analogue (`0`, the Owner class) on success so `classify_peer` keeps
+/// working unchanged.
+#[cfg(windows)]
+pub fn verify_peer_credentials(stream: &std::net::TcpStream) -> Result<u32, String> {
+    let peer = stream
+        .peer_addr()
+        .map_err(|error| format!("failed to read Windows IPC peer address: {error}"))?;
+    if !crate::ipc_transport::is_loopback_addr(&peer) {
+        return Err(format!(
+            "Unauthorized connection: non-loopback peer {peer} (Windows IPC is loopback-only)"
+        ));
+    }
+    Ok(get_current_uid())
 }
