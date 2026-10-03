@@ -537,11 +537,27 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
             .is_some_and(|error| { error.contains("Encrypted realtime transport is unavailable") })
     );
     let rotation = daemon.send(r#"{"command":"rotate_encryption_key"}"#);
-    assert_eq!(rotation["success"], true);
+    #[cfg(all(target_os = "macos", feature = "hal"))]
+    assert_eq!(rotation["success"], true, "rotation response: {rotation}");
+    #[cfg(not(all(target_os = "macos", feature = "hal")))]
+    {
+        assert_eq!(rotation["success"], false, "rotation response: {rotation}");
+        assert!(
+            rotation["error"].as_str().is_some_and(|error| error
+                .contains("encryption key rotation requires the macOS HAL-enabled daemon build")),
+            "rotation response: {rotation}"
+        );
+    }
     let encryption_status = daemon.send(r#"{"command":"encryption_status"}"#);
     assert_eq!(encryption_status["success"], true);
     assert_eq!(encryption_status["data"]["enabled"], false);
+    #[cfg(all(target_os = "macos", feature = "hal"))]
     assert_eq!(encryption_status["data"]["transport_state"], "unavailable");
+    #[cfg(not(all(target_os = "macos", feature = "hal")))]
+    assert_eq!(
+        encryption_status["data"]["transport_state"],
+        "not_applicable"
+    );
 
     let reconfigured = daemon
         .send(r#"{"command":"set_pipeline_channels","input_channels":10,"output_channels":2}"#);
