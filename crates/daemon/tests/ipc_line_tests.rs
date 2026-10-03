@@ -8,14 +8,39 @@
 
 use serial_test::serial;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 static DAEMON_PROCESS_LOCK: Mutex<()> = Mutex::new(());
+
+/// Reap subprocesses created outside `DaemonFixture`, including on assertion panic.
+struct OwnedChild(Child);
+
+impl Deref for OwnedChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for OwnedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 struct DaemonFixture {
     child: Child,
@@ -30,7 +55,7 @@ impl DaemonFixture {
     // clippy cannot see the cross-method lifecycle.
     #[allow(clippy::zombie_processes)]
     fn start() -> Self {
-        Self::start_with_driver("null")
+        Self::start_with_driver("lab")
     }
 
     #[allow(clippy::zombie_processes)]
@@ -212,14 +237,23 @@ fn daemon_ping_roundtrip_over_unix_socket() {
 fn second_daemon_cannot_take_ownership_of_a_live_runtime() {
     let daemon = DaemonFixture::start();
 
-    let mut second = Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
-        .env("SOTF_DAEMON_SOCKET_PATH", &daemon.socket_path)
-        .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", daemon._temp_dir.path())
-        .env("SOTF_SYSTEMWIDE_DRIVER", "null")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn second sotf-daemon");
+    let second_stderr_path = daemon._temp_dir.path().join("second.stderr.log");
+    let second_stderr = File::create(&second_stderr_path).expect("create second daemon stderr log");
+    let mut second = OwnedChild(
+        Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
+            .env("SOTF_DAEMON_SOCKET_PATH", &daemon.socket_path)
+            .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", daemon._temp_dir.path())
+            .env(
+                "SOTF_SYSTEMWIDE_STATE_PATH",
+                daemon._temp_dir.path().join("systemwide-state.json"),
+            )
+            .env_remove("SOTF_OUTPUT_DEVICE")
+            .env("SOTF_SYSTEMWIDE_DRIVER", "lab")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(second_stderr))
+            .spawn()
+            .expect("spawn second sotf-daemon"),
+    );
 
     let mut second_status = None;
     for _ in 0..100 {
@@ -262,14 +296,23 @@ fn second_daemon_with_distinct_socket_cannot_rotate_shared_transport_key() {
     let first_hal_key = std::fs::read(&hal_key_path).expect("read first HAL key");
     let second_socket_path = daemon._temp_dir.path().join("alternate-daemon.sock");
 
-    let mut second = Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
-        .env("SOTF_DAEMON_SOCKET_PATH", &second_socket_path)
-        .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", daemon._temp_dir.path())
-        .env("SOTF_SYSTEMWIDE_DRIVER", "null")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn second sotf-daemon");
+    let second_stderr_path = daemon._temp_dir.path().join("alternate-daemon.stderr.log");
+    let second_stderr = File::create(&second_stderr_path).expect("create alternate daemon stderr log");
+    let mut second = OwnedChild(
+        Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
+            .env("SOTF_DAEMON_SOCKET_PATH", &second_socket_path)
+            .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", daemon._temp_dir.path())
+            .env(
+                "SOTF_SYSTEMWIDE_STATE_PATH",
+                daemon._temp_dir.path().join("systemwide-state.json"),
+            )
+            .env_remove("SOTF_OUTPUT_DEVICE")
+            .env("SOTF_SYSTEMWIDE_DRIVER", "lab")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(second_stderr))
+            .spawn()
+            .expect("spawn second sotf-daemon"),
+    );
 
     let mut second_status = None;
     for _ in 0..100 {
@@ -335,14 +378,6 @@ fn daemon_set_volume_roundtrip_over_unix_socket() {
 
     let response = daemon.send(r#"{"command":"set_volume","volume":0.37}"#);
 
-    if response["error"]
-        .as_str()
-        .is_some_and(|error| error.contains("closed channel"))
-    {
-        eprintln!("skipping set-volume roundtrip: playback engine unavailable: {response}");
-        daemon.shutdown();
-        return;
-    }
     assert_eq!(response["success"], true, "{response}");
 
     daemon.shutdown();
@@ -408,24 +443,30 @@ fn daemon_shutdown_drains_clients_and_allows_immediate_restart() {
     );
     drop(idle_clients);
 
-    let mut restarted = Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
-        .env("SOTF_DAEMON_SOCKET_PATH", &daemon.socket_path)
-        .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", daemon._temp_dir.path())
-        .env("SOTF_SYSTEMWIDE_DRIVER", "null")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("restart sotf-daemon");
+    let restart_stderr_path = daemon._temp_dir.path().join("restart.stderr.log");
+    let restart_stderr = File::create(&restart_stderr_path).expect("create restart stderr log");
+    let mut restarted = OwnedChild(
+        Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
+            .env("SOTF_DAEMON_SOCKET_PATH", &daemon.socket_path)
+            .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", daemon._temp_dir.path())
+            .env(
+                "SOTF_SYSTEMWIDE_STATE_PATH",
+                daemon._temp_dir.path().join("systemwide-state.json"),
+            )
+            .env_remove("SOTF_OUTPUT_DEVICE")
+            .env("SOTF_SYSTEMWIDE_DRIVER", "lab")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(restart_stderr))
+            .spawn()
+            .expect("restart sotf-daemon"),
+    );
 
     for _ in 0..100 {
         if daemon.socket_path.exists() {
             break;
         }
         if let Some(status) = restarted.try_wait().expect("poll restarted daemon") {
-            let mut stderr = String::new();
-            if let Some(mut pipe) = restarted.stderr.take() {
-                let _ = pipe.read_to_string(&mut stderr);
-            }
+            let stderr = std::fs::read_to_string(&restart_stderr_path).unwrap_or_default();
             panic!("restarted daemon exited early ({status}): {stderr}");
         }
         std::thread::sleep(Duration::from_millis(50));

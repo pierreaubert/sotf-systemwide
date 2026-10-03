@@ -157,11 +157,7 @@ pub(super) fn handle_driver_config_change(
         actual_rate,
         requested_frames,
         requested_channels as usize,
-        if driver_manager.lock().is_lab_backend() {
-            SinkType::LabNull
-        } else {
-            SinkType::Cpal
-        },
+        driver_manager.lock().output_sink_type(),
     ) {
         Ok(outcome) => {
             let (active_config, result) = acknowledged_config_for_outcome(
@@ -247,7 +243,7 @@ pub(super) fn reconfigure_audio_pipeline(
         hal_sample_rate,
         hal_buffer_frames,
         input_channels,
-        SinkType::Cpal,
+        SinkType::LabNull,
     )
 }
 

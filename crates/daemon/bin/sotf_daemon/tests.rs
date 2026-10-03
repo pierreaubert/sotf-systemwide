@@ -978,24 +978,6 @@ mod ipc_safety_tests {
         DriverStatus::new(true, true, true, 48_000, 2, 512, "Fake HAL", true)
     }
 
-    fn has_physical_output_device() -> bool {
-        use cpal::traits::{DeviceTrait, HostTrait};
-        use sotf_audio::devices::is_null_device;
-
-        cpal::default_host()
-            .output_devices()
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|device| {
-                device
-                    .description()
-                    .ok()
-                    .map(|description| description.name().to_string())
-            })
-            .any(|name| is_safe_output_device_name(&name) && !is_null_device(&name))
-    }
-
     fn fault_codes(faults: &[Value]) -> Vec<&str> {
         faults
             .iter()
@@ -1007,7 +989,7 @@ mod ipc_safety_tests {
         AudioDaemon {
             manager: Arc::new(Mutex::new(AudioEngineManager::new())),
             running: Arc::new(Mutex::new(true)),
-            driver_manager: Arc::new(Mutex::new(DriverManager::from_driver(Box::new(
+            driver_manager: Arc::new(Mutex::new(DriverManager::from_driver_with_lab_output(Box::new(
                 FakeDriver::new(state),
             )))),
             system_state: Arc::new(Mutex::new(SystemwideState::default())),
@@ -1018,6 +1000,23 @@ mod ipc_safety_tests {
             output_profiles: Arc::new(Mutex::new(
                 crate::output_profiles::OutputProfileStore::default(),
             )),
+        }
+    }
+
+    fn assert_fake_driver_uses_lab_output(daemon: &AudioDaemon) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let playback = daemon.manager.lock().get_engine_state();
+            if playback.playback_output_device.as_deref() == Some("Systemwide Lab Output")
+                && playback.playback_callback_count > 0
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake driver did not process audio through lab output: {playback:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -1862,11 +1861,6 @@ mod ipc_safety_tests {
     #[test]
     #[serial_test::serial]
     fn testkit_live_rack_state_promotion_and_graph_reorder_preserve_node_state() {
-        if !has_physical_output_device() {
-            eprintln!("skipping live graph/rack mutation test: no physical output device");
-            return;
-        }
-
         let state = fake_driver_state();
         let daemon = test_daemon_with_driver(state);
         let seed = daemon.handle_command(Command::LoadPlugins {
@@ -1877,18 +1871,8 @@ mod ipc_safety_tests {
             input_channels: 2,
             output_channels: 2,
         });
-        if !seed.success
-            && seed
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("No physical output device found"))
-        {
-            eprintln!(
-                "skipping live graph/rack mutation test: engine has no usable physical output"
-            );
-            return;
-        }
         assert!(seed.success, "failed to seed rack pipeline: {seed:?}");
+        assert_fake_driver_uses_lab_output(&daemon);
         let rack_generation = daemon
             .system_state
             .lock()
@@ -2387,11 +2371,6 @@ mod ipc_safety_tests {
     #[test]
     #[serial_test::serial]
     fn testkit_concurrent_add_plugin_preserves_both_mutations() {
-        if !has_physical_output_device() {
-            eprintln!("skipping live engine mutation test: no physical output device");
-            return;
-        }
-
         let state = fake_driver_state();
         let daemon = Arc::new(test_daemon_with_driver(state));
         let seed = daemon.handle_command(Command::LoadPlugins {
@@ -2400,16 +2379,7 @@ mod ipc_safety_tests {
             output_channels: 2,
         });
         assert!(seed.success, "failed to seed pipeline: {seed:?}");
-        if daemon
-            .manager
-            .lock()
-            .get_engine_state()
-            .playback_output_device
-            .is_none()
-        {
-            eprintln!("skipping live engine mutation test: playback has no output device");
-            return;
-        }
+        assert_fake_driver_uses_lab_output(&daemon);
 
         let start = Arc::new(Barrier::new(3));
         let first_daemon = Arc::clone(&daemon);

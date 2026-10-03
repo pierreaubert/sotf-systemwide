@@ -1855,11 +1855,7 @@ impl SystemwideController {
             plan.spec.output_device
         );
 
-        let sink_type = if self.driver_manager.lock().is_lab_backend() {
-            SinkType::LabNull
-        } else {
-            SinkType::Cpal
-        };
+        let sink_type = self.driver_manager.lock().output_sink_type();
         let result = {
             let mut manager = self.manager.lock();
             Self::start_pipeline_plan(
