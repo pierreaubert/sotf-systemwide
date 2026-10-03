@@ -1,7 +1,7 @@
 use serde_json::Value;
 use sotf_audio::PluginConfig;
 use sotf_audio::engine::PluginGraphConfig;
-use sotf_audio_player::room_eq_types::{DspChainOutput, build_room_eq_plugin_graph_config};
+use sotf_room_eq_graph::{DspChainOutput, build_room_eq_plugin_graph_config};
 
 const MAX_PLUGIN_ARTIFACT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
