@@ -440,6 +440,7 @@ class AudioEngineClient {
         )
     }
 
+
     func getStatus(reuseConnection: Bool = false) -> Status {
         // Configuration UI state must come from one daemon snapshot. The old
         // flat `status` response sampled a different instant than device,
@@ -464,8 +465,10 @@ class AudioEngineClient {
         let transport = observed["transport"] as? [String: Any] ?? [:]
         // The HAL stream flag lives on the driver snapshot; fall back to the
         // transport alias so older daemons still drive the indicator.
-        let captureActive = (driver["capture_active"] as? Bool)
-            ?? (transport["hal_capture_active"] as? Bool)
+        let captureActive = ConfigBarHALCaptureStatus.resolve(
+            driver: driver,
+            transport: transport
+        )
         let halDriverReady = driver["driver_ready"] as? Bool
         let routeProfileID = applied["profile_id"] as? String
         let routeDeviceUID = applied["output_device_uid"] as? String

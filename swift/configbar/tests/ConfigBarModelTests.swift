@@ -2,6 +2,31 @@ import XCTest
 @testable import ConfigBarModels
 
 final class ConfigBarModelTests: XCTestCase {
+    func testHALCaptureStatusUsesLiveDriverFlagAndLegacyTransportFallback() {
+        XCTAssertEqual(
+            ConfigBarHALCaptureStatus.resolve(
+                driver: ["capture_active": false],
+                transport: ["hal_capture_active": true]
+            ),
+            false
+        )
+        XCTAssertEqual(
+            ConfigBarHALCaptureStatus.resolve(
+                driver: ["capture_active": true],
+                transport: ["hal_capture_active": false]
+            ),
+            true
+        )
+        XCTAssertEqual(
+            ConfigBarHALCaptureStatus.resolve(
+                driver: [:],
+                transport: ["hal_capture_active": false]
+            ),
+            false
+        )
+        XCTAssertNil(ConfigBarHALCaptureStatus.resolve(driver: [:], transport: [:]))
+    }
+
     func testMenuBarPillConventionSeparatesPlayingRecordingAndIdle() {
         XCTAssertEqual(
             ConfigBarMenuBarPillAppearance.resolve(

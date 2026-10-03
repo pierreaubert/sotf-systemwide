@@ -141,6 +141,7 @@ struct LabDriver {
     status: DriverStatus,
     phase: f32,
     engine_ready: bool,
+    idle_marker: Option<std::path::PathBuf>,
 }
 
 impl LabDriver {
@@ -158,7 +159,14 @@ impl LabDriver {
             ),
             phase: 0.0,
             engine_ready: false,
+            idle_marker: std::env::var_os("SOTF_SYSTEMWIDE_RUNTIME_DIR")
+                .map(|dir| std::path::PathBuf::from(dir).join("lab-capture-idle")),
         }
+    }
+
+    fn capture_active(&self) -> bool {
+        self.status.capture_active
+            && !self.idle_marker.as_ref().is_some_and(|marker| marker.exists())
     }
 }
 
@@ -173,11 +181,13 @@ impl AudioDriver for LabDriver {
     }
 
     fn status(&self) -> DriverStatus {
-        self.status.clone()
+        let mut status = self.status.clone();
+        status.capture_active = self.capture_active();
+        status
     }
 
     fn read_audio(&mut self, buffer: &mut [f32]) -> usize {
-        if !self.status.capture_active || !self.engine_ready || self.status.sample_rate == 0 {
+        if !self.capture_active() || !self.engine_ready || self.status.sample_rate == 0 {
             buffer.fill(0.0);
             return 0;
         }
@@ -199,7 +209,7 @@ impl AudioDriver for LabDriver {
     }
 
     fn available_frames(&self) -> usize {
-        if self.status.capture_active {
+        if self.capture_active() {
             self.status.buffer_frames as usize
         } else {
             0

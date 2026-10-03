@@ -1,5 +1,13 @@
 import Foundation
 
+/// Resolve the HAL capture flag from one daemon snapshot.
+public enum ConfigBarHALCaptureStatus {
+    public static func resolve(driver: [String: Any], transport: [String: Any]) -> Bool? {
+        (driver["capture_active"] as? Bool)
+            ?? (transport["hal_capture_active"] as? Bool)
+    }
+}
+
 /// UI-independent policy for the native menu-bar pill. Recording takes
 /// precedence if callers ever observe overlapping playback/capture flags.
 public enum ConfigBarMenuBarPillAppearance: Equatable {

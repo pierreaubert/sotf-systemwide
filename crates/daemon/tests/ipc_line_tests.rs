@@ -418,6 +418,17 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
     assert!(initial["data"]["desired"]["output_channels"].is_number());
     assert!(initial["data"]["diagnostics"]["faults"].is_array());
 
+    // The marker affects only this private lab runtime, never the installed HAL.
+    let idle_marker = daemon._temp_dir.path().join("lab-capture-idle");
+    std::fs::write(&idle_marker, b"").expect("mark lab capture idle");
+    let idle = daemon.send(r#"{"command":"get_snapshot"}"#);
+    assert_eq!(idle["data"]["observed"]["driver"]["capture_active"], false);
+    assert_eq!(idle["data"]["observed"]["transport"]["hal_capture_active"], false);
+    std::fs::remove_file(&idle_marker).expect("resume lab capture");
+    let resumed = daemon.send(r#"{"command":"get_snapshot"}"#);
+    assert_eq!(resumed["data"]["observed"]["driver"]["capture_active"], true);
+    assert_eq!(resumed["data"]["observed"]["transport"]["hal_capture_active"], true);
+
     let current_generation = initial["data"]["applied"]["generation"]
         .as_u64()
         .unwrap_or(0);
@@ -441,15 +452,10 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
     // Live timing changes are intentionally rejected while the engine is
     // active; stop first, then verify the idle configuration path.
     let stopped = daemon.send(r#"{"command":"stop"}"#);
-    if stopped["error"]
-        .as_str()
-        .is_some_and(|error| error.contains("closed channel"))
-    {
-        eprintln!("skipping lab timing changes: playback engine unavailable: {stopped}");
-        daemon.shutdown();
-        return;
-    }
-    assert_eq!(stopped["success"], true, "{stopped}");
+    assert_eq!(
+        stopped["success"], true,
+        "lab playback engine must be available for the remaining scenario: {stopped}"
+    );
 
     let sample_rate = daemon.send(r#"{"command":"set_sample_rate","rate":96000}"#);
     assert_eq!(sample_rate["success"], true, "{sample_rate}");
@@ -496,9 +502,46 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
     assert_eq!(after_reconfigure["data"]["desired"]["output_channels"], 2);
 
     let loaded = daemon.send(
-        r#"{"command":"load_plugin_artifact","artifact":{"plugins":[{"plugin_type":"gain","parameters":{"gain_db":-3.0}}]}}"#,
+        r#"{"command":"load_plugin_artifact","artifact":{"plugins":[{"plugin_type":"gain","parameters":{"gain_db":-3.0}},{"plugin_type":"eq","parameters":{}},{"plugin_type":"gain","parameters":{"gain_db":-6.0}}]}}"#,
     );
     assert_eq!(loaded["success"], true, "{loaded}");
+
+    let after_load = daemon.send(r#"{"command":"get_snapshot"}"#);
+    assert_eq!(after_load["data"]["desired"]["input_channels"], 10);
+    assert_eq!(after_load["data"]["desired"]["output_channels"], 2);
+    assert_eq!(after_load["data"]["desired"]["user_plugin_count"], 3);
+    assert_eq!(
+        after_load["data"]["desired"]["user_plugin_types"],
+        serde_json::json!(["gain", "eq", "gain"])
+    );
+    assert_eq!(after_load["data"]["applied"]["spec"]["user_plugin_count"], 3);
+    let loaded_generation = after_load["data"]["applied"]["generation"]
+        .as_u64()
+        .expect("loaded pipeline generation");
+
+    let reloaded = daemon.send(
+        r#"{"command":"load_plugin_artifact","artifact":{"plugins":[{"plugin_type":"gain","parameters":{"gain_db":-9.0}},{"plugin_type":"eq","parameters":{}},{"plugin_type":"gain","parameters":{"gain_db":-12.0}}]}}"#,
+    );
+    assert_eq!(reloaded["success"], true, "{reloaded}");
+    let after_reload = daemon.send(r#"{"command":"get_snapshot"}"#);
+    assert_eq!(after_reload["data"]["desired"]["input_channels"], 10);
+    assert_eq!(after_reload["data"]["desired"]["output_channels"], 2);
+    assert_eq!(
+        after_reload["data"]["desired"]["user_plugin_types"],
+        serde_json::json!(["gain", "eq", "gain"])
+    );
+    assert_eq!(after_reload["data"]["applied"]["spec"]["input_channels"], 10);
+    assert_eq!(after_reload["data"]["applied"]["spec"]["output_channels"], 2);
+    assert_eq!(after_reload["data"]["applied"]["spec"]["user_plugin_count"], 3);
+    assert!(
+        after_reload["data"]["applied"]["generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > loaded_generation)
+    );
+    let reloaded_plugins = daemon.send(r#"{"command":"get_plugins"}"#);
+    assert_eq!(reloaded_plugins["data"]["plugins"][0]["parameters"]["gain_db"], -9.0);
+    assert_eq!(reloaded_plugins["data"]["plugins"][1]["plugin_type"], "eq");
+    assert_eq!(reloaded_plugins["data"]["plugins"][2]["parameters"]["gain_db"], -12.0);
 
     let before_rejected_artifact = daemon.send(r#"{"command":"get_snapshot"}"#);
     let rejected = daemon.send(
