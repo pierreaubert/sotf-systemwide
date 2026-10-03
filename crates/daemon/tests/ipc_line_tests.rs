@@ -563,7 +563,7 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
         .send(r#"{"command":"set_pipeline_channels","input_channels":10,"output_channels":2}"#);
     assert_eq!(reconfigured["success"], true);
 
-    let after_reconfigure = daemon.send(r#"{"command":"get_snapshot"}"#);
+    let after_reconfigure = daemon.wait_for_lab_playback();
     assert_eq!(
         after_reconfigure["data"]["observed"]["engine"]["playback_output_device"],
         "Systemwide Lab Output"
@@ -581,7 +581,7 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
     );
     assert_eq!(loaded["success"], true, "{loaded}");
 
-    let after_load = daemon.send(r#"{"command":"get_snapshot"}"#);
+    let after_load = daemon.wait_for_lab_playback();
     assert_eq!(
         after_load["data"]["observed"]["engine"]["playback_output_device"],
         "Systemwide Lab Output"
@@ -610,7 +610,7 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
         r#"{"command":"load_plugin_artifact","artifact":{"plugins":[{"plugin_type":"gain","parameters":{"gain_db":-9.0}},{"plugin_type":"eq","parameters":{}},{"plugin_type":"gain","parameters":{"gain_db":-12.0}}]}}"#,
     );
     assert_eq!(reloaded["success"], true, "{reloaded}");
-    let after_reload = daemon.send(r#"{"command":"get_snapshot"}"#);
+    let after_reload = daemon.wait_for_lab_playback();
     assert_eq!(
         after_reload["data"]["observed"]["engine"]["playback_output_device"],
         "Systemwide Lab Output"
