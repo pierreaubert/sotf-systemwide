@@ -7,6 +7,7 @@
 #![cfg(unix)]
 
 use serial_test::serial;
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -19,6 +20,7 @@ static DAEMON_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 struct DaemonFixture {
     child: Child,
     socket_path: PathBuf,
+    stderr_path: PathBuf,
     _temp_dir: tempfile::TempDir,
     _process_guard: MutexGuard<'static, ()>,
 }
@@ -38,6 +40,8 @@ impl DaemonFixture {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let socket_path = temp_dir.path().join("daemon.sock");
+        let stderr_path = temp_dir.path().join("daemon.stderr.log");
+        let stderr = File::create(&stderr_path).expect("create private daemon stderr log");
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
             .env("SOTF_DAEMON_SOCKET_PATH", &socket_path)
@@ -49,16 +53,22 @@ impl DaemonFixture {
             .env_remove("SOTF_OUTPUT_DEVICE")
             .env("SOTF_SYSTEMWIDE_DRIVER", driver)
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .expect("spawn sotf-daemon");
+        eprintln!(
+            "lab fixture: daemon pid={} driver={driver} waiting for socket",
+            child.id()
+        );
 
         // Wait for the daemon to bind its socket.
         for _ in 0..100 {
             if socket_path.exists() {
+                eprintln!("lab fixture: daemon socket ready pid={}", child.id());
                 return Self {
                     child,
                     socket_path,
+                    stderr_path,
                     _temp_dir: temp_dir,
                     _process_guard: process_guard,
                 };
@@ -68,22 +78,64 @@ impl DaemonFixture {
 
         let _ = child.kill();
         let status = child.wait().ok();
-        let mut stderr = String::new();
-        if let Some(mut pipe) = child.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
-        }
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
         panic!("daemon did not create socket in time (status={status:?}): {stderr}");
     }
 
+    fn stderr_tail(&self) -> String {
+        let stderr = std::fs::read_to_string(&self.stderr_path).unwrap_or_default();
+        stderr
+            .lines()
+            .rev()
+            .take(80)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn send(&self, command_json: &str) -> serde_json::Value {
+        let command_name = serde_json::from_str::<serde_json::Value>(command_json)
+            .ok()
+            .and_then(|command| command["command"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_string());
+        eprintln!("lab fixture: sending {command_name}");
         let mut stream = UnixStream::connect(&self.socket_path).expect("connect to daemon socket");
-        writeln!(stream, "{}", command_json).expect("write command");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("set daemon response timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set daemon request timeout");
+        writeln!(stream, "{command_json}").unwrap_or_else(|error| {
+            panic!(
+                "daemon {command_name} request failed: {error}; daemon stderr:\n{}",
+                self.stderr_tail()
+            )
+        });
 
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        reader.read_line(&mut line).expect("read response line");
+        let bytes_read = reader.read_line(&mut line).unwrap_or_else(|error| {
+            panic!(
+                "daemon {command_name} response failed: {error}; daemon stderr:\n{}",
+                self.stderr_tail()
+            )
+        });
+        assert!(
+            bytes_read > 0,
+            "daemon {command_name} closed without a response; daemon stderr:\n{}",
+            self.stderr_tail()
+        );
+        eprintln!("lab fixture: received {command_name}");
 
-        serde_json::from_str(&line).expect("response is valid JSON")
+        serde_json::from_str(&line).unwrap_or_else(|error| {
+            panic!(
+                "daemon {command_name} response is invalid JSON: {error}; daemon stderr:\n{}",
+                self.stderr_tail()
+            )
+        })
     }
 
     fn wait_for_lab_playback(&self) -> serde_json::Value {
@@ -107,15 +159,24 @@ impl DaemonFixture {
     }
 
     fn shutdown(mut self) {
+        eprintln!("lab fixture: requesting daemon shutdown pid={}", self.child.id());
         let _ = self.send(r#"{"command":"shutdown"}"#);
 
         for _ in 0..100 {
             if self.child.try_wait().ok().flatten().is_some() {
+                eprintln!("lab fixture: daemon shutdown complete");
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
 
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for DaemonFixture {
+    fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
