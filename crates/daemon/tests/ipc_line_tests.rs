@@ -42,6 +42,11 @@ impl DaemonFixture {
         let mut child = Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
             .env("SOTF_DAEMON_SOCKET_PATH", &socket_path)
             .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", temp_dir.path())
+            .env(
+                "SOTF_SYSTEMWIDE_STATE_PATH",
+                temp_dir.path().join("systemwide-state.json"),
+            )
+            .env_remove("SOTF_OUTPUT_DEVICE")
             .env("SOTF_SYSTEMWIDE_DRIVER", driver)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -79,6 +84,26 @@ impl DaemonFixture {
         reader.read_line(&mut line).expect("read response line");
 
         serde_json::from_str(&line).expect("response is valid JSON")
+    }
+
+    fn wait_for_lab_playback(&self) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            let snapshot = self.send(r#"{"command":"get_snapshot"}"#);
+            if snapshot["data"]["observed"]["engine"]["playback_output_device"]
+                == "Systemwide Lab Output"
+                && snapshot["data"]["observed"]["engine"]["playback_callback_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+            {
+                return snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lab playback did not start: {snapshot}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn shutdown(mut self) {
@@ -396,7 +421,7 @@ fn daemon_sigterm_clears_runtime_socket_and_reaps_process() {
 fn systemwide_lab_scenario_matrix_over_unix_socket() {
     let daemon = DaemonFixture::start_with_driver("lab");
 
-    let initial = daemon.send(r#"{"command":"get_snapshot"}"#);
+    let initial = daemon.wait_for_lab_playback();
     assert_eq!(initial["success"], true);
     assert_eq!(
         initial["data"]["observed"]["driver"]["driver_name"],
@@ -417,17 +442,41 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
     assert!(initial["data"]["desired"]["input_channels"].is_number());
     assert!(initial["data"]["desired"]["output_channels"].is_number());
     assert!(initial["data"]["diagnostics"]["faults"].is_array());
+    let devices = daemon.send(r#"{"command":"list_devices"}"#);
+    assert_eq!(devices["success"], true, "{devices}");
+    assert_eq!(devices["data"]["devices"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        devices["data"]["devices"][0]["name"],
+        "Systemwide Lab Output"
+    );
+    assert_eq!(devices["data"]["devices"][0]["channels"], 16);
+    let physical = daemon.send(r#"{"command":"set_device","device":"EVO8"}"#);
+    assert_eq!(physical["success"], false, "{physical}");
+    assert!(
+        physical["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Lab backend"))
+    );
 
     // The marker affects only this private lab runtime, never the installed HAL.
     let idle_marker = daemon._temp_dir.path().join("lab-capture-idle");
     std::fs::write(&idle_marker, b"").expect("mark lab capture idle");
     let idle = daemon.send(r#"{"command":"get_snapshot"}"#);
     assert_eq!(idle["data"]["observed"]["driver"]["capture_active"], false);
-    assert_eq!(idle["data"]["observed"]["transport"]["hal_capture_active"], false);
+    assert_eq!(
+        idle["data"]["observed"]["transport"]["hal_capture_active"],
+        false
+    );
     std::fs::remove_file(&idle_marker).expect("resume lab capture");
     let resumed = daemon.send(r#"{"command":"get_snapshot"}"#);
-    assert_eq!(resumed["data"]["observed"]["driver"]["capture_active"], true);
-    assert_eq!(resumed["data"]["observed"]["transport"]["hal_capture_active"], true);
+    assert_eq!(
+        resumed["data"]["observed"]["driver"]["capture_active"],
+        true
+    );
+    assert_eq!(
+        resumed["data"]["observed"]["transport"]["hal_capture_active"],
+        true
+    );
 
     let current_generation = resumed["data"]["generation"]
         .as_u64()
@@ -499,6 +548,15 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
     assert_eq!(reconfigured["success"], true);
 
     let after_reconfigure = daemon.send(r#"{"command":"get_snapshot"}"#);
+    assert_eq!(
+        after_reconfigure["data"]["observed"]["engine"]["playback_output_device"],
+        "Systemwide Lab Output"
+    );
+    assert!(
+        after_reconfigure["data"]["observed"]["engine"]["playback_callback_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
     assert_eq!(after_reconfigure["data"]["desired"]["input_channels"], 10);
     assert_eq!(after_reconfigure["data"]["desired"]["output_channels"], 2);
 
@@ -508,6 +566,15 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
     assert_eq!(loaded["success"], true, "{loaded}");
 
     let after_load = daemon.send(r#"{"command":"get_snapshot"}"#);
+    assert_eq!(
+        after_load["data"]["observed"]["engine"]["playback_output_device"],
+        "Systemwide Lab Output"
+    );
+    assert!(
+        after_load["data"]["observed"]["engine"]["playback_callback_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
     assert_eq!(after_load["data"]["desired"]["input_channels"], 10);
     assert_eq!(after_load["data"]["desired"]["output_channels"], 2);
     assert_eq!(after_load["data"]["desired"]["user_plugin_count"], 3);
@@ -515,7 +582,10 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
         after_load["data"]["desired"]["user_plugin_types"],
         serde_json::json!(["gain", "eq", "gain"])
     );
-    assert_eq!(after_load["data"]["applied"]["spec"]["user_plugin_count"], 3);
+    assert_eq!(
+        after_load["data"]["applied"]["spec"]["user_plugin_count"],
+        3
+    );
     let loaded_generation = after_load["data"]["applied"]["generation"]
         .as_u64()
         .expect("loaded pipeline generation");
@@ -525,24 +595,48 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
     );
     assert_eq!(reloaded["success"], true, "{reloaded}");
     let after_reload = daemon.send(r#"{"command":"get_snapshot"}"#);
+    assert_eq!(
+        after_reload["data"]["observed"]["engine"]["playback_output_device"],
+        "Systemwide Lab Output"
+    );
+    assert!(
+        after_reload["data"]["observed"]["engine"]["playback_callback_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
     assert_eq!(after_reload["data"]["desired"]["input_channels"], 10);
     assert_eq!(after_reload["data"]["desired"]["output_channels"], 2);
     assert_eq!(
         after_reload["data"]["desired"]["user_plugin_types"],
         serde_json::json!(["gain", "eq", "gain"])
     );
-    assert_eq!(after_reload["data"]["applied"]["spec"]["input_channels"], 10);
-    assert_eq!(after_reload["data"]["applied"]["spec"]["output_channels"], 2);
-    assert_eq!(after_reload["data"]["applied"]["spec"]["user_plugin_count"], 3);
+    assert_eq!(
+        after_reload["data"]["applied"]["spec"]["input_channels"],
+        10
+    );
+    assert_eq!(
+        after_reload["data"]["applied"]["spec"]["output_channels"],
+        2
+    );
+    assert_eq!(
+        after_reload["data"]["applied"]["spec"]["user_plugin_count"],
+        3
+    );
     assert!(
         after_reload["data"]["applied"]["generation"]
             .as_u64()
             .is_some_and(|generation| generation > loaded_generation)
     );
     let reloaded_plugins = daemon.send(r#"{"command":"get_plugins"}"#);
-    assert_eq!(reloaded_plugins["data"]["plugins"][0]["parameters"]["gain_db"], -9.0);
+    assert_eq!(
+        reloaded_plugins["data"]["plugins"][0]["parameters"]["gain_db"],
+        -9.0
+    );
     assert_eq!(reloaded_plugins["data"]["plugins"][1]["plugin_type"], "eq");
-    assert_eq!(reloaded_plugins["data"]["plugins"][2]["parameters"]["gain_db"], -12.0);
+    assert_eq!(
+        reloaded_plugins["data"]["plugins"][2]["parameters"]["gain_db"],
+        -12.0
+    );
 
     let before_rejected_artifact = daemon.send(r#"{"command":"get_snapshot"}"#);
     let rejected = daemon.send(

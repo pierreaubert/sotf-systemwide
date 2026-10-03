@@ -12,14 +12,20 @@ const DRIVER_OVERRIDE_ENV: &str = "SOTF_SYSTEMWIDE_DRIVER";
 pub struct DriverManager {
     driver: Box<dyn AudioDriver>,
     engine_ready: bool,
+    lab_backend: bool,
 }
 
 impl DriverManager {
     /// Create a new driver manager with the appropriate platform driver.
     pub fn new() -> Self {
+        let choice = std::env::var(DRIVER_OVERRIDE_ENV).ok();
+        let lab_backend = choice.as_deref().is_some_and(|choice| {
+            matches!(choice.trim().to_ascii_lowercase().as_str(), "fake" | "lab")
+        });
         Self {
-            driver: create_platform_driver(),
+            driver: create_platform_driver_for_choice(choice.as_deref()),
             engine_ready: false,
+            lab_backend,
         }
     }
 
@@ -28,7 +34,12 @@ impl DriverManager {
         Self {
             driver,
             engine_ready: false,
+            lab_backend: false,
         }
+    }
+
+    pub fn is_lab_backend(&self) -> bool {
+        self.lab_backend
     }
 
     /// Initialize the driver and verify connectivity.
@@ -88,10 +99,6 @@ impl DriverManager {
 }
 
 /// Create the appropriate platform audio driver.
-fn create_platform_driver() -> Box<dyn AudioDriver> {
-    create_platform_driver_for_choice(std::env::var(DRIVER_OVERRIDE_ENV).ok().as_deref())
-}
-
 fn create_platform_driver_for_choice(choice: Option<&str>) -> Box<dyn AudioDriver> {
     match choice.map(|value| value.trim().to_ascii_lowercase()) {
         Some(choice) if choice == "fake" || choice == "lab" => {
@@ -166,7 +173,10 @@ impl LabDriver {
 
     fn capture_active(&self) -> bool {
         self.status.capture_active
-            && !self.idle_marker.as_ref().is_some_and(|marker| marker.exists())
+            && !self
+                .idle_marker
+                .as_ref()
+                .is_some_and(|marker| marker.exists())
     }
 }
 

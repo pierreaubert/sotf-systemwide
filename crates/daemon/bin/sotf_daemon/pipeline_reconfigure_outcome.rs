@@ -6,6 +6,7 @@ use super::systemwide_state::SystemwideState;
 use super::types::PipelineReconfigureOutcome;
 use driver_common::DriverConfig;
 use parking_lot::Mutex;
+use sotf_audio::SinkType;
 use sotf_audio::manager::AudioEngineManager;
 use std::sync::Arc;
 use std::time::Duration;
@@ -150,12 +151,17 @@ pub(super) fn handle_driver_config_change(
     // A failed restart must not leave HAL believing that a stopped engine is
     // still ready to consume audio.
     driver_manager.lock().set_engine_ready(false);
-    match reconfigure_audio_pipeline(
+    match reconfigure_audio_pipeline_with_sink(
         audio_manager,
         system_state,
         actual_rate,
         requested_frames,
         requested_channels as usize,
+        if driver_manager.lock().is_lab_backend() {
+            SinkType::LabNull
+        } else {
+            SinkType::Cpal
+        },
     ) {
         Ok(outcome) => {
             let (active_config, result) = acknowledged_config_for_outcome(
@@ -234,6 +240,24 @@ pub(super) fn reconfigure_audio_pipeline(
     hal_buffer_frames: u32,
     input_channels: usize,
 ) -> Result<PipelineReconfigureOutcome, String> {
+    reconfigure_audio_pipeline_with_sink(
+        audio_manager,
+        system_state,
+        hal_sample_rate,
+        hal_buffer_frames,
+        input_channels,
+        SinkType::Cpal,
+    )
+}
+
+fn reconfigure_audio_pipeline_with_sink(
+    audio_manager: &Arc<Mutex<AudioEngineManager>>,
+    system_state: &Arc<Mutex<SystemwideState>>,
+    hal_sample_rate: u32,
+    hal_buffer_frames: u32,
+    input_channels: usize,
+    sink_type: SinkType,
+) -> Result<PipelineReconfigureOutcome, String> {
     let plan = {
         let state = system_state.lock();
         if let Some(graph) = state.user_graph() {
@@ -285,8 +309,13 @@ pub(super) fn reconfigure_audio_pipeline(
         plan.spec.output_device
     );
 
-    let result =
-        AudioDaemon::start_pipeline_plan(&mut manager, &plan, hal_sample_rate, hal_buffer_frames);
+    let result = AudioDaemon::start_pipeline_plan(
+        &mut manager,
+        &plan,
+        hal_sample_rate,
+        hal_buffer_frames,
+        sink_type.clone(),
+    );
 
     match result {
         Ok(_) => {
@@ -307,6 +336,7 @@ pub(super) fn reconfigure_audio_pipeline(
                 &previous_plan,
                 hal_sample_rate,
                 hal_buffer_frames,
+                sink_type,
             );
             if restore.is_ok() {
                 log::warn!(

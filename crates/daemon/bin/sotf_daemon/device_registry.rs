@@ -57,7 +57,19 @@ impl DeviceRegistry {
         &mut self,
         selected_device: &str,
         sample_rate: u32,
+        lab_backend: bool,
     ) -> Result<usize, String> {
+        if lab_backend {
+            if selected_device != "Systemwide Lab Output" {
+                return Err(format!(
+                    "Lab backend cannot inspect physical output device '{selected_device}'"
+                ));
+            }
+            if !super::consts::SUPPORTED_SAMPLE_RATES.contains(&sample_rate) {
+                return Err(format!("Lab output does not support {sample_rate} Hz"));
+            }
+            return Ok(16);
+        }
         let now = Instant::now();
         let key = (selected_device.to_string(), sample_rate);
         if let Some(cached) = self.max_output_channels.get(&key)
