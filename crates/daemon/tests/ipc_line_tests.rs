@@ -429,9 +429,9 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
     assert_eq!(resumed["data"]["observed"]["driver"]["capture_active"], true);
     assert_eq!(resumed["data"]["observed"]["transport"]["hal_capture_active"], true);
 
-    let current_generation = initial["data"]["applied"]["generation"]
+    let current_generation = resumed["data"]["generation"]
         .as_u64()
-        .unwrap_or(0);
+        .expect("lab snapshot generation");
     let stale_intent = format!(
         r#"{{"command":"set_pipeline_channels","input_channels":2,"output_channels":2,"base_generation":{}}}"#,
         current_generation.saturating_add(1)
@@ -441,7 +441,8 @@ fn systemwide_lab_scenario_matrix_over_unix_socket() {
     assert!(
         stale_response["error"]
             .as_str()
-            .is_some_and(|error| error.contains("generation conflict"))
+            .is_some_and(|error| error.contains("generation conflict")),
+        "unexpected stale-intent response: {stale_response}"
     );
 
     let initial_driver_config = daemon.send(r#"{"command":"get_driver_config"}"#);
@@ -600,7 +601,7 @@ fn systemwide_lab_restarts_with_a_fresh_coherent_snapshot() {
     let first = DaemonFixture::start_with_driver("lab");
     let changed =
         first.send(r#"{"command":"set_pipeline_channels","input_channels":6,"output_channels":2}"#);
-    assert_eq!(changed["success"], true);
+    assert_eq!(changed["success"], true, "{changed}");
     first.shutdown();
 
     let restarted = DaemonFixture::start_with_driver("lab");
