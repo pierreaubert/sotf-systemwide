@@ -233,6 +233,7 @@ pub(super) fn handle_driver_config_change(
 }
 
 /// Reconfigure the audio pipeline with new sample rate and buffer size
+#[cfg(test)]
 pub(super) fn reconfigure_audio_pipeline(
     audio_manager: &Arc<Mutex<AudioEngineManager>>,
     system_state: &Arc<Mutex<SystemwideState>>,

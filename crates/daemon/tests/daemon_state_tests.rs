@@ -138,7 +138,7 @@ fn daemon_load_plugins_carries_hal_input_channels() {
         "load_plugins should carry requested HAL input channels into driver config"
     );
     assert!(
-        source.contains("start_hal_playback_with_driver_config(")
+        source.contains("start_hal_playback_with_driver_config_and_sink(")
             && source.contains("plan.spec.input_channels"),
         "driver playback should be restarted with the resolved HAL input channel count"
     );
@@ -294,8 +294,7 @@ fn daemon_pkg_preinstall_quiesces_running_daemon_before_upgrade() {
 fn systemwide_pkg_ships_launch_agent_and_exposes_installer_progress_and_logs() {
     let source = include_str!("../../../scripts/build-systemwide.sh");
     let daemon_plist = include_str!("../../../builds/macos/org.spinorama.sotf-daemon.plist");
-    let configbar_plist =
-        include_str!("../../../builds/macos/org.spinorama.sotf-systemwide.plist");
+    let configbar_plist = include_str!("../../../builds/macos/org.spinorama.sotf-systemwide.plist");
 
     assert!(
         source.contains("local hal_pkg_root=\"$DMG_DIR/pkg-root-hal\"")

@@ -91,7 +91,14 @@ fn daemon_reconfiguration_uses_negotiated_hal_format() {
     let source = read_repo_file(
         "sotf-systemwide/crates/daemon/bin/sotf_daemon/pipeline_reconfigure_outcome.rs",
     );
-    let body = function_body(&source, "fn reconfigure_audio_pipeline");
+    let wrapper = function_body(&source, "fn reconfigure_audio_pipeline(");
+    let body = function_body(&source, "fn reconfigure_audio_pipeline_with_sink(");
+
+    assert!(
+        wrapper.contains("reconfigure_audio_pipeline_with_sink(")
+            && wrapper.contains("SinkType::Cpal"),
+        "the default reconfiguration path must retain CPAL output"
+    );
 
     assert!(
         source.contains("hal_sample_rate: u32"),
