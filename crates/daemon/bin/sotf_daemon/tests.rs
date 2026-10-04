@@ -3191,6 +3191,7 @@ mod command_roundtrip_tests {
     #[test]
     fn handle_set_output_route_rejects_empty_and_unknown_devices() {
         let daemon = AudioDaemon::new();
+        let lab_backend = daemon.driver_manager.lock().is_lab_backend();
         assert!(
             !daemon
                 .handle_set_output_route("   ", None, None, None, None, None)
@@ -3205,12 +3206,12 @@ mod command_roundtrip_tests {
             None,
         );
         assert!(!missing.success);
-        assert!(
-            missing
-                .error
-                .expect("missing device error")
-                .contains("not found")
-        );
+        let error = missing.error.expect("missing device error");
+        if lab_backend {
+            assert_eq!(error, "Lab backend cannot select a physical output device");
+        } else {
+            assert!(error.contains("not found"), "{error}");
+        }
     }
 
     #[test]

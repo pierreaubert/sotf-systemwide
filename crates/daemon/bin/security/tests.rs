@@ -218,12 +218,20 @@ fn test_encryption_status() {
 
 #[test]
 #[serial]
-fn test_hal_key_path_is_under_uid_tmpdir() {
-    let path = get_hal_key_path();
-    let path_str = path.to_string_lossy();
-
-    assert!(path_str.contains(&format!("/tmp/sotf-{}", get_current_uid())));
-    assert!(path_str.ends_with("/session.key"));
+fn test_hal_key_path_respects_runtime_override_and_uid_default() {
+    let uid = get_current_uid();
+    assert_eq!(
+        hal_session_key_path_from_env(None, None, uid),
+        PathBuf::from(format!("/tmp/sotf-{uid}/session.key"))
+    );
+    assert_eq!(
+        get_hal_key_path(),
+        hal_session_key_path_from_env(
+            std::env::var_os("SOTF_HAL_SESSION_KEY_PATH"),
+            std::env::var_os("SOTF_SYSTEMWIDE_RUNTIME_DIR"),
+            uid,
+        )
+    );
 }
 
 #[test]
