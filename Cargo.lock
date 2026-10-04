@@ -3507,6 +3507,7 @@ dependencies = [
  "realfft",
  "rustfft",
  "serde",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -5342,6 +5343,7 @@ dependencies = [
  "roomeq-model",
  "roomeq-quality",
  "rustfft",
+ "same-file",
  "schemars",
  "serde",
  "serde_ignored",
