@@ -66,7 +66,7 @@ block = { path = "../gpui-toolkit/crates/3rdparties/block" }
 objc = { path = "../gpui-toolkit/crates/3rdparties/objc" }
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
 nnnoiseless = { path = "../sotf-daw/crates/3rdparties/nnnoiseless" }
-coreaudio-rs = { path = "../sotf-daw/crates/3rdparties/coreaudio-rs" }
+coreaudio-rs = { git = "https://github.com/pierreaubert/coreaudio-rs.git", rev = "2d57f0f827d67162ccdce8f34b453fbd70d7750b" }
 
 [patch."https://github.com/zed-industries/font-kit"]
 zed-font-kit = { path = "../gpui-toolkit/crates/3rdparties/zed-font-kit" }
