@@ -7,6 +7,7 @@
 
 use crate::cpal_capture::CpalCaptureDriver;
 use driver_common::{AudioDriver, ConfigResult, DriverConfig, DriverError, DriverStatus};
+use sotf_audio::SinkType;
 
 const DRIVER_OVERRIDE_ENV: &str = "SOTF_SYSTEMWIDE_DRIVER";
 
@@ -14,14 +15,24 @@ const DRIVER_OVERRIDE_ENV: &str = "SOTF_SYSTEMWIDE_DRIVER";
 pub struct DriverManager {
     driver: Box<dyn AudioDriver>,
     engine_ready: bool,
+    lab_backend: bool,
+    #[cfg(test)]
+    test_lab_output: bool,
 }
 
 impl DriverManager {
     /// Create a new driver manager with the appropriate platform driver.
     pub fn new() -> Self {
+        let choice = std::env::var(DRIVER_OVERRIDE_ENV).ok();
+        let lab_backend = choice.as_deref().is_some_and(|choice| {
+            matches!(choice.trim().to_ascii_lowercase().as_str(), "fake" | "lab")
+        });
         Self {
-            driver: create_platform_driver(),
+            driver: create_platform_driver_for_choice(choice.as_deref()),
             engine_ready: false,
+            lab_backend,
+            #[cfg(test)]
+            test_lab_output: false,
         }
     }
 
@@ -30,6 +41,31 @@ impl DriverManager {
         Self {
             driver,
             engine_ready: false,
+            lab_backend: false,
+            test_lab_output: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn from_driver_with_lab_output(driver: Box<dyn AudioDriver>) -> Self {
+        let mut manager = Self::from_driver(driver);
+        manager.test_lab_output = true;
+        manager
+    }
+
+    pub fn is_lab_backend(&self) -> bool {
+        self.lab_backend
+    }
+
+    pub fn output_sink_type(&self) -> SinkType {
+        #[cfg(test)]
+        if self.test_lab_output {
+            return SinkType::LabNull;
+        }
+        if self.lab_backend {
+            SinkType::LabNull
+        } else {
+            SinkType::Cpal
         }
     }
 
@@ -90,10 +126,6 @@ impl DriverManager {
 }
 
 /// Create the appropriate platform audio driver.
-fn create_platform_driver() -> Box<dyn AudioDriver> {
-    create_platform_driver_for_choice(std::env::var(DRIVER_OVERRIDE_ENV).ok().as_deref())
-}
-
 fn create_platform_driver_for_choice(choice: Option<&str>) -> Box<dyn AudioDriver> {
     match choice.map(|value| value.trim().to_ascii_lowercase()) {
         Some(choice) if choice == "fake" || choice == "lab" => {
@@ -148,6 +180,7 @@ struct LabDriver {
     status: DriverStatus,
     phase: f32,
     engine_ready: bool,
+    idle_marker: Option<std::path::PathBuf>,
 }
 
 impl LabDriver {
@@ -165,7 +198,17 @@ impl LabDriver {
             ),
             phase: 0.0,
             engine_ready: false,
+            idle_marker: std::env::var_os("SOTF_SYSTEMWIDE_RUNTIME_DIR")
+                .map(|dir| std::path::PathBuf::from(dir).join("lab-capture-idle")),
         }
+    }
+
+    fn capture_active(&self) -> bool {
+        self.status.capture_active
+            && !self
+                .idle_marker
+                .as_ref()
+                .is_some_and(|marker| marker.exists())
     }
 }
 
@@ -180,11 +223,13 @@ impl AudioDriver for LabDriver {
     }
 
     fn status(&self) -> DriverStatus {
-        self.status.clone()
+        let mut status = self.status.clone();
+        status.capture_active = self.capture_active();
+        status
     }
 
     fn read_audio(&mut self, buffer: &mut [f32]) -> usize {
-        if !self.status.capture_active || !self.engine_ready || self.status.sample_rate == 0 {
+        if !self.capture_active() || !self.engine_ready || self.status.sample_rate == 0 {
             buffer.fill(0.0);
             return 0;
         }
@@ -206,7 +251,7 @@ impl AudioDriver for LabDriver {
     }
 
     fn available_frames(&self) -> usize {
-        if self.status.capture_active {
+        if self.capture_active() {
             self.status.buffer_frames as usize
         } else {
             0
@@ -261,6 +306,22 @@ mod tests {
     struct CountingDriver {
         ready_calls: Arc<AtomicUsize>,
         ready: bool,
+    }
+
+    #[test]
+    fn injected_driver_lab_output_is_explicit_and_keeps_driver_identity() {
+        let driver = || CountingDriver {
+            ready_calls: Arc::new(AtomicUsize::new(0)),
+            ready: false,
+        };
+        let ordinary = DriverManager::from_driver(Box::new(driver()));
+        assert_eq!(ordinary.output_sink_type(), SinkType::Cpal);
+        assert!(!ordinary.is_lab_backend());
+
+        let isolated = DriverManager::from_driver_with_lab_output(Box::new(driver()));
+        assert_eq!(isolated.output_sink_type(), SinkType::LabNull);
+        assert!(!isolated.is_lab_backend());
+        assert_eq!(isolated.status().driver_name, "counting");
     }
 
     impl AudioDriver for CountingDriver {

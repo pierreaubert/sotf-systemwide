@@ -17,7 +17,7 @@ fn daemon_source() -> String {
 }
 
 fn configbar_source() -> &'static str {
-    include_str!("../configbar/src/ConfigBar.swift")
+    include_str!("../../../swift/configbar/src/ConfigBar.swift")
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn daemon_load_plugins_carries_hal_input_channels() {
         "load_plugins should carry requested HAL input channels into driver config"
     );
     assert!(
-        source.contains("start_hal_playback_with_driver_config(")
+        source.contains("start_hal_playback_with_driver_config_and_sink(")
             && source.contains("plan.spec.input_channels"),
         "driver playback should be restarted with the resolved HAL input channel count"
     );
@@ -178,7 +178,7 @@ fn daemon_status_exposes_toolbar_device_and_playback_diagnostics() {
 
 #[test]
 fn configbar_reconciles_device_picker_from_daemon_status() {
-    let source = include_str!("../configbar/src/ConfigBar.swift");
+    let source = include_str!("../../../swift/configbar/src/ConfigBar.swift");
 
     assert!(
         source.contains("let selectedDevice: String?")
@@ -223,7 +223,7 @@ fn output_profile_commands_are_registered() {
 
 #[test]
 fn configbar_reconciles_daemon_owned_channel_counts_from_status() {
-    let source = include_str!("../configbar/src/ConfigBar.swift");
+    let source = include_str!("../../../swift/configbar/src/ConfigBar.swift");
 
     assert!(
         source.contains("if let inputChannels = status.inputChannels")
@@ -242,7 +242,7 @@ fn configbar_reconciles_daemon_owned_channel_counts_from_status() {
 
 #[test]
 fn daemon_pkg_preinstall_quiesces_running_daemon_before_upgrade() {
-    let source = include_str!("../../../../../scripts/build-systemwide.sh");
+    let source = include_str!("../../../scripts/build-systemwide.sh");
     let preinstall_start = source
         .find("cat > \"$pkg_scripts/preinstall\"")
         .expect("app package preinstall should exist");
@@ -292,10 +292,9 @@ fn daemon_pkg_preinstall_quiesces_running_daemon_before_upgrade() {
 
 #[test]
 fn systemwide_pkg_ships_launch_agent_and_exposes_installer_progress_and_logs() {
-    let source = include_str!("../../../../../scripts/build-systemwide.sh");
-    let daemon_plist = include_str!("../../../../../builds/macos/org.spinorama.sotf-daemon.plist");
-    let configbar_plist =
-        include_str!("../../../../../builds/macos/org.spinorama.sotf-systemwide.plist");
+    let source = include_str!("../../../scripts/build-systemwide.sh");
+    let daemon_plist = include_str!("../../../builds/macos/org.spinorama.sotf-daemon.plist");
+    let configbar_plist = include_str!("../../../builds/macos/org.spinorama.sotf-systemwide.plist");
 
     assert!(
         source.contains("local hal_pkg_root=\"$DMG_DIR/pkg-root-hal\"")
@@ -356,7 +355,7 @@ fn systemwide_pkg_ships_launch_agent_and_exposes_installer_progress_and_logs() {
 
 #[test]
 fn systemwide_pkg_preinstall_boots_out_both_launch_agents() {
-    let source = include_str!("../../../../../scripts/build-systemwide.sh");
+    let source = include_str!("../../../scripts/build-systemwide.sh");
     let preinstall_start = source
         .find("cat > \"$pkg_scripts/preinstall\"")
         .expect("app package preinstall should exist");
@@ -376,7 +375,7 @@ fn systemwide_pkg_preinstall_boots_out_both_launch_agents() {
 
 #[test]
 fn standalone_hal_installer_quiesces_running_system_before_replacing_driver() {
-    let source = include_str!("../../../../../scripts/build-systemwide.sh");
+    let source = include_str!("../../../scripts/build-systemwide.sh");
     let install_start = source
         .find("cat > \"$DMG_DIR/install-hal.sh\"")
         .expect("standalone HAL install script should exist");
@@ -409,7 +408,7 @@ fn standalone_hal_installer_quiesces_running_system_before_replacing_driver() {
 
 #[test]
 fn systemwide_app_icon_uses_configbar_svg_source() {
-    let source = include_str!("../../../../../scripts/build-systemwide.sh");
+    let source = include_str!("../../../scripts/build-systemwide.sh");
     let create_icon_start = source
         .find("create_app_icon()")
         .expect("Systemwide package script should create an app icon");
@@ -431,9 +430,9 @@ fn systemwide_app_icon_uses_configbar_svg_source() {
 
 #[test]
 fn configbar_output_device_refresh_tracks_channel_limits() {
-    let configbar = include_str!("../configbar/src/ConfigBar.swift");
-    let configbar_pure = include_str!("../configbar/src/ConfigBarPure.swift");
-    let rack = include_str!("../configbar/src/PluginRackView.swift");
+    let configbar = include_str!("../../../swift/configbar/src/ConfigBar.swift");
+    let configbar_pure = include_str!("../../../swift/configbar/src/ConfigBarPure.swift");
+    let rack = include_str!("../../../swift/configbar/src/PluginRackView.swift");
 
     assert!(
         configbar.contains("Button(action: {\n                            loadDevices()\n                        })"),
@@ -490,8 +489,8 @@ fn configbar_output_device_refresh_tracks_channel_limits() {
 
 #[test]
 fn configbar_hal_stream_status_wording_matches_signal_scope() {
-    let configbar = include_str!("../configbar/src/ConfigBar.swift");
-    let shared_memory = include_str!("../../driver-hal/swift/Sources/SharedMemory.swift");
+    let configbar = include_str!("../../../swift/configbar/src/ConfigBar.swift");
+    let shared_memory = include_str!("../../../swift/driver-hal/Sources/SharedMemory.swift");
 
     assert!(
         configbar.contains("HAL Stream Active")
@@ -514,7 +513,7 @@ fn configbar_hal_stream_status_wording_matches_signal_scope() {
 
 #[test]
 fn configbar_menu_bar_icon_uses_playing_recording_and_idle_pill_convention() {
-    let configbar = include_str!("../configbar/src/ConfigBar.swift");
+    let configbar = include_str!("../../../swift/configbar/src/ConfigBar.swift");
 
     assert!(
         configbar.contains("let issue = !daemonRunning || currentState == .error")
@@ -543,7 +542,7 @@ fn configbar_menu_bar_icon_uses_playing_recording_and_idle_pill_convention() {
 
 #[test]
 fn configbar_plugin_edit_sheet_batches_parameter_edits_until_apply_or_close() {
-    let source = include_str!("../configbar/src/PluginRackView.swift");
+    let source = include_str!("../../../swift/configbar/src/PluginRackView.swift");
     let sheet_start = source
         .find("struct PluginEditSheet")
         .expect("PluginEditSheet should exist");
@@ -608,7 +607,7 @@ fn configbar_plugin_edit_sheet_batches_parameter_edits_until_apply_or_close() {
 
 #[test]
 fn configbar_and_daemon_support_isolated_lab_runtime_paths() {
-    let configbar = include_str!("../configbar/src/ConfigBar.swift");
+    let configbar = include_str!("../../../swift/configbar/src/ConfigBar.swift");
     let daemon = daemon_source();
     let security = [
         include_str!("../bin/security.rs"),
@@ -633,7 +632,7 @@ fn configbar_and_daemon_support_isolated_lab_runtime_paths() {
 
 #[test]
 fn configbar_plugin_chain_loader_delegates_artifact_planning_to_daemon() {
-    let source = include_str!("../configbar/src/ConfigBar.swift");
+    let source = include_str!("../../../swift/configbar/src/ConfigBar.swift");
 
     assert!(
         source.contains("\"command\": \"load_plugin_artifact_path\"")
@@ -650,7 +649,7 @@ fn configbar_plugin_chain_loader_delegates_artifact_planning_to_daemon() {
 
 #[test]
 fn configbar_atomic_patch_helper_owns_wire_command() {
-    let source = include_str!("../configbar/src/ConfigBar.swift");
+    let source = include_str!("../../../swift/configbar/src/ConfigBar.swift");
     let helper_start = source
         .find("private func sendApplyConfiguration(")
         .expect("atomic patch helper should exist");
@@ -674,7 +673,7 @@ fn configbar_atomic_patch_helper_owns_wire_command() {
 
 #[test]
 fn configbar_configuration_actions_use_atomic_patch_intents() {
-    let source = include_str!("../configbar/src/ConfigBar.swift");
+    let source = include_str!("../../../swift/configbar/src/ConfigBar.swift");
     let apply_start = source
         .find("private func applyHALConfiguration()")
         .expect("applyHALConfiguration should exist");
@@ -707,7 +706,7 @@ fn configbar_configuration_actions_use_atomic_patch_intents() {
 
 #[test]
 fn configbar_timing_and_device_actions_are_single_configuration_mutations() {
-    let source = include_str!("../configbar/src/ConfigBar.swift");
+    let source = include_str!("../../../swift/configbar/src/ConfigBar.swift");
 
     assert_eq!(
         source

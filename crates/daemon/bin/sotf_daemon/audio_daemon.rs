@@ -48,6 +48,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::Value;
 use sotf_audio::PluginConfig;
+use sotf_audio::SinkType;
 use sotf_audio::engine::{PluginGraphConfig, PluginGraphEdgeConfig, PluginGraphNodeConfig};
 use sotf_audio::manager::AudioEngineManager;
 use sotf_audio::plugins::PluginType;
@@ -1470,6 +1471,19 @@ impl SystemwideController {
     }
 
     pub(super) fn handle_list_devices(&self) -> Response {
+        if self.driver_manager.lock().is_lab_backend() {
+            let sample_rate = self.driver_manager.lock().status().sample_rate;
+            return Response::ok(serde_json::json!({
+                "generation": 1,
+                "devices": [{
+                    "name": "Systemwide Lab Output",
+                    "is_default": true,
+                    "channels": 16,
+                    "sample_rate": sample_rate,
+                    "backend": "lab_null",
+                }],
+            }));
+        }
         match self.device_registry.lock().list_devices() {
             Ok((generation, devices)) => Response::ok(serde_json::json!({
                 "generation": generation,
@@ -1480,6 +1494,11 @@ impl SystemwideController {
     }
 
     fn resolve_safe_output_device(&self, device: &str) -> Result<String, String> {
+        if self.driver_manager.lock().is_lab_backend() {
+            return (device == "Systemwide Lab Output")
+                .then(|| device.to_string())
+                .ok_or_else(|| "Lab backend cannot select a physical output device".to_string());
+        }
         use cpal::traits::DeviceTrait;
 
         let is_asio = sotf_audio::devices::is_asio_device(device);
@@ -1510,6 +1529,15 @@ impl SystemwideController {
     }
 
     pub(super) fn handle_set_device(&self, device: &str) -> Response {
+        if self.driver_manager.lock().is_lab_backend() {
+            return self.handle_apply_configuration(
+                None,
+                None,
+                None,
+                None,
+                Some(device.to_string()),
+            );
+        }
         use cpal::traits::DeviceTrait;
         let is_asio = sotf_audio::devices::is_asio_device(device);
         let host = sotf_audio::devices::get_host_for_device(Some(device));
@@ -1833,6 +1861,7 @@ impl SystemwideController {
             plan.spec.output_device
         );
 
+        let sink_type = self.driver_manager.lock().output_sink_type();
         let result = {
             let mut manager = self.manager.lock();
             Self::start_pipeline_plan(
@@ -1840,6 +1869,7 @@ impl SystemwideController {
                 &plan,
                 effective_driver_sample_rate,
                 effective_driver_buffer_frames,
+                sink_type,
             )
             .map_err(|error| error.to_string())
         };
@@ -1879,6 +1909,7 @@ impl SystemwideController {
         plan: &PipelinePlan,
         sample_rate: u32,
         buffer_frames: u32,
+        sink_type: SinkType,
     ) -> Result<(), String> {
         let bootstrap_plugins = if plan.runtime_graph.is_some() {
             build_driver_plugin_chain(Vec::new()).0
@@ -1886,13 +1917,14 @@ impl SystemwideController {
             plan.runtime_plugins.clone()
         };
         manager
-            .start_hal_playback_with_driver_config(
+            .start_hal_playback_with_driver_config_and_sink(
                 plan.spec.output_device.clone(),
                 bootstrap_plugins,
                 plan.spec.output_channels,
                 sample_rate,
                 buffer_frames,
                 plan.spec.input_channels,
+                sink_type,
             )
             .map_err(|error| error.to_string())?;
 
@@ -2065,10 +2097,12 @@ impl SystemwideController {
             return Ok(());
         };
         let device_name = sotf_audio::devices::strip_asio_prefix(&selected_device);
-        let max_channels = self
-            .device_registry
-            .lock()
-            .max_output_channels(&selected_device, sample_rate)?;
+        let lab_backend = self.driver_manager.lock().is_lab_backend();
+        let max_channels = self.device_registry.lock().max_output_channels(
+            &selected_device,
+            sample_rate,
+            lab_backend,
+        )?;
 
         if required_channels > max_channels {
             return Err(format!(
@@ -2827,17 +2861,25 @@ impl SystemwideController {
         if device.is_empty() {
             return Response::err("Output device must not be empty");
         }
-        let is_asio = sotf_audio::devices::is_asio_device(device);
-        let host = sotf_audio::devices::get_host_for_device(Some(device));
-        let device_name = sotf_audio::devices::strip_asio_prefix(device);
-        let resolved_name = match sotf_audio::devices::find_device(&host, device_name, false) {
-            Ok(cpal_device) => cpal_device
-                .description()
-                .map(|description| description.name().to_string())
-                .unwrap_or_else(|_| "Unknown Device".to_string()),
-            Err(error) => {
-                self.device_registry.lock().invalidate();
-                return Response::err(format!("Device '{device}' not found. {error}"));
+        let lab_backend = self.driver_manager.lock().is_lab_backend();
+        let is_asio = !lab_backend && sotf_audio::devices::is_asio_device(device);
+        let resolved_name = if lab_backend {
+            match self.resolve_safe_output_device(device) {
+                Ok(name) => name,
+                Err(error) => return Response::err(error),
+            }
+        } else {
+            let host = sotf_audio::devices::get_host_for_device(Some(device));
+            let device_name = sotf_audio::devices::strip_asio_prefix(device);
+            match sotf_audio::devices::find_device(&host, device_name, false) {
+                Ok(cpal_device) => cpal_device
+                    .description()
+                    .map(|description| description.name().to_string())
+                    .unwrap_or_else(|_| "Unknown Device".to_string()),
+                Err(error) => {
+                    self.device_registry.lock().invalidate();
+                    return Response::err(format!("Device '{device}' not found. {error}"));
+                }
             }
         };
         if !is_safe_output_device_name(&resolved_name) {
@@ -3205,11 +3247,12 @@ impl SystemwideController {
         };
 
         if let Some(device) = plan.spec.output_device.as_deref() {
-            let max_channels = match self
-                .device_registry
-                .lock()
-                .max_output_channels(device, requested_sample_rate)
-            {
+            let lab_backend = self.driver_manager.lock().is_lab_backend();
+            let max_channels = match self.device_registry.lock().max_output_channels(
+                device,
+                requested_sample_rate,
+                lab_backend,
+            ) {
                 Ok(channels) => channels,
                 Err(error) => return Response::err(error),
             };

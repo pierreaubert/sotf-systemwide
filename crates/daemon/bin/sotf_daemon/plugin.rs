@@ -18,11 +18,19 @@ pub(super) fn plugin_type_to_engine_str(pt: &PluginType) -> &'static str {
 /// Categorize plugins for the UI picker
 pub(super) fn plugin_type_category(pt: &PluginType) -> &'static str {
     match pt {
-        PluginType::EQ | PluginType::FletcherMunson | PluginType::LoudnessCompensation => {
+        PluginType::EQ
+        | PluginType::AnalogEq
+        | PluginType::FletcherMunson
+        | PluginType::LoudnessCompensation => {
             "EQ & Tone"
         }
         PluginType::Gain | PluginType::Dither => "Utility",
-        PluginType::Compressor | PluginType::Limiter | PluginType::Gate | PluginType::Expander => {
+        PluginType::Compressor
+        | PluginType::AnalogCompressor
+        | PluginType::Limiter
+        | PluginType::AnalogLimiter
+        | PluginType::Gate
+        | PluginType::Expander => {
             "Dynamics"
         }
         PluginType::MultibandCompressor | PluginType::MultibandExpander => "Dynamics",
@@ -80,5 +88,8 @@ mod tests {
             );
         }
         assert_eq!(plugin_type_category(&PluginType::Dither), "Utility");
+        assert_eq!(plugin_type_category(&PluginType::AnalogEq), "EQ & Tone");
+        assert_eq!(plugin_type_category(&PluginType::AnalogCompressor), "Dynamics");
+        assert_eq!(plugin_type_category(&PluginType::AnalogLimiter), "Dynamics");
     }
 }

@@ -91,7 +91,20 @@ fn daemon_reconfiguration_uses_negotiated_hal_format() {
     let source = read_repo_file(
         "sotf-systemwide/crates/daemon/bin/sotf_daemon/pipeline_reconfigure_outcome.rs",
     );
-    let body = function_body(&source, "fn reconfigure_audio_pipeline");
+    let wrapper = function_body(&source, "fn reconfigure_audio_pipeline(");
+    let body = function_body(&source, "fn reconfigure_audio_pipeline_with_sink(");
+    let driver_manager = read_repo_file("sotf-systemwide/crates/daemon/bin/driver_manager.rs");
+
+    assert!(
+        wrapper.contains("reconfigure_audio_pipeline_with_sink(")
+            && wrapper.contains("SinkType::LabNull"),
+        "the test-only reconfiguration path must avoid physical output"
+    );
+    assert!(
+        source.contains("driver_manager.lock().output_sink_type()")
+            && driver_manager.contains("SinkType::Cpal"),
+        "production reconfiguration must retain CPAL as the default output"
+    );
 
     assert!(
         source.contains("hal_sample_rate: u32"),

@@ -9,7 +9,9 @@
 //! `ipc_transport`).
 
 use serial_test::serial;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
@@ -39,9 +41,34 @@ fn connect_daemon(socket_path: &Path) -> std::net::TcpStream {
     .expect("connect to daemon loopback port")
 }
 
+/// Reap subprocesses created outside `DaemonFixture`, including on assertion panic.
+struct OwnedChild(Child);
+
+impl Deref for OwnedChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for OwnedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 struct DaemonFixture {
     child: Child,
     socket_path: PathBuf,
+    stderr_path: PathBuf,
     _temp_dir: tempfile::TempDir,
     _process_guard: MutexGuard<'static, ()>,
 }
@@ -51,7 +78,7 @@ impl DaemonFixture {
     // clippy cannot see the cross-method lifecycle.
     #[allow(clippy::zombie_processes)]
     fn start() -> Self {
-        Self::start_with_driver("null")
+        Self::start_with_driver("lab")
     }
 
     #[allow(clippy::zombie_processes)]
@@ -61,22 +88,35 @@ impl DaemonFixture {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let socket_path = temp_dir.path().join("daemon.sock");
+        let stderr_path = temp_dir.path().join("daemon.stderr.log");
+        let stderr = File::create(&stderr_path).expect("create private daemon stderr log");
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
             .env("SOTF_DAEMON_SOCKET_PATH", &socket_path)
             .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", temp_dir.path())
+            .env(
+                "SOTF_SYSTEMWIDE_STATE_PATH",
+                temp_dir.path().join("systemwide-state.json"),
+            )
+            .env_remove("SOTF_OUTPUT_DEVICE")
             .env("SOTF_SYSTEMWIDE_DRIVER", driver)
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .expect("spawn sotf-daemon");
+        eprintln!(
+            "lab fixture: daemon pid={} driver={driver} waiting for socket",
+            child.id()
+        );
 
         // Wait for the daemon to bind its socket.
         for _ in 0..100 {
             if socket_path.exists() {
+                eprintln!("lab fixture: daemon socket ready pid={}", child.id());
                 return Self {
                     child,
                     socket_path,
+                    stderr_path,
                     _temp_dir: temp_dir,
                     _process_guard: process_guard,
                 };
@@ -86,34 +126,108 @@ impl DaemonFixture {
 
         let _ = child.kill();
         let status = child.wait().ok();
-        let mut stderr = String::new();
-        if let Some(mut pipe) = child.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
-        }
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
         panic!("daemon did not create socket in time (status={status:?}): {stderr}");
     }
 
+    fn stderr_tail(&self) -> String {
+        let stderr = std::fs::read_to_string(&self.stderr_path).unwrap_or_default();
+        stderr
+            .lines()
+            .rev()
+            .take(80)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn send(&self, command_json: &str) -> serde_json::Value {
+        let command_name = serde_json::from_str::<serde_json::Value>(command_json)
+            .ok()
+            .and_then(|command| command["command"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_string());
+        eprintln!("lab fixture: sending {command_name}");
         let mut stream = connect_daemon(&self.socket_path);
-        writeln!(stream, "{}", command_json).expect("write command");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("set daemon response timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set daemon request timeout");
+        writeln!(stream, "{command_json}").unwrap_or_else(|error| {
+            panic!(
+                "daemon {command_name} request failed: {error}; daemon stderr:\n{}",
+                self.stderr_tail()
+            )
+        });
 
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        reader.read_line(&mut line).expect("read response line");
+        let bytes_read = reader.read_line(&mut line).unwrap_or_else(|error| {
+            panic!(
+                "daemon {command_name} response failed: {error}; daemon stderr:\n{}",
+                self.stderr_tail()
+            )
+        });
+        assert!(
+            bytes_read > 0,
+            "daemon {command_name} closed without a response; daemon stderr:\n{}",
+            self.stderr_tail()
+        );
+        eprintln!("lab fixture: received {command_name}");
 
-        serde_json::from_str(&line).expect("response is valid JSON")
+        serde_json::from_str(&line).unwrap_or_else(|error| {
+            panic!(
+                "daemon {command_name} response is invalid JSON: {error}; daemon stderr:\n{}",
+                self.stderr_tail()
+            )
+        })
+    }
+
+    fn wait_for_lab_playback(&self) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            let snapshot = self.send(r#"{"command":"get_snapshot"}"#);
+            if snapshot["data"]["observed"]["engine"]["playback_output_device"]
+                == "Systemwide Lab Output"
+                && snapshot["data"]["observed"]["engine"]["playback_callback_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+            {
+                return snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lab playback did not start: {snapshot}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn shutdown(mut self) {
+        eprintln!(
+            "lab fixture: requesting daemon shutdown pid={}",
+            self.child.id()
+        );
         let _ = self.send(r#"{"command":"shutdown"}"#);
 
         for _ in 0..100 {
             if self.child.try_wait().ok().flatten().is_some() {
+                eprintln!("lab fixture: daemon shutdown complete");
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
 
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for DaemonFixture {
+    fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -149,14 +263,23 @@ fn daemon_ping_roundtrip_over_ipc() {
 fn second_daemon_cannot_take_ownership_of_a_live_runtime() {
     let daemon = DaemonFixture::start();
 
-    let mut second = Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
-        .env("SOTF_DAEMON_SOCKET_PATH", &daemon.socket_path)
-        .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", daemon._temp_dir.path())
-        .env("SOTF_SYSTEMWIDE_DRIVER", "null")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn second sotf-daemon");
+    let second_stderr_path = daemon._temp_dir.path().join("second.stderr.log");
+    let second_stderr = File::create(&second_stderr_path).expect("create second daemon stderr log");
+    let mut second = OwnedChild(
+        Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
+            .env("SOTF_DAEMON_SOCKET_PATH", &daemon.socket_path)
+            .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", daemon._temp_dir.path())
+            .env(
+                "SOTF_SYSTEMWIDE_STATE_PATH",
+                daemon._temp_dir.path().join("systemwide-state.json"),
+            )
+            .env_remove("SOTF_OUTPUT_DEVICE")
+            .env("SOTF_SYSTEMWIDE_DRIVER", "lab")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(second_stderr))
+            .spawn()
+            .expect("spawn second sotf-daemon"),
+    );
 
     let mut second_status = None;
     for _ in 0..100 {
@@ -199,14 +322,24 @@ fn second_daemon_with_distinct_socket_cannot_rotate_shared_transport_key() {
     let first_hal_key = std::fs::read(&hal_key_path).expect("read first HAL key");
     let second_socket_path = daemon._temp_dir.path().join("alternate-daemon.sock");
 
-    let mut second = Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
-        .env("SOTF_DAEMON_SOCKET_PATH", &second_socket_path)
-        .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", daemon._temp_dir.path())
-        .env("SOTF_SYSTEMWIDE_DRIVER", "null")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn second sotf-daemon");
+    let second_stderr_path = daemon._temp_dir.path().join("alternate-daemon.stderr.log");
+    let second_stderr =
+        File::create(&second_stderr_path).expect("create alternate daemon stderr log");
+    let mut second = OwnedChild(
+        Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
+            .env("SOTF_DAEMON_SOCKET_PATH", &second_socket_path)
+            .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", daemon._temp_dir.path())
+            .env(
+                "SOTF_SYSTEMWIDE_STATE_PATH",
+                daemon._temp_dir.path().join("systemwide-state.json"),
+            )
+            .env_remove("SOTF_OUTPUT_DEVICE")
+            .env("SOTF_SYSTEMWIDE_DRIVER", "lab")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(second_stderr))
+            .spawn()
+            .expect("spawn second sotf-daemon"),
+    );
 
     let mut second_status = None;
     for _ in 0..100 {
@@ -272,14 +405,6 @@ fn daemon_set_volume_roundtrip_over_ipc() {
 
     let response = daemon.send(r#"{"command":"set_volume","volume":0.37}"#);
 
-    if response["error"]
-        .as_str()
-        .is_some_and(|error| error.contains("closed channel"))
-    {
-        eprintln!("skipping set-volume roundtrip: playback engine unavailable: {response}");
-        daemon.shutdown();
-        return;
-    }
     assert_eq!(response["success"], true, "{response}");
 
     daemon.shutdown();
@@ -343,24 +468,30 @@ fn daemon_shutdown_drains_clients_and_allows_immediate_restart() {
     );
     drop(idle_clients);
 
-    let mut restarted = Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
-        .env("SOTF_DAEMON_SOCKET_PATH", &daemon.socket_path)
-        .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", daemon._temp_dir.path())
-        .env("SOTF_SYSTEMWIDE_DRIVER", "null")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("restart sotf-daemon");
+    let restart_stderr_path = daemon._temp_dir.path().join("restart.stderr.log");
+    let restart_stderr = File::create(&restart_stderr_path).expect("create restart stderr log");
+    let mut restarted = OwnedChild(
+        Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
+            .env("SOTF_DAEMON_SOCKET_PATH", &daemon.socket_path)
+            .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", daemon._temp_dir.path())
+            .env(
+                "SOTF_SYSTEMWIDE_STATE_PATH",
+                daemon._temp_dir.path().join("systemwide-state.json"),
+            )
+            .env_remove("SOTF_OUTPUT_DEVICE")
+            .env("SOTF_SYSTEMWIDE_DRIVER", "lab")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(restart_stderr))
+            .spawn()
+            .expect("restart sotf-daemon"),
+    );
 
     for _ in 0..100 {
         if daemon.socket_path.exists() {
             break;
         }
         if let Some(status) = restarted.try_wait().expect("poll restarted daemon") {
-            let mut stderr = String::new();
-            if let Some(mut pipe) = restarted.stderr.take() {
-                let _ = pipe.read_to_string(&mut stderr);
-            }
+            let stderr = std::fs::read_to_string(&restart_stderr_path).unwrap_or_default();
             panic!("restarted daemon exited early ({status}): {stderr}");
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -420,7 +551,7 @@ fn daemon_sigterm_clears_runtime_socket_and_reaps_process() {
 fn systemwide_lab_scenario_matrix_over_ipc() {
     let daemon = DaemonFixture::start_with_driver("lab");
 
-    let initial = daemon.send(r#"{"command":"get_snapshot"}"#);
+    let initial = daemon.wait_for_lab_playback();
     assert_eq!(initial["success"], true);
     assert_eq!(
         initial["data"]["observed"]["driver"]["driver_name"],
@@ -441,10 +572,45 @@ fn systemwide_lab_scenario_matrix_over_ipc() {
     assert!(initial["data"]["desired"]["input_channels"].is_number());
     assert!(initial["data"]["desired"]["output_channels"].is_number());
     assert!(initial["data"]["diagnostics"]["faults"].is_array());
+    let devices = daemon.send(r#"{"command":"list_devices"}"#);
+    assert_eq!(devices["success"], true, "{devices}");
+    assert_eq!(devices["data"]["devices"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        devices["data"]["devices"][0]["name"],
+        "Systemwide Lab Output"
+    );
+    assert_eq!(devices["data"]["devices"][0]["channels"], 16);
+    let physical = daemon.send(r#"{"command":"set_device","device":"EVO8"}"#);
+    assert_eq!(physical["success"], false, "{physical}");
+    assert!(
+        physical["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Lab backend"))
+    );
 
-    let current_generation = initial["data"]["applied"]["generation"]
+    // The marker affects only this private lab runtime, never the installed HAL.
+    let idle_marker = daemon._temp_dir.path().join("lab-capture-idle");
+    std::fs::write(&idle_marker, b"").expect("mark lab capture idle");
+    let idle = daemon.send(r#"{"command":"get_snapshot"}"#);
+    assert_eq!(idle["data"]["observed"]["driver"]["capture_active"], false);
+    assert_eq!(
+        idle["data"]["observed"]["transport"]["hal_capture_active"],
+        false
+    );
+    std::fs::remove_file(&idle_marker).expect("resume lab capture");
+    let resumed = daemon.send(r#"{"command":"get_snapshot"}"#);
+    assert_eq!(
+        resumed["data"]["observed"]["driver"]["capture_active"],
+        true
+    );
+    assert_eq!(
+        resumed["data"]["observed"]["transport"]["hal_capture_active"],
+        true
+    );
+
+    let current_generation = resumed["data"]["generation"]
         .as_u64()
-        .unwrap_or(0);
+        .expect("lab snapshot generation");
     let stale_intent = format!(
         r#"{{"command":"set_pipeline_channels","input_channels":2,"output_channels":2,"base_generation":{}}}"#,
         current_generation.saturating_add(1)
@@ -454,7 +620,8 @@ fn systemwide_lab_scenario_matrix_over_ipc() {
     assert!(
         stale_response["error"]
             .as_str()
-            .is_some_and(|error| error.contains("generation conflict"))
+            .is_some_and(|error| error.contains("generation conflict")),
+        "unexpected stale-intent response: {stale_response}"
     );
 
     let initial_driver_config = daemon.send(r#"{"command":"get_driver_config"}"#);
@@ -465,15 +632,10 @@ fn systemwide_lab_scenario_matrix_over_ipc() {
     // Live timing changes are intentionally rejected while the engine is
     // active; stop first, then verify the idle configuration path.
     let stopped = daemon.send(r#"{"command":"stop"}"#);
-    if stopped["error"]
-        .as_str()
-        .is_some_and(|error| error.contains("closed channel"))
-    {
-        eprintln!("skipping lab timing changes: playback engine unavailable: {stopped}");
-        daemon.shutdown();
-        return;
-    }
-    assert_eq!(stopped["success"], true, "{stopped}");
+    assert_eq!(
+        stopped["success"], true,
+        "lab playback engine must be available for the remaining scenario: {stopped}"
+    );
 
     let sample_rate = daemon.send(r#"{"command":"set_sample_rate","rate":96000}"#);
     assert_eq!(sample_rate["success"], true, "{sample_rate}");
@@ -505,24 +667,122 @@ fn systemwide_lab_scenario_matrix_over_ipc() {
             .is_some_and(|error| { error.contains("Encrypted realtime transport is unavailable") })
     );
     let rotation = daemon.send(r#"{"command":"rotate_encryption_key"}"#);
-    assert_eq!(rotation["success"], true);
+    #[cfg(all(target_os = "macos", feature = "hal"))]
+    assert_eq!(rotation["success"], true, "rotation response: {rotation}");
+    #[cfg(not(all(target_os = "macos", feature = "hal")))]
+    {
+        assert_eq!(rotation["success"], false, "rotation response: {rotation}");
+        assert!(
+            rotation["error"].as_str().is_some_and(|error| error
+                .contains("encryption key rotation requires the macOS HAL-enabled daemon build")),
+            "rotation response: {rotation}"
+        );
+    }
     let encryption_status = daemon.send(r#"{"command":"encryption_status"}"#);
     assert_eq!(encryption_status["success"], true);
     assert_eq!(encryption_status["data"]["enabled"], false);
+    #[cfg(all(target_os = "macos", feature = "hal"))]
     assert_eq!(encryption_status["data"]["transport_state"], "unavailable");
+    #[cfg(not(all(target_os = "macos", feature = "hal")))]
+    assert_eq!(
+        encryption_status["data"]["transport_state"],
+        "not_applicable"
+    );
 
     let reconfigured = daemon
         .send(r#"{"command":"set_pipeline_channels","input_channels":10,"output_channels":2}"#);
     assert_eq!(reconfigured["success"], true);
 
-    let after_reconfigure = daemon.send(r#"{"command":"get_snapshot"}"#);
+    let after_reconfigure = daemon.wait_for_lab_playback();
+    assert_eq!(
+        after_reconfigure["data"]["observed"]["engine"]["playback_output_device"],
+        "Systemwide Lab Output"
+    );
+    assert!(
+        after_reconfigure["data"]["observed"]["engine"]["playback_callback_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
     assert_eq!(after_reconfigure["data"]["desired"]["input_channels"], 10);
     assert_eq!(after_reconfigure["data"]["desired"]["output_channels"], 2);
 
     let loaded = daemon.send(
-        r#"{"command":"load_plugin_artifact","artifact":{"plugins":[{"plugin_type":"gain","parameters":{"gain_db":-3.0}}]}}"#,
+        r#"{"command":"load_plugin_artifact","artifact":{"plugins":[{"plugin_type":"gain","parameters":{"gain_db":-3.0}},{"plugin_type":"eq","parameters":{}},{"plugin_type":"gain","parameters":{"gain_db":-6.0}}]}}"#,
     );
     assert_eq!(loaded["success"], true, "{loaded}");
+
+    let after_load = daemon.wait_for_lab_playback();
+    assert_eq!(
+        after_load["data"]["observed"]["engine"]["playback_output_device"],
+        "Systemwide Lab Output"
+    );
+    assert!(
+        after_load["data"]["observed"]["engine"]["playback_callback_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert_eq!(after_load["data"]["desired"]["input_channels"], 10);
+    assert_eq!(after_load["data"]["desired"]["output_channels"], 2);
+    assert_eq!(after_load["data"]["desired"]["user_plugin_count"], 3);
+    assert_eq!(
+        after_load["data"]["desired"]["user_plugin_types"],
+        serde_json::json!(["gain", "eq", "gain"])
+    );
+    assert_eq!(
+        after_load["data"]["applied"]["spec"]["user_plugin_count"],
+        3
+    );
+    let loaded_generation = after_load["data"]["applied"]["generation"]
+        .as_u64()
+        .expect("loaded pipeline generation");
+
+    let reloaded = daemon.send(
+        r#"{"command":"load_plugin_artifact","artifact":{"plugins":[{"plugin_type":"gain","parameters":{"gain_db":-9.0}},{"plugin_type":"eq","parameters":{}},{"plugin_type":"gain","parameters":{"gain_db":-12.0}}]}}"#,
+    );
+    assert_eq!(reloaded["success"], true, "{reloaded}");
+    let after_reload = daemon.wait_for_lab_playback();
+    assert_eq!(
+        after_reload["data"]["observed"]["engine"]["playback_output_device"],
+        "Systemwide Lab Output"
+    );
+    assert!(
+        after_reload["data"]["observed"]["engine"]["playback_callback_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert_eq!(after_reload["data"]["desired"]["input_channels"], 10);
+    assert_eq!(after_reload["data"]["desired"]["output_channels"], 2);
+    assert_eq!(
+        after_reload["data"]["desired"]["user_plugin_types"],
+        serde_json::json!(["gain", "eq", "gain"])
+    );
+    assert_eq!(
+        after_reload["data"]["applied"]["spec"]["input_channels"],
+        10
+    );
+    assert_eq!(
+        after_reload["data"]["applied"]["spec"]["output_channels"],
+        2
+    );
+    assert_eq!(
+        after_reload["data"]["applied"]["spec"]["user_plugin_count"],
+        3
+    );
+    assert!(
+        after_reload["data"]["applied"]["generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > loaded_generation)
+    );
+    let reloaded_plugins = daemon.send(r#"{"command":"get_plugins"}"#);
+    assert_eq!(
+        reloaded_plugins["data"]["plugins"][0]["parameters"]["gain_db"],
+        -9.0
+    );
+    assert_eq!(reloaded_plugins["data"]["plugins"][1]["plugin_type"], "eq");
+    assert_eq!(
+        reloaded_plugins["data"]["plugins"][2]["parameters"]["gain_db"],
+        -12.0
+    );
 
     let before_rejected_artifact = daemon.send(r#"{"command":"get_snapshot"}"#);
     let rejected = daemon.send(
@@ -581,7 +841,7 @@ fn systemwide_lab_restarts_with_a_fresh_coherent_snapshot() {
     let first = DaemonFixture::start_with_driver("lab");
     let changed =
         first.send(r#"{"command":"set_pipeline_channels","input_channels":6,"output_channels":2}"#);
-    assert_eq!(changed["success"], true);
+    assert_eq!(changed["success"], true, "{changed}");
     first.shutdown();
 
     let restarted = DaemonFixture::start_with_driver("lab");

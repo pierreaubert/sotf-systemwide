@@ -981,24 +981,6 @@ mod ipc_safety_tests {
         DriverStatus::new(true, true, true, 48_000, 2, 512, "Fake HAL", true)
     }
 
-    fn has_physical_output_device() -> bool {
-        use cpal::traits::{DeviceTrait, HostTrait};
-        use sotf_audio::devices::is_null_device;
-
-        cpal::default_host()
-            .output_devices()
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|device| {
-                device
-                    .description()
-                    .ok()
-                    .map(|description| description.name().to_string())
-            })
-            .any(|name| is_safe_output_device_name(&name) && !is_null_device(&name))
-    }
-
     fn fault_codes(faults: &[Value]) -> Vec<&str> {
         faults
             .iter()
@@ -1010,9 +992,9 @@ mod ipc_safety_tests {
         AudioDaemon {
             manager: Arc::new(Mutex::new(AudioEngineManager::new())),
             running: Arc::new(Mutex::new(true)),
-            driver_manager: Arc::new(Mutex::new(DriverManager::from_driver(Box::new(
-                FakeDriver::new(state),
-            )))),
+            driver_manager: Arc::new(Mutex::new(DriverManager::from_driver_with_lab_output(
+                Box::new(FakeDriver::new(state)),
+            ))),
             system_state: Arc::new(Mutex::new(SystemwideState::default())),
             key_manager: Arc::new(Mutex::new(KeyManager::for_test())),
             pipeline_mutation: Arc::new(Mutex::new(())),
@@ -1046,6 +1028,26 @@ mod ipc_safety_tests {
         let client = std::net::TcpStream::connect(addr).expect("connect test client");
         let (server, _) = listener.accept().expect("accept test client");
         (client, server)
+    }
+
+    fn assert_fake_driver_uses_lab_output(daemon: &AudioDaemon) {
+        // The playback worker publishes callback and frame counters every five seconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(7);
+        loop {
+            let playback = daemon.manager.lock().get_engine_state();
+            if playback.playback_output_device.as_deref() == Some("Systemwide Lab Output")
+                && playback.playback_callback_count > 0
+                && playback.playback_frames_received > 0
+                && playback.playback_frames_written > 0
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake driver did not process audio through lab output: {playback:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     fn send_owner_ipc_command(daemon: &AudioDaemon, raw: &str) -> serde_json::Value {
@@ -1889,11 +1891,6 @@ mod ipc_safety_tests {
     #[test]
     #[serial_test::serial]
     fn testkit_live_rack_state_promotion_and_graph_reorder_preserve_node_state() {
-        if !has_physical_output_device() {
-            eprintln!("skipping live graph/rack mutation test: no physical output device");
-            return;
-        }
-
         let state = fake_driver_state();
         let daemon = test_daemon_with_driver(state);
         let seed = daemon.handle_command(Command::LoadPlugins {
@@ -1904,18 +1901,13 @@ mod ipc_safety_tests {
             input_channels: 2,
             output_channels: 2,
         });
-        if !seed.success
-            && seed
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("No physical output device found"))
-        {
-            eprintln!(
-                "skipping live graph/rack mutation test: engine has no usable physical output"
-            );
-            return;
-        }
         assert!(seed.success, "failed to seed rack pipeline: {seed:?}");
+        daemon
+            .manager
+            .lock()
+            .resume()
+            .expect("resume fake HAL silent source after rack seed");
+        assert_fake_driver_uses_lab_output(&daemon);
         let rack_generation = daemon
             .system_state
             .lock()
@@ -2414,11 +2406,6 @@ mod ipc_safety_tests {
     #[test]
     #[serial_test::serial]
     fn testkit_concurrent_add_plugin_preserves_both_mutations() {
-        if !has_physical_output_device() {
-            eprintln!("skipping live engine mutation test: no physical output device");
-            return;
-        }
-
         let state = fake_driver_state();
         let daemon = Arc::new(test_daemon_with_driver(state));
         let seed = daemon.handle_command(Command::LoadPlugins {
@@ -2427,16 +2414,12 @@ mod ipc_safety_tests {
             output_channels: 2,
         });
         assert!(seed.success, "failed to seed pipeline: {seed:?}");
-        if daemon
+        daemon
             .manager
             .lock()
-            .get_engine_state()
-            .playback_output_device
-            .is_none()
-        {
-            eprintln!("skipping live engine mutation test: playback has no output device");
-            return;
-        }
+            .resume()
+            .expect("resume fake HAL silent source after pipeline seed");
+        assert_fake_driver_uses_lab_output(&daemon);
 
         let start = Arc::new(Barrier::new(3));
         let first_daemon = Arc::clone(&daemon);
@@ -3235,6 +3218,7 @@ mod command_roundtrip_tests {
     #[test]
     fn handle_set_output_route_rejects_empty_and_unknown_devices() {
         let daemon = AudioDaemon::new();
+        let lab_backend = daemon.driver_manager.lock().is_lab_backend();
         assert!(
             !daemon
                 .handle_set_output_route("   ", None, None, None, None, None)
@@ -3249,12 +3233,12 @@ mod command_roundtrip_tests {
             None,
         );
         assert!(!missing.success);
-        assert!(
-            missing
-                .error
-                .expect("missing device error")
-                .contains("not found")
-        );
+        let error = missing.error.expect("missing device error");
+        if lab_backend {
+            assert_eq!(error, "Lab backend cannot select a physical output device");
+        } else {
+            assert!(error.contains("not found"), "{error}");
+        }
     }
 
     #[test]
