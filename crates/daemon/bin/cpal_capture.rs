@@ -113,6 +113,7 @@ impl CpalCaptureDriver {
     }
 
     /// Number of captured samples dropped because the consumer stalled.
+    #[cfg(test)]
     pub fn overflow_count(&self) -> u64 {
         self.overflow_drops.load(Ordering::Relaxed)
     }
