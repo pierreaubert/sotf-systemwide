@@ -151,13 +151,14 @@ pub(super) fn handle_driver_config_change(
     // A failed restart must not leave HAL believing that a stopped engine is
     // still ready to consume audio.
     driver_manager.lock().set_engine_ready(false);
+    let output_sink_type = driver_manager.lock().output_sink_type();
     match reconfigure_audio_pipeline_with_sink(
         audio_manager,
         system_state,
         actual_rate,
         requested_frames,
         requested_channels as usize,
-        driver_manager.lock().output_sink_type(),
+        output_sink_type,
     ) {
         Ok(outcome) => {
             let (active_config, result) = acknowledged_config_for_outcome(
