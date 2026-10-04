@@ -9,8 +9,8 @@
 use serial_test::serial;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::ops::{Deref, DerefMut};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
@@ -184,7 +184,10 @@ impl DaemonFixture {
     }
 
     fn shutdown(mut self) {
-        eprintln!("lab fixture: requesting daemon shutdown pid={}", self.child.id());
+        eprintln!(
+            "lab fixture: requesting daemon shutdown pid={}",
+            self.child.id()
+        );
         let _ = self.send(r#"{"command":"shutdown"}"#);
 
         for _ in 0..100 {
@@ -297,7 +300,8 @@ fn second_daemon_with_distinct_socket_cannot_rotate_shared_transport_key() {
     let second_socket_path = daemon._temp_dir.path().join("alternate-daemon.sock");
 
     let second_stderr_path = daemon._temp_dir.path().join("alternate-daemon.stderr.log");
-    let second_stderr = File::create(&second_stderr_path).expect("create alternate daemon stderr log");
+    let second_stderr =
+        File::create(&second_stderr_path).expect("create alternate daemon stderr log");
     let mut second = OwnedChild(
         Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
             .env("SOTF_DAEMON_SOCKET_PATH", &second_socket_path)

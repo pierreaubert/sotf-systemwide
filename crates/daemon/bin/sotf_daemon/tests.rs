@@ -989,9 +989,9 @@ mod ipc_safety_tests {
         AudioDaemon {
             manager: Arc::new(Mutex::new(AudioEngineManager::new())),
             running: Arc::new(Mutex::new(true)),
-            driver_manager: Arc::new(Mutex::new(DriverManager::from_driver_with_lab_output(Box::new(
-                FakeDriver::new(state),
-            )))),
+            driver_manager: Arc::new(Mutex::new(DriverManager::from_driver_with_lab_output(
+                Box::new(FakeDriver::new(state)),
+            ))),
             system_state: Arc::new(Mutex::new(SystemwideState::default())),
             key_manager: Arc::new(Mutex::new(KeyManager::for_test())),
             pipeline_mutation: Arc::new(Mutex::new(())),
@@ -1004,11 +1004,14 @@ mod ipc_safety_tests {
     }
 
     fn assert_fake_driver_uses_lab_output(daemon: &AudioDaemon) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // The playback worker publishes callback and frame counters every five seconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(7);
         loop {
             let playback = daemon.manager.lock().get_engine_state();
             if playback.playback_output_device.as_deref() == Some("Systemwide Lab Output")
                 && playback.playback_callback_count > 0
+                && playback.playback_frames_received > 0
+                && playback.playback_frames_written > 0
             {
                 return;
             }
