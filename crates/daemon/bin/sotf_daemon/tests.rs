@@ -1872,6 +1872,11 @@ mod ipc_safety_tests {
             output_channels: 2,
         });
         assert!(seed.success, "failed to seed rack pipeline: {seed:?}");
+        daemon
+            .manager
+            .lock()
+            .resume()
+            .expect("resume fake HAL silent source after rack seed");
         assert_fake_driver_uses_lab_output(&daemon);
         let rack_generation = daemon
             .system_state
@@ -2379,6 +2384,11 @@ mod ipc_safety_tests {
             output_channels: 2,
         });
         assert!(seed.success, "failed to seed pipeline: {seed:?}");
+        daemon
+            .manager
+            .lock()
+            .resume()
+            .expect("resume fake HAL silent source after pipeline seed");
         assert_fake_driver_uses_lab_output(&daemon);
 
         let start = Arc::new(Barrier::new(3));
