@@ -38,7 +38,7 @@ bytemuck = { version = "1.14", features = ["derive"] }
 # Test and QA
 tempfile = "3.23"
 insta = { version = "1.42", features = ["json"] }
-serial_test = "3"
+serial_test = "4.0.1"
 proptest = "1.9"
 
 # Audio output

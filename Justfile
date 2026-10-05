@@ -21,11 +21,11 @@ import 'builds/systemwide.just'
 
 [group('test')]
 check:
-	{{cargo}} check --workspace --lib --bins --tests --examples
+	{{cargo}} check --workspace --all-targets
 
 [group('test')]
 test:
-	{{cargo}} test --workspace --lib --bins --tests --examples
+	{{cargo}} test --workspace --all-targets
 
 # Run the isolated macOS systemwide-audio lab. This does not install or touch
 # the CoreAudio HAL bundle; subprocess tests use temporary Unix sockets and
