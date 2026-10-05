@@ -21,18 +21,14 @@ pub(super) fn plugin_type_category(pt: &PluginType) -> &'static str {
         PluginType::EQ
         | PluginType::AnalogEq
         | PluginType::FletcherMunson
-        | PluginType::LoudnessCompensation => {
-            "EQ & Tone"
-        }
+        | PluginType::LoudnessCompensation => "EQ & Tone",
         PluginType::Gain | PluginType::Dither => "Utility",
         PluginType::Compressor
         | PluginType::AnalogCompressor
         | PluginType::Limiter
         | PluginType::AnalogLimiter
         | PluginType::Gate
-        | PluginType::Expander => {
-            "Dynamics"
-        }
+        | PluginType::Expander => "Dynamics",
         PluginType::MultibandCompressor | PluginType::MultibandExpander => "Dynamics",
         PluginType::AAE
         | PluginType::Upmixer
@@ -89,7 +85,10 @@ mod tests {
         }
         assert_eq!(plugin_type_category(&PluginType::Dither), "Utility");
         assert_eq!(plugin_type_category(&PluginType::AnalogEq), "EQ & Tone");
-        assert_eq!(plugin_type_category(&PluginType::AnalogCompressor), "Dynamics");
+        assert_eq!(
+            plugin_type_category(&PluginType::AnalogCompressor),
+            "Dynamics"
+        );
         assert_eq!(plugin_type_category(&PluginType::AnalogLimiter), "Dynamics");
     }
 }

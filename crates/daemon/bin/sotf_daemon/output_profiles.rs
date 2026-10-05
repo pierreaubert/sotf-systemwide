@@ -687,7 +687,10 @@ mod tests {
         let path = directory.path().join(PROFILES_FILE_NAME);
         let mut store = OutputProfileStore::default();
         let id = store.upsert(rack_profile("")).unwrap();
-        assert!(!store.save().unwrap(), "an in-memory store must remain session-only");
+        assert!(
+            !store.save().unwrap(),
+            "an in-memory store must remain session-only"
+        );
         store.assign(Some("UID-1"), "Headphones", &id).unwrap();
         store
             .record_route(Some("UID-1"), "Headphones", &id)
