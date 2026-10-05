@@ -3125,6 +3125,9 @@ mod command_roundtrip_tests {
     #[test]
     fn output_profile_crud_round_trip_on_one_daemon() {
         let daemon = AudioDaemon::new();
+        // This CRUD transaction owns one in-memory store; other tests may
+        // share the process environment but must not advance its id counter.
+        *daemon.output_profiles.lock() = crate::output_profiles::OutputProfileStore::default();
 
         let created = daemon.handle_set_output_profile(test_output_profile(
             "",

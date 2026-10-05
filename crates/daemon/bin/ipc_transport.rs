@@ -13,13 +13,16 @@
 //!   the credential-check equivalent (see `is_loopback_addr` and
 //!   `security::verify_peer_credentials`).
 //!
-//! Call sites use [`IpcStream`] / [`IpcListener`] so the accept loop,
-//! per-client handlers, and line-reader stay identical across platforms.
+//! Call sites use [`IpcStream`] for per-client handlers on both platforms.
+//! The Windows accept loop also uses `IpcListener`.
 
+#[cfg(any(windows, test))]
 use std::ffi::OsString;
+#[cfg(any(windows, test))]
 use std::net::SocketAddr;
 #[cfg(windows)]
 use std::path::Path;
+#[cfg(any(windows, test))]
 use std::path::PathBuf;
 
 /// Connected IPC stream: `UnixStream` on Unix, loopback `TcpStream` on Windows.
@@ -30,11 +33,7 @@ pub type IpcStream = std::os::unix::net::UnixStream;
 #[cfg(windows)]
 pub type IpcStream = std::net::TcpStream;
 
-/// Listening IPC socket: `UnixListener` on Unix, loopback `TcpListener` on Windows.
-#[cfg(unix)]
-pub type IpcListener = std::os::unix::net::UnixListener;
-
-/// Listening IPC socket: `UnixListener` on Unix, loopback `TcpListener` on Windows.
+/// Listening IPC socket for the Windows loopback transport.
 #[cfg(windows)]
 pub type IpcListener = std::net::TcpListener;
 
@@ -42,6 +41,7 @@ pub type IpcListener = std::net::TcpListener;
 ///
 /// The file holds the ASCII decimal port with a single trailing newline, so it
 /// stays human-inspectable and trivially parseable by clients.
+#[cfg(any(windows, test))]
 pub fn encode_port_file_contents(port: u16) -> String {
     format!("{port}\n")
 }
@@ -51,6 +51,7 @@ pub fn encode_port_file_contents(port: u16) -> String {
 /// Returns `None` for empty input, trailing garbage, or port `0` (never a
 /// valid bound listener port). Pure function so clients and tests share the
 /// exact acceptance rule.
+#[cfg(any(windows, test))]
 pub fn decode_port_file_contents(text: &str) -> Option<u16> {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.len() > 5 {
@@ -68,10 +69,12 @@ pub fn decode_port_file_contents(text: &str) -> Option<u16> {
 /// The Windows daemon binds `127.0.0.1` and refuses non-loopback peers; this
 /// predicate is the shared definition used by the credential check and its
 /// tests. The port is ignored.
+#[cfg(any(windows, test))]
 pub fn is_loopback_addr(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
+#[cfg(any(windows, test))]
 fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
     value
         .map(PathBuf::from)
@@ -84,6 +87,7 @@ fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
 /// explicit socket override, then runtime-dir override, then the per-user
 /// `%LOCALAPPDATA%\sotf\daemon.sock` default. Pure function for testability;
 /// `security::get_secure_socket_path` selects it under `cfg(windows)`.
+#[cfg(any(windows, test))]
 pub fn windows_socket_path_from_env(
     socket_override: Option<OsString>,
     runtime_dir: Option<OsString>,
@@ -220,6 +224,7 @@ pub fn bind_windows_listener(port_file: &Path) -> std::io::Result<IpcListener> {
 /// Loopback connects normally succeed or refuse instantly; the bound only
 /// matters when a SYN hangs (stale port file, filtered stack). It mirrors
 /// the `IPC_CLIENT_*_TIMEOUT_SECS` discipline so no IPC path blocks forever.
+#[cfg(any(windows, test))]
 pub const WINDOWS_LOOPBACK_CONNECT_TIMEOUT_SECS: u64 = 5;
 
 /// Connect to `127.0.0.1:port` with [`WINDOWS_LOOPBACK_CONNECT_TIMEOUT_SECS`].

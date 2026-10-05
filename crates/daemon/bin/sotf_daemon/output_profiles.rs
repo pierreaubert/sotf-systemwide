@@ -100,6 +100,9 @@ pub(super) enum StartupChain {
 /// Daemon-owned store of per-output DSP profiles.
 #[derive(Debug)]
 pub(super) struct OutputProfileStore {
+    /// Fixed when the store is loaded. In-memory stores never write the
+    /// process-wide state path, which may belong to another concurrent test.
+    persistence_path: Option<PathBuf>,
     profiles: HashMap<String, OutputProfile>,
     /// Device key (`uid:<uid>` or `name:<name>`) -> profile id. Written both
     /// by explicit assignment and, as last-used memory, by route switches.
@@ -113,6 +116,7 @@ pub(super) struct OutputProfileStore {
 impl Default for OutputProfileStore {
     fn default() -> Self {
         Self {
+            persistence_path: None,
             profiles: HashMap::new(),
             assignments: HashMap::new(),
             current_device_uid: None,
@@ -134,11 +138,16 @@ impl OutputProfileStore {
     }
 
     pub(super) fn load() -> Self {
-        let Some(path) = output_profiles_path() else {
+        Self::load_at(output_profiles_path())
+    }
+
+    fn load_at(path: Option<PathBuf>) -> Self {
+        let Some(path) = path else {
             return Self::default();
         };
         match load_profiles_from_path(&path) {
             Some(persisted) => Self {
+                persistence_path: Some(path),
                 profiles: persisted
                     .profiles
                     .into_iter()
@@ -150,7 +159,10 @@ impl OutputProfileStore {
                 current_profile_id: persisted.current_profile_id,
                 next_id: persisted.next_id.max(1),
             },
-            None => Self::default(),
+            None => Self {
+                persistence_path: Some(path),
+                ..Self::default()
+            },
         }
     }
 
@@ -159,7 +171,7 @@ impl OutputProfileStore {
     /// environments) the store stays session-only and reports false so
     /// callers can warn instead of failing the mutation.
     fn save(&self) -> Result<bool, String> {
-        let Some(path) = output_profiles_path() else {
+        let Some(path) = self.persistence_path.as_deref() else {
             return Ok(false);
         };
         let mut profiles: Vec<OutputProfile> = self.profiles.values().cloned().collect();
@@ -173,7 +185,7 @@ impl OutputProfileStore {
             current_profile_id: self.current_profile_id.clone(),
             next_id: self.next_id,
         };
-        save_profiles_to_path(&path, &persisted)
+        save_profiles_to_path(path, &persisted)
             .map_err(|error| format!("failed to persist output profiles: {error}"))?;
         Ok(true)
     }
@@ -675,6 +687,7 @@ mod tests {
         let path = directory.path().join(PROFILES_FILE_NAME);
         let mut store = OutputProfileStore::default();
         let id = store.upsert(rack_profile("")).unwrap();
+        assert!(!store.save().unwrap(), "an in-memory store must remain session-only");
         store.assign(Some("UID-1"), "Headphones", &id).unwrap();
         store
             .record_route(Some("UID-1"), "Headphones", &id)
@@ -706,6 +719,28 @@ mod tests {
         wrong_version["version"] = serde_json::json!(PROFILES_VERSION + 1);
         std::fs::write(&path, serde_json::to_vec(&wrong_version).unwrap()).unwrap();
         assert!(load_profiles_from_path(&path).is_none());
+    }
+
+    #[test]
+    fn loaded_store_keeps_its_own_persistence_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first-output-profiles.json");
+        let second_path = directory.path().join("second-output-profiles.json");
+        let mut first = OutputProfileStore::load_at(Some(first_path.clone()));
+        let mut second = OutputProfileStore::load_at(Some(second_path.clone()));
+
+        assert_eq!(first.upsert(rack_profile("")).unwrap(), "profile-1");
+        assert_eq!(second.upsert(rack_profile("")).unwrap(), "profile-1");
+        assert_eq!(first.upsert(rack_profile("")).unwrap(), "profile-2");
+        assert!(first_path.is_file());
+        assert!(second_path.is_file());
+
+        let reloaded_first = OutputProfileStore::load_at(Some(first_path));
+        let reloaded_second = OutputProfileStore::load_at(Some(second_path));
+        assert_eq!(reloaded_first.next_id, 3);
+        assert_eq!(reloaded_second.next_id, 2);
+        assert_eq!(reloaded_first.profiles.len(), 2);
+        assert_eq!(reloaded_second.profiles.len(), 1);
     }
 
     #[test]
