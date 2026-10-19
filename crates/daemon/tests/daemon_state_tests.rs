@@ -138,7 +138,7 @@ fn daemon_load_plugins_carries_hal_input_channels() {
         "load_plugins should carry requested HAL input channels into driver config"
     );
     assert!(
-        source.contains("start_hal_playback_with_driver_config_and_sink(")
+        source.contains("start_driver_playback_with_source(")
             && source.contains("plan.spec.input_channels"),
         "driver playback should be restarted with the resolved HAL input channel count"
     );
@@ -293,6 +293,7 @@ fn daemon_pkg_preinstall_quiesces_running_daemon_before_upgrade() {
 #[test]
 fn systemwide_pkg_ships_launch_agent_and_exposes_installer_progress_and_logs() {
     let source = include_str!("../../../scripts/build-systemwide.sh");
+    let user_files = include_str!("../../../scripts/lib/prepare_user_files.sh");
     let daemon_plist = include_str!("../../../builds/macos/org.spinorama.sotf-daemon.plist");
     let configbar_plist = include_str!("../../../builds/macos/org.spinorama.sotf-systemwide.plist");
 
@@ -317,12 +318,14 @@ fn systemwide_pkg_ships_launch_agent_and_exposes_installer_progress_and_logs() {
         "LaunchAgent templates should use the installed app path and installer-resolved durable logs"
     );
     assert!(
-        source.contains("/usr/libexec/PlistBuddy -c \"Set :StandardOutPath $stdout_path\"")
+        user_files.contains("/usr/libexec/PlistBuddy -c \"Set :StandardOutPath $stdout_path\"")
             && source.contains("LOG_DIR=\"$USER_HOME/Library/Logs/SotF\"")
             && source.contains("LOG_ROLLOVER_BYTES=10485760")
-            && source.contains("prepare_log \"$LOG_DIR/sotf-daemon.log\"")
-            && source.contains("prepare_log \"$LOG_DIR/sotf-systemwide.log\""),
-        "postinstall should resolve, prepare, and bound daemon and ConfigBar logs"
+            && user_files.contains("prepare_log \"$LOG_DIR/sotf-daemon.log\"")
+            && user_files.contains("prepare_log \"$LOG_DIR/sotf-systemwide.log\"")
+            && source.contains("as_console_user /bin/bash \"$SCRIPT_DIR/prepare_user_files.sh\"")
+            && user_files.contains("Refusing to prepare user files as root"),
+        "postinstall must prepare bounded logs and plists only with console-user privileges"
     );
     assert!(
         source.contains("launchctl asuser \"$CONSOLE_UID\"")

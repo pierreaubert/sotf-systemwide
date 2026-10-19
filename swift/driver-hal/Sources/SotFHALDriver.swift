@@ -297,41 +297,90 @@ final class DriverState {
     private var sharedAudioSlot0Readers: UInt64 = 0
     private var sharedAudioSlot1Readers: UInt64 = 0
 
+    // A failed bounded lease returns this immutable, disconnected object.
+    private let unavailableSharedAudio = SharedAudioBuffer()
+    private var callbackSessionEnabled: UInt32 = 1
+    private let sessionLock = NSLock()
+    private var transportSessionPath = getSharedMemoryPath()
+    private var requestedSessionPath: String?
+
+    /// Control-path notification: stop admitting audio before retiring a session.
+    func noticeConsoleSessionChange() {
+        let path = getSharedMemoryPath()
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        if path != transportSessionPath {
+            requestedSessionPath = path
+            sotf_atomic_store_u32(&callbackSessionEnabled, 0)
+        }
+    }
+
+    /// Maintenance owns reclamation, after all old callback leases have drained.
+    @discardableResult
+    func reconcileConsoleSession() -> Bool {
+        noticeConsoleSessionChange()
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        guard let nextPath = requestedSessionPath else { return true }
+        guard sotf_cipher_try_write(&sharedAudioSlot0Readers) else { return false }
+        guard sotf_cipher_try_write(&sharedAudioSlot1Readers) else {
+            sotf_cipher_end_write(&sharedAudioSlot0Readers)
+            return false
+        }
+        defer {
+            sotf_cipher_end_write(&sharedAudioSlot1Readers)
+            sotf_cipher_end_write(&sharedAudioSlot0Readers)
+        }
+        for audio in sharedAudioSlots { audio.closeSharedMemory() }
+        // Neither old PCM nor pending configuration belongs to the next user.
+        inputRingBuffer?.reset()
+        outputRingBuffer?.reset()
+        volumeLock.lock()
+        _volumeScalar = 1
+        _outputMuted = false
+        _publishedVolumeGeneration = 0
+        volumeLock.unlock()
+        clearPendingHostConfiguration()
+        clearPendingDaemonConfig()
+        EncryptionKeyManager.shared.reloadFromCurrentEnvironment()
+        transportSessionPath = nextPath
+        requestedSessionPath = nil
+        initRetryLock.lock()
+        _lastInitRetry = 0
+        initRetryLock.unlock()
+        halLog("[MAINT] retired previous console audio session")
+        return true
+    }
+
     var sharedAudio: SharedAudioBuffer {
         sharedAudioSlots[Int(sotf_atomic_load_u32(&activeSharedAudioSlot))]
     }
 
     @inline(__always)
     func acquireSharedAudioForCallback() -> (buffer: SharedAudioBuffer, slot: UInt32) {
-        while true {
+        for _ in 0..<3 {
+            guard sotf_atomic_load_u32(&callbackSessionEnabled) != 0 else { break }
             let slot = sotf_atomic_load_u32(&activeSharedAudioSlot)
-            if slot == 0 {
-                _ = sotf_atomic_fetch_add_u64_previous(&sharedAudioSlot0Readers, 1)
-            } else {
-                _ = sotf_atomic_fetch_add_u64_previous(&sharedAudioSlot1Readers, 1)
-            }
-
-            if slot == sotf_atomic_load_u32(&activeSharedAudioSlot) {
+            let pinned = slot == 0 ? sotf_cipher_try_pin(&sharedAudioSlot0Readers)
+                : sotf_cipher_try_pin(&sharedAudioSlot1Readers)
+            guard pinned else { continue }
+            if slot == sotf_atomic_load_u32(&activeSharedAudioSlot)
+                && sotf_atomic_load_u32(&callbackSessionEnabled) != 0 {
                 return (sharedAudioSlots[Int(slot)], slot)
             }
             finishSharedAudioCallback(slot: slot)
         }
+        return (unavailableSharedAudio, UInt32.max)
     }
 
     @inline(__always)
     func finishSharedAudioCallback(slot: UInt32) {
+        if slot == UInt32.max { return }
         if slot == 0 {
             _ = sotf_atomic_fetch_add_u64_previous(&sharedAudioSlot0Readers, UInt64.max)
         } else {
             _ = sotf_atomic_fetch_add_u64_previous(&sharedAudioSlot1Readers, UInt64.max)
         }
-    }
-
-    private func sharedAudioReaderCount(slot: UInt32) -> UInt64 {
-        if slot == 0 {
-            return sotf_atomic_load_u64(&sharedAudioSlot0Readers)
-        }
-        return sotf_atomic_load_u64(&sharedAudioSlot1Readers)
     }
 
     // Loopback mode (when Rust engine not connected)
@@ -385,7 +434,6 @@ final class DriverState {
         if let scalar { _volumeScalar = clampVolumeScalar(scalar) }
         if let muted { _outputMuted = muted }
         let current = (_volumeScalar, _outputMuted)
-        volumeLock.unlock()
 
         let lease = acquireSharedAudioForCallback()
         let generation = lease.buffer.setOutputVolume(
@@ -395,10 +443,9 @@ final class DriverState {
         finishSharedAudioCallback(slot: lease.slot)
 
         if generation != 0 {
-            volumeLock.lock()
             _publishedVolumeGeneration = generation
-            volumeLock.unlock()
         }
+        volumeLock.unlock()
         notifyVolumePropertiesChanged()
         halLog("[VOLUME] scalar=\(current.0) muted=\(current.1) generation=\(generation)")
     }
@@ -408,12 +455,12 @@ final class DriverState {
     /// local state actually changed so the OSD and sliders track IPC
     /// `set_volume` changes.
     func syncVolumeFromSharedMemory() {
+        volumeLock.lock()
         let lease = acquireSharedAudioForCallback()
         let shared = lease.buffer.outputVolume()
         finishSharedAudioCallback(slot: lease.slot)
 
-        guard shared.generation != 0 else { return }
-        volumeLock.lock()
+        guard shared.generation != 0 else { volumeLock.unlock(); return }
         let changed = shared.generation != _publishedVolumeGeneration
         if changed {
             _volumeScalar = clampVolumeScalar(Float32(bitPattern: shared.scalarBits))
@@ -441,13 +488,16 @@ final class DriverState {
     /// Attempt to re-initialise shared memory if we're not connected.
     /// Throttled to one call per second. Safe to call from any thread.
     func attemptInitRetryIfNeeded() {
-        let lease = acquireSharedAudioForCallback()
-        let sharedAudio = lease.buffer
-        defer { finishSharedAudioCallback(slot: lease.slot) }
-
-        if sharedAudio.isConnected {
-            return
+        let slot = sotf_atomic_load_u32(&activeSharedAudioSlot)
+        let acquired = slot == 0 ? sotf_cipher_try_write(&sharedAudioSlot0Readers)
+            : sotf_cipher_try_write(&sharedAudioSlot1Readers)
+        guard acquired else { return }
+        defer {
+            if slot == 0 { sotf_cipher_end_write(&sharedAudioSlot0Readers) }
+            else { sotf_cipher_end_write(&sharedAudioSlot1Readers) }
         }
+        let sharedAudio = sharedAudioSlots[Int(slot)]
+        if sharedAudio.isConnected { return }
         let now = ProcessInfo.processInfo.systemUptime
         initRetryLock.lock()
         let should = (now - _lastInitRetry) > 1.0
@@ -466,6 +516,7 @@ final class DriverState {
             channelCount: configuration.channelCount
         )
         halLog("[RETRY] sharedAudio.initialize -> \(ok), isConnected=\(sharedAudio.isConnected)")
+        if ok { sotf_atomic_store_u32(&callbackSessionEnabled, 1) }
     }
 
     func startMaintenanceTasks() {
@@ -496,21 +547,22 @@ final class DriverState {
         }
 
         let replacementSlot: UInt32 = activeSlot == 0 ? 1 : 0
-        guard sharedAudioReaderCount(slot: replacementSlot) == 0 else {
-            return true
+        let acquired = replacementSlot == 0 ? sotf_cipher_try_write(&sharedAudioSlot0Readers)
+            : sotf_cipher_try_write(&sharedAudioSlot1Readers)
+        guard acquired else { return true }
+        defer {
+            if replacementSlot == 0 { sotf_cipher_end_write(&sharedAudioSlot0Readers) }
+            else { sotf_cipher_end_write(&sharedAudioSlot1Readers) }
         }
 
         let replacement = sharedAudioSlots[Int(replacementSlot)]
         replacement.closeSharedMemory()
         let configuration = activeConfiguration()
-        guard replacement.initialize(
+        _ = replacement.initialize(
             sampleRate: UInt32(configuration.sampleRate),
             bufferFrames: configuration.bufferFrames,
             channelCount: configuration.channelCount
-        ) else {
-            return true
-        }
-
+        )
         sotf_atomic_store_u32(&activeSharedAudioSlot, replacementSlot)
         halLog("[MAINT] published shared-memory mapping generation \(replacementSlot)")
         return true
@@ -523,9 +575,12 @@ final class DriverState {
             return
         }
 
+        guard reconcileConsoleSession() else { return }
+        attemptInitRetryIfNeeded()
+
         // Key discovery and reload perform filesystem I/O and must stay off the
-        // CoreAudio callback. The encrypted realtime transport remains disabled
-        // until the HAL can publish and consume an allocation-free cipher snapshot.
+        // CoreAudio callback. Cipher publication pins readers to immutable slots;
+        // replacement and final reclamation remain on this maintenance queue.
         _ = EncryptionKeyManager.shared.checkAndReload()
 
         if handoffStaleSharedAudioMappingIfNeeded() {
@@ -534,7 +589,6 @@ final class DriverState {
         let lease = acquireSharedAudioForCallback()
         let sharedAudio = lease.buffer
         defer { finishSharedAudioCallback(slot: lease.slot) }
-        attemptInitRetryIfNeeded()
 
         if sharedAudio.isConnected {
             sharedAudio.setActive(isRunning)
@@ -939,7 +993,7 @@ final class DriverState {
     }
 
     static let shared = DriverState()
-    private init() {
+    init() {
         // Initialize ring buffers
         resetBuffers()
     }
@@ -1077,6 +1131,7 @@ private func driverDestroyDevice(_ driver: AudioServerPlugInDriverRef, _ deviceO
 
 private func driverAddDeviceClient(_ driver: AudioServerPlugInDriverRef, _ deviceObjectID: AudioObjectID, _ clientInfo: UnsafePointer<AudioServerPlugInClientInfo>) -> OSStatus {
     let info = clientInfo.pointee
+    DriverState.shared.noticeConsoleSessionChange()
     halLog("AddDeviceClient: device=\(deviceObjectID) client=\(info.mClientID) pid=\(info.mProcessID)")
     return noErr
 }
@@ -1848,6 +1903,7 @@ private func driverStartIO(_ driver: AudioServerPlugInDriverRef, _ deviceObjectI
     halLog("StartIO: device=\(deviceObjectID) client=\(clientID)")
 
     let state = DriverState.shared
+    state.noticeConsoleSessionChange()
     let lease = state.acquireSharedAudioForCallback()
     let sharedAudio = lease.buffer
     defer { state.finishSharedAudioCallback(slot: lease.slot) }
@@ -1908,7 +1964,9 @@ private func driverStopIO(_ driver: AudioServerPlugInDriverRef, _ deviceObjectID
 
 private func driverGetZeroTimeStamp(_ driver: AudioServerPlugInDriverRef, _ deviceObjectID: AudioObjectID, _ clientID: UInt32, _ outSampleTime: UnsafeMutablePointer<Float64>, _ outHostTime: UnsafeMutablePointer<UInt64>, _ outSeed: UnsafeMutablePointer<UInt64>) -> OSStatus {
     let state = DriverState.shared
-    let (sampleTime, hostTime, seed) = state.clock.getZeroTimeStamp(period: kZeroTimeStampPeriod)
+    guard let (sampleTime, hostTime, seed) = state.clock.getZeroTimeStamp(period: kZeroTimeStampPeriod) else {
+        return kAudioHardwareNotRunningError
+    }
 
     outSampleTime.pointee = sampleTime
     outHostTime.pointee = hostTime
@@ -1994,6 +2052,12 @@ private func driverDoIOOperation(_ driver: AudioServerPlugInDriverRef, _ deviceO
     let channelCount = Int(state.callbackChannelCountSnapshot())
     let sampleCount = frameCount * channelCount
     let floatBuffer = buffer.assumingMemoryBound(to: Float.self)
+    guard sharedAudioLease.slot != UInt32.max else {
+        if operationID == kIOOperation_ReadInput {
+            memset(floatBuffer, 0, sampleCount * MemoryLayout<Float>.size)
+        }
+        return noErr
+    }
 
     switch operationID {
     case kIOOperation_ReadInput:

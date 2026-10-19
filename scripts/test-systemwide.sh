@@ -43,7 +43,11 @@ test_rust_common() {
     cargo test --locked --manifest-path ../sotf-daw/Cargo.toml -p driver-common
 
     phase "sotf-daemon tests (including real local IPC)"
-    cargo test --locked -p sotf-daemon
+    if [[ "$(uname -s)" = "Darwin" ]]; then
+        cargo test --locked -p sotf-daemon --features hal
+    else
+        cargo test --locked -p sotf-daemon
+    fi
 }
 
 test_macos() {
@@ -85,6 +89,12 @@ test_macos() {
 
     phase "ConfigBar XCTest suites"
     scripts/test-configbar.sh "$swift_build_dir"
+
+    phase "Swift HAL behavioral tests"
+    just test-hal-driver-swift
+
+    phase "Installer privilege and readiness fixtures"
+    "${PYTHON:-python3}" scripts/tests/test_installer_user_files.py
 
     local hal_sources="swift/driver-hal/Sources"
     phase "Swift HAL driver type-check"

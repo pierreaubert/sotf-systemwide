@@ -22,8 +22,9 @@ use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn test_socket_path_is_user_specific() {
-    let path = get_secure_socket_path();
-    assert!(path.to_string_lossy().contains("sotf"));
+    let uid = get_current_uid();
+    let path = secure_socket_path_from_env(None, None, None, None, uid);
+    assert_eq!(path, PathBuf::from(format!("/tmp/sotf-{uid}/daemon.sock")));
 }
 
 #[cfg(unix)]
@@ -441,9 +442,23 @@ fn test_published_hal_key_copy_is_0600() {
 }
 
 #[test]
-fn test_socket_path_under_tmpdir_or_contains_uid() {
+#[serial]
+fn test_socket_path_respects_override_or_user_runtime() {
     let path = get_secure_socket_path();
     let path_str = path.to_string_lossy();
+
+    if let Some(explicit) =
+        std::env::var_os("SOTF_DAEMON_SOCKET_PATH").filter(|value| !value.is_empty())
+    {
+        assert_eq!(path, PathBuf::from(explicit));
+        return;
+    }
+    if let Some(runtime) =
+        std::env::var_os("SOTF_SYSTEMWIDE_RUNTIME_DIR").filter(|value| !value.is_empty())
+    {
+        assert_eq!(path, PathBuf::from(runtime).join("daemon.sock"));
+        return;
+    }
 
     let uid = get_current_uid();
     let tmpdir = std::env::var("TMPDIR").ok();

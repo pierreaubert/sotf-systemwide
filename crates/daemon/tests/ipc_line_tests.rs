@@ -19,6 +19,11 @@ use std::time::{Duration, Instant};
 
 static DAEMON_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(windows)]
+#[path = "../bin/ipc_transport.rs"]
+#[allow(dead_code)] // The integration fixture uses only the client-side API.
+mod ipc_transport;
+
 /// Connect to the fixture daemon's IPC endpoint: dial the Unix socket at
 /// `socket_path` on Unix; on Windows read the loopback port back from the
 /// port file at `socket_path` and dial `127.0.0.1:port` with a timeout.
@@ -29,16 +34,7 @@ fn connect_daemon(socket_path: &Path) -> std::os::unix::net::UnixStream {
 
 #[cfg(windows)]
 fn connect_daemon(socket_path: &Path) -> std::net::TcpStream {
-    let port: u16 = std::fs::read_to_string(socket_path)
-        .expect("read daemon port file")
-        .trim()
-        .parse()
-        .expect("parse daemon port number");
-    std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_secs(5),
-    )
-    .expect("connect to daemon loopback port")
+    ipc_transport::connect_windows(socket_path).expect("authenticate fixture connection")
 }
 
 /// Reap subprocesses created outside `DaemonFixture`, including on assertion panic.
@@ -206,6 +202,37 @@ impl DaemonFixture {
         }
     }
 
+    #[allow(clippy::zombie_processes)]
+    fn restart(&mut self) {
+        assert_eq!(self.send(r#"{"command":"shutdown"}"#)["success"], true);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while self.child.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "daemon did not stop before restart"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let stderr = File::create(&self.stderr_path).unwrap();
+        self.child = Command::new(env!("CARGO_BIN_EXE_sotf-daemon"))
+            .env("SOTF_DAEMON_SOCKET_PATH", &self.socket_path)
+            .env("SOTF_SYSTEMWIDE_RUNTIME_DIR", self._temp_dir.path())
+            .env(
+                "SOTF_SYSTEMWIDE_STATE_PATH",
+                self._temp_dir.path().join("systemwide-state.json"),
+            )
+            .env_remove("SOTF_OUTPUT_DEVICE")
+            .env("SOTF_SYSTEMWIDE_DRIVER", "lab")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .unwrap();
+        while !self.socket_path.exists() {
+            assert!(Instant::now() < deadline, "restarted daemon did not bind");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn shutdown(mut self) {
         eprintln!(
             "lab fixture: requesting daemon shutdown pid={}",
@@ -231,6 +258,85 @@ impl Drop for DaemonFixture {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+#[serial]
+fn profile_switch_preserves_both_saved_chains_and_failed_route() {
+    let mut fixture = DaemonFixture::start();
+    // Fence asynchronous startup with a serialized explicit playback intent.
+    assert_eq!(fixture.send(r#"{"command":"play"}"#)["success"], true);
+    let mut ids = Vec::new();
+    for (name, gain, graph) in [("A", -3.0, false), ("B", -9.0, true)] {
+        let response = fixture.send(
+            &serde_json::json!({
+                "command": "set_output_profile",
+                "profile": {
+                    "id": "", "name": name, "topology": if graph { "graph" } else { "rack" },
+                    "plugins": if graph { serde_json::json!([]) } else { serde_json::json!([{"plugin_type":"gain","parameters":{"gain_db":gain}}]) },
+                    "graph": if graph { serde_json::json!({"nodes":[{"id":5,"plugin_type":"gain","parameters":{"gain_db":gain},"input_channels":2}],"edges":[]}) } else { serde_json::Value::Null }, "input_channels": 2, "output_channels": 2,
+                    "updated_at_unix_ms": 0,
+                },
+            })
+            .to_string(),
+        );
+        assert_eq!(response["success"], true, "{response}");
+        ids.push(response["data"]["profile_id"].as_str().unwrap().to_owned());
+    }
+    let saved_gain = |profile: &serde_json::Value| {
+        if profile["topology"] == "graph" {
+            profile["graph"]["nodes"][0]["parameters"]["gain_db"].clone()
+        } else {
+            profile["plugins"][0]["parameters"]["gain_db"].clone()
+        }
+    };
+    for index in [0, 1, 0] {
+        let response = fixture.send(
+            &serde_json::json!({
+                "command": "set_output_route", "output_device": "Systemwide Lab Output",
+                "profile_id": ids[index],
+            })
+            .to_string(),
+        );
+        assert_eq!(response["success"], true, "{response}");
+        let profiles = fixture.send(r#"{"command":"get_output_profiles"}"#);
+        assert_eq!(profiles["data"]["current"]["profile_id"], ids[index]);
+        for (id, expected_gain) in ids.iter().zip([-3.0, -9.0]) {
+            let saved = profiles["data"]["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|profile| profile["id"] == *id)
+                .unwrap();
+            assert_eq!(saved_gain(saved), expected_gain);
+        }
+    }
+    let failed = fixture.send(
+        &serde_json::json!({
+            "command": "set_output_route", "output_device": "Missing Output", "profile_id": ids[1],
+        })
+        .to_string(),
+    );
+    assert_eq!(failed["success"], false);
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fixture._temp_dir.path().join("output-profiles.json")).unwrap(),
+    )
+    .unwrap();
+    for (id, expected_gain) in ids.iter().zip([-3.0, -9.0]) {
+        let saved = persisted["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|profile| profile["id"] == *id)
+            .unwrap();
+        assert_eq!(saved_gain(saved), expected_gain);
+    }
+    fixture.restart();
+    let restarted = fixture.wait_for_lab_playback();
+    assert_eq!(restarted["data"]["applied"]["profile_id"], ids[0]);
+    let live = fixture.send(r#"{"command":"get_plugins"}"#);
+    assert_eq!(live["data"]["plugins"][0]["parameters"]["gain_db"], -3.0);
+    fixture.shutdown();
 }
 
 #[test]
@@ -440,7 +546,17 @@ fn daemon_shutdown_drains_clients_and_allows_immediate_restart() {
         idle_clients.push(connect_daemon(&daemon.socket_path));
     }
     for _ in 0..32 {
-        drop(connect_daemon(&daemon.socket_path));
+        let mut closing = connect_daemon(&daemon.socket_path);
+        closing
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        closing.shutdown(std::net::Shutdown::Write).unwrap();
+        // Fence server-observed EOF. Local close alone does not mean its
+        // handler released admission; otherwise the shutdown client can be
+        // the rejected 65th connection during a fast accept burst.
+        let mut discarded = Vec::new();
+        std::io::Read::read_to_end(&mut closing, &mut discarded)
+            .expect("server observes disconnected client");
     }
 
     let started = Instant::now();
@@ -873,4 +989,82 @@ fn systemwide_lab_restarts_with_a_fresh_coherent_snapshot() {
     assert!(snapshot["data"]["diagnostics"]["health"].is_string());
     assert!(snapshot["data"]["diagnostics"]["faults"].is_array());
     restarted.shutdown();
+}
+
+#[test]
+#[serial]
+fn paused_play_resumes_and_long_idle_replaces_the_pipeline() {
+    let daemon = DaemonFixture::start_with_driver("lab");
+    let initial = daemon.wait_for_lab_playback();
+    let generation = initial["data"]["generation"]
+        .as_u64()
+        .expect("pipeline generation");
+    assert_eq!(daemon.send(r#"{"command":"pause"}"#)["success"], true);
+    let paused = daemon.send(r#"{"command":"get_snapshot"}"#);
+    assert_eq!(paused["data"]["observed"]["engine"]["state"], "Paused");
+    assert_eq!(daemon.send(r#"{"command":"play"}"#)["success"], true);
+    let resumed = daemon.send(r#"{"command":"get_snapshot"}"#);
+    assert_eq!(resumed["data"]["observed"]["engine"]["state"], "Playing");
+    assert_eq!(
+        resumed["data"]["generation"], generation,
+        "resume must keep the existing stream"
+    );
+    assert_eq!(daemon.send(r#"{"command":"play"}"#)["success"], true);
+    let unchanged = daemon.send(r#"{"command":"get_snapshot"}"#);
+    assert_eq!(unchanged["data"]["generation"], generation);
+    assert_eq!(unchanged["data"]["observed"]["engine"]["muted"], false);
+
+    let marker = daemon._temp_dir.path().join("lab-capture-idle");
+    std::fs::write(&marker, b"").expect("idle capture");
+    // Cross the production threshold; this proves the whole recovery path,
+    // beyond the separate unit test of the tracker decision predicate.
+    std::thread::sleep(Duration::from_secs(31));
+    std::fs::remove_file(&marker).expect("resume capture");
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let snapshot = daemon.send(r#"{"command":"get_snapshot"}"#);
+        if snapshot["data"]["generation"]
+            .as_u64()
+            .is_some_and(|new| new > generation)
+            && snapshot["data"]["observed"]["engine"]["playback_callback_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        {
+            assert_eq!(snapshot["data"]["observed"]["engine"]["state"], "Playing");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recovery never replaced the pipeline: {snapshot}; {}",
+            daemon.stderr_tail()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let logs = std::fs::read_to_string(&daemon.stderr_path).expect("read recovery log");
+    assert!(
+        logs.contains("Long-idle physical playback rebuild succeeded"),
+        "{}",
+        daemon.stderr_tail()
+    );
+    daemon.shutdown();
+}
+
+#[cfg(windows)]
+#[test]
+#[serial]
+fn silent_authentication_clients_do_not_delay_authenticated_status() {
+    let daemon = DaemonFixture::start_with_driver("lab");
+    let port = ipc_transport::read_port_file(&daemon.socket_path).expect("published port");
+    let silent: Vec<_> = (0..3)
+        .map(|_| ipc_transport::connect_loopback(port).expect("silent client"))
+        .collect();
+    let started = Instant::now();
+    let response = daemon.send(r#"{"command":"get_snapshot"}"#);
+    assert_eq!(response["success"], true);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "authentication serialized acceptance"
+    );
+    drop(silent);
+    daemon.shutdown();
 }

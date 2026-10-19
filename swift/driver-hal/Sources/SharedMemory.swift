@@ -25,6 +25,12 @@ private let kSharedMemoryMagic: UInt32 = 0x534F5446
 /// (OS media keys) and the daemon share one volume state.
 private let kSharedMemoryVersion: UInt32 = 7
 private let kDaemonHeartbeatTimeoutMs: UInt64 = 3_000
+// These bounds match driver-hal/src/shared_memory/consts.rs.
+private let kMaximumSampleRate: UInt32 = 192_000
+private let kMaximumBufferFrames: UInt32 = 4_096
+private let kMaximumChannels: UInt32 = 32
+private let kMaximumAudioBytes = 4_096 * 32 * 32 * MemoryLayout<Float>.size
+private let kMaximumRecordBytes = 4_096 * 32 * MemoryLayout<Float>.size + 40
 
 /// Encrypted audio record magic: 'SEA1' (SotF Encrypted Audio v1)
 private let kEncryptedRecordMagic: UInt32 = 0x5345_4131
@@ -72,7 +78,7 @@ private func tryAcquireIOCommit(
     bit: UInt32
 ) -> Bool {
     var state = atomicLoad(&header.pointee.configuring)
-    while true {
+    for _ in 0..<8 {
         if state & kConfiguringReconfigure != 0 || state & bit != 0 {
             return false
         }
@@ -85,6 +91,7 @@ private func tryAcquireIOCommit(
         }
         state = atomicLoad(&header.pointee.configuring)
     }
+    return false
 }
 
 @inline(__always)
@@ -92,18 +99,7 @@ private func releaseIOCommit(
     _ header: UnsafeMutablePointer<SharedAudioHeader>,
     bit: UInt32
 ) {
-    var state = atomicLoad(&header.pointee.configuring)
-    while true {
-        let next = state & ~bit
-        if sotf_atomic_compare_exchange_u32(
-            &header.pointee.configuring,
-            state,
-            next
-        ) {
-            return
-        }
-        state = atomicLoad(&header.pointee.configuring)
-    }
+    sotf_atomic_clear_u32(&header.pointee.configuring, bit)
 }
 
 @inline(__always)
@@ -168,11 +164,9 @@ private func commitReadPosition(
     _ header: UnsafeMutablePointer<SharedAudioHeader>,
     _ position: UInt64
 ) -> Bool {
-    guard tryAcquireIOCommit(header, bit: kConfiguringReadCommit) else {
-        return false
-    }
+    // The reader owns this bit for the entire copy, not just publication.
+    guard atomicLoad(&header.pointee.configuring) & kConfiguringReadCommit != 0 else { return false }
     atomicStore(&header.pointee.readPosition, position)
-    releaseIOCommit(header, bit: kConfiguringReadCommit)
     return true
 }
 
@@ -187,7 +181,7 @@ private func currentUnixMillis() -> UInt64 {
 ///
 /// IMPORTANT: This must match the Rust side in shared_memory.rs which uses:
 /// `/tmp/sotf-{uid}/audio.shm`
-private func getSharedMemoryPath() -> String {
+func getSharedMemoryPath() -> String {
     let environment = ProcessInfo.processInfo.environment
     if let overridePath = environment["SOTF_HAL_SHARED_MEMORY_PATH"], !overridePath.isEmpty {
         return overridePath
@@ -302,6 +296,7 @@ final class SharedAudioBuffer {
     private var currentPath: String = ""
     private var backingDevice: dev_t = 0
     private var backingInode: ino_t = 0
+    private var validatedMapping = false
 
     /// Ring depth in blocks at the 48 kHz reference rate. The depth scales
     /// with the sample rate so the ring holds the same *duration* at every
@@ -310,6 +305,18 @@ final class SharedAudioBuffer {
     private func ringBufferCount(forSampleRate sampleRate: UInt32) -> Int {
         let multiplier = max(1, (Int(sampleRate) + 47_999) / 48_000)
         return 8 * multiplier
+    }
+
+    /// Validate before converting untrusted geometry into offsets or allocation sizes.
+    private func validatedCapacity(sampleRate: UInt32, bufferFrames: UInt32, channelCount: UInt32) -> Int? {
+        guard sampleRate > 0, sampleRate <= kMaximumSampleRate,
+              bufferFrames > 0, bufferFrames <= kMaximumBufferFrames,
+              channelCount > 0, channelCount <= kMaximumChannels else { return nil }
+        // The bounds above make every multiplication fit in Int on supported hosts.
+        let capacity = Int(bufferFrames) * Int(channelCount) * ringBufferCount(forSampleRate: sampleRate)
+        let alignedHeaderSize = (MemoryLayout<SharedAudioHeader>.size + 63) & ~63
+        guard capacity * MemoryLayout<Float>.size <= memorySize - alignedHeaderSize else { return nil }
+        return capacity
     }
 
     /// Header pointer (start of shared memory)
@@ -334,8 +341,9 @@ final class SharedAudioBuffer {
 
     /// Whether we're connected to shared memory
     var isConnected: Bool {
-        guard sharedMemory != nil, let header = header else { return false }
+        guard validatedMapping, let header = header else { return false }
         return atomicLoad(&header.pointee.magic) == kSharedMemoryMagic
+            && atomicLoad(&header.pointee.version) == kSharedMemoryVersion
     }
 
     /// Whether the Rust engine is connected.
@@ -395,20 +403,21 @@ final class SharedAudioBuffer {
     ///   - channelCount: Number of audio channels
     /// - Returns: true if successful
     func initialize(sampleRate: UInt32, bufferFrames: UInt32, channelCount: UInt32) -> Bool {
-        // Calculate sizes
         let headerSize = MemoryLayout<SharedAudioHeader>.size
         let alignedHeaderSize = (headerSize + 63) & ~63  // 64-byte aligned
-        audioCapacity = Int(bufferFrames) * Int(channelCount) * ringBufferCount(forSampleRate: sampleRate)
-        let audioSize = audioCapacity * MemoryLayout<Float>.size
-        let requiredMemorySize = alignedHeaderSize + audioSize
+        guard sampleRate > 0, sampleRate <= kMaximumSampleRate,
+              bufferFrames > 0, bufferFrames <= kMaximumBufferFrames,
+              channelCount > 0, channelCount <= kMaximumChannels else { return false }
 
         // Get the shared memory path (secure per-user path or legacy)
         currentPath = getSharedMemoryPath()
-        halLog("SharedMemory: initializing \(requiredMemorySize) bytes at \(currentPath)")
+        halLog("SharedMemory: opening daemon mapping at \(currentPath)")
 
         if sharedMemory != nil || fileDescriptor >= 0 {
             closeSharedMemory()
         }
+        var initialized = false
+        defer { if !initialized { closeSharedMemory() } }
 
         // Open the daemon-owned file. The HAL plugin runs inside coreaudiod's
         // restricted environment, so creation/sizing/permissions are handled by
@@ -437,17 +446,13 @@ final class SharedAudioBuffer {
         backingDevice = statBuf.st_dev
         backingInode = statBuf.st_ino
 
-        if statBuf.st_size < requiredMemorySize {
-            halLog("SharedMemory: file too small: \(statBuf.st_size), need \(requiredMemorySize)")
+        if statBuf.st_size < alignedHeaderSize || statBuf.st_size > alignedHeaderSize + kMaximumAudioBytes {
+            halLog("SharedMemory: file size is outside transport bounds")
             Darwin.close(fileDescriptor)
             fileDescriptor = -1
             return false
         }
         memorySize = Int(statBuf.st_size)
-        let mappedAudioBytes = max(audioSize, max(0, memorySize - alignedHeaderSize))
-        encryptedPlaintextScratch = [UInt8](repeating: 0, count: mappedAudioBytes)
-        encryptedPayloadScratch = [UInt8](repeating: 0, count: mappedAudioBytes)
-        encryptedHeaderScratch = [UInt8](repeating: 0, count: kEncryptedRecordHeaderBytes)
 
         // Map memory
         sharedMemory = mmap(nil, memorySize, PROT_READ | PROT_WRITE, MAP_SHARED, fileDescriptor, 0)
@@ -477,25 +482,29 @@ final class SharedAudioBuffer {
             fileDescriptor = -1
             return false
         }
-
-        halLog("SharedMemory: already initialized, preserving daemon state")
-
-        // Set identifying fields only. Active geometry belongs to the
-        // acknowledged configuration path below; changing it here would let
-        // a coreaudiod reconnect race the daemon and expose a mismatched ring.
-        atomicStore(&header.pointee.magic, kSharedMemoryMagic)
-        atomicStore(&header.pointee.version, kSharedMemoryVersion)
-        atomicStore(&header.pointee.driverReady, 1)
+        guard atomicLoad(&header.pointee.version) == kSharedMemoryVersion,
+              tryAcquireIOCommit(header, bit: kConfiguringWriteCommit) else { return false }
+        defer { releaseIOCommit(header, bit: kConfiguringWriteCommit) }
 
         let activeSampleRate = atomicLoad(&header.pointee.sampleRate)
         let activeBufferFrames = atomicLoad(&header.pointee.bufferFrames)
         let activeChannelCount = atomicLoad(&header.pointee.channelCount)
-        guard activeSampleRate > 0, activeBufferFrames > 0, activeChannelCount > 0 else {
+        guard let capacity = validatedCapacity(
+            sampleRate: activeSampleRate, bufferFrames: activeBufferFrames, channelCount: activeChannelCount
+        ) else {
             halLog("SharedMemory: daemon header has invalid active geometry")
             return false
         }
 
-        audioCapacity = Int(activeBufferFrames) * Int(activeChannelCount) * ringBufferCount(forSampleRate: activeSampleRate)
+        let writePosition = atomicLoad(&header.pointee.writePosition)
+        let readPosition = atomicLoad(&header.pointee.readPosition)
+        guard writePosition >= readPosition, writePosition - readPosition <= UInt64(capacity) else { return false }
+        audioCapacity = capacity
+        encryptedPlaintextScratch = [UInt8](repeating: 0, count: kMaximumRecordBytes)
+        encryptedPayloadScratch = [UInt8](repeating: 0, count: kMaximumRecordBytes)
+        encryptedHeaderScratch = [UInt8](repeating: 0, count: kEncryptedRecordHeaderBytes)
+        validatedMapping = true
+        atomicStore(&header.pointee.driverReady, 1)
         if activeSampleRate != sampleRate
             || activeBufferFrames != bufferFrames
             || activeChannelCount != channelCount {
@@ -514,6 +523,7 @@ final class SharedAudioBuffer {
 
         let engineReady = atomicLoad(&header.pointee.engineReady)
         halLog("SharedMemory: initialized (version \(kSharedMemoryVersion), fresh=\(!alreadyInitialized), engineReady=\(engineReady))")
+        initialized = true
         return true
     }
 
@@ -528,22 +538,10 @@ final class SharedAudioBuffer {
         bufferFrames: UInt32,
         channelCount: UInt32
     ) -> Bool {
-        guard let header,
-              sampleRate > 0,
-              bufferFrames > 0,
-              channelCount > 0 else {
-            return false
-        }
-
-        let newCapacity = Int(bufferFrames) * Int(channelCount) * ringBufferCount(forSampleRate: sampleRate)
-        let headerSize = MemoryLayout<SharedAudioHeader>.size
-        let alignedHeaderSize = (headerSize + 63) & ~63
-        guard newCapacity > 0,
-              alignedHeaderSize + newCapacity * MemoryLayout<Float>.size <= memorySize else {
-            halLog(
-                "SharedMemory: negotiated geometry exceeds mapped capacity: "
-                    + "(sampleRate)Hz, (bufferFrames) frames, (channelCount) channels"
-            )
+        guard validatedMapping, let header,
+              let newCapacity = validatedCapacity(
+                sampleRate: sampleRate, bufferFrames: bufferFrames, channelCount: channelCount
+              ) else {
             return false
         }
 
@@ -572,14 +570,17 @@ final class SharedAudioBuffer {
 
     /// Close shared memory
     func closeSharedMemory() {
-        if let header = header {
+        if validatedMapping, let header = header {
             atomicStore(&header.pointee.driverReady, 0)
         }
+        validatedMapping = false
 
         if let mem = sharedMemory, memorySize > 0 {
             munmap(mem, memorySize)
         }
         sharedMemory = nil
+        memorySize = 0
+        audioCapacity = 0
 
         if fileDescriptor >= 0 {
             Darwin.close(fileDescriptor)
@@ -607,6 +608,8 @@ final class SharedAudioBuffer {
             && descriptorStat.st_ino == pathStat.st_ino
             && descriptorStat.st_dev == backingDevice
             && descriptorStat.st_ino == backingInode
+            && descriptorStat.st_size == memorySize
+            && pathStat.st_size == memorySize
     }
 
     /// Set active state
@@ -662,15 +665,12 @@ final class SharedAudioBuffer {
         return difference == 0
     }
 
-    private func cipherMatchingHeader(_ header: UnsafeMutablePointer<SharedAudioHeader>) -> AudioCipher? {
+    private func withMatchingCipher(_ header: UnsafeMutablePointer<SharedAudioHeader>, body: (AudioCipher) -> Int) -> Int {
         let headerFingerprint = atomicLoad(&header.pointee.keyFingerprint)
-
-        if let cipher = EncryptionKeyManager.shared.getCipher(),
-           fingerprintMatches(headerFingerprint, cipher.getFingerprint()) {
-            return cipher
+        return EncryptionKeyManager.shared.withCipher { cipher in
+            guard let cipher, fingerprintMatches(headerFingerprint, cipher.getFingerprint()) else { return 0 }
+            return body(cipher)
         }
-
-        return nil
     }
 
     private func writeUInt32BE(_ value: UInt32, into bytes: inout [UInt8], at offset: Int) {
@@ -760,17 +760,26 @@ final class SharedAudioBuffer {
     /// Write audio to shared memory (called from DoIOOperation for output)
     /// Uses lock-free ring buffer algorithm
     func writeAudio(_ buffer: UnsafePointer<Float>, frameCount: Int, channelCount: Int) -> Int {
-        guard let header = header, let audioData = audioData else { return 0 }
-        guard frameCount > 0, channelCount > 0, audioCapacity > 0 else { return 0 }
-        if reconfigurationRequested(header) {
-            atomicStore(&header.pointee.configuringAck, 1)
+        guard validatedMapping, let header = header, let audioData = audioData,
+              frameCount > 0, frameCount <= Int(kMaximumBufferFrames),
+              channelCount > 0, channelCount <= Int(kMaximumChannels) else { return 0 }
+        guard tryAcquireIOCommit(header, bit: kConfiguringWriteCommit) else {
+            if reconfigurationRequested(header) { atomicStore(&header.pointee.configuringAck, 1) }
             return 0
         }
+        defer { releaseIOCommit(header, bit: kConfiguringWriteCommit) }
+        guard atomicLoad(&header.pointee.version) == kSharedMemoryVersion,
+              atomicLoad(&header.pointee.channelCount) == UInt32(channelCount),
+              let audioCapacity = validatedCapacity(
+                sampleRate: atomicLoad(&header.pointee.sampleRate),
+                bufferFrames: atomicLoad(&header.pointee.bufferFrames),
+                channelCount: UInt32(channelCount)
+              ) else { return 0 }
 
         // Check for encryption. The encrypted path is allocation-free
         // (caller buffers + RealtimeChaChaPoly), so it is always compiled in.
         if atomicLoad(&header.pointee.encrypted) != 0 {
-            if let cipher = cipherMatchingHeader(header) {
+            return withMatchingCipher(header) { cipher in
                 let sampleCount = frameCount * channelCount
                 let ciphertextLen = sampleCount * MemoryLayout<Float>.size + 16
                 let totalBytes = kEncryptedRecordHeaderBytes + ciphertextLen
@@ -812,9 +821,8 @@ final class SharedAudioBuffer {
                         originalFrameCount: frameCount
                     )
                 }
+                return 0
             }
-            // If encryption enabled but failed, write silence or return 0
-            return 0
         }
 
         // Standard unencrypted write
@@ -822,57 +830,36 @@ final class SharedAudioBuffer {
         let writableCapacity = audioCapacity - (audioCapacity % channelCount)
         guard sampleCount > 0, writableCapacity > 0 else { return 0 }
 
-        let samplesToWrite = min(sampleCount, writableCapacity)
-        let sourceOffset = sampleCount - samplesToWrite
-        let sourceBuffer = buffer.advanced(by: sourceOffset)
         let writePos = atomicLoad(&header.pointee.writePosition)
         let readPos = atomicLoad(&header.pointee.readPosition)
-
-        // This is a live capture stream. If the daemon falls behind during a
-        // reconnect/client switch, drop stale samples and always publish the
-        // newest complete frames instead of returning 0 forever on a full ring.
-        let used = clampedUsedSampleCount(
-            writePos: writePos,
-            readPos: readPos,
-            capacity: writableCapacity
-        )
-        let effectiveReadPos = writePos >= readPos ? readPos : writePos
-        let samplesToDrop = max(0, used + samplesToWrite - writableCapacity)
-        let adjustedReadPos = effectiveReadPos + UInt64(samplesToDrop)
+        guard writePos >= readPos, writePos - readPos <= UInt64(writableCapacity) else { return 0 }
+        let available = writableCapacity - Int(writePos - readPos)
+        // Only the consumer owns readPosition. Drop incoming frames when full;
+        // overwriting unread payload would race a reader already copying it.
+        let writableSamples = min(sampleCount, available)
+        let samplesToWrite = writableSamples - writableSamples % channelCount
+        guard samplesToWrite > 0, writePos <= UInt64.max - UInt64(samplesToWrite) else { return 0 }
 
         let writeIndex = Int(writePos % UInt64(audioCapacity))
         let firstPart = min(samplesToWrite, audioCapacity - writeIndex)
         let secondPart = samplesToWrite - firstPart
 
         // Copy data
-        memcpy(audioData.advanced(by: writeIndex), sourceBuffer, firstPart * MemoryLayout<Float>.size)
+        memcpy(audioData.advanced(by: writeIndex), buffer, firstPart * MemoryLayout<Float>.size)
         if secondPart > 0 {
-            memcpy(audioData, sourceBuffer.advanced(by: firstPart), secondPart * MemoryLayout<Float>.size)
-        }
-
-        // Do not publish a position computed from stale geometry if a daemon
-        // reconfiguration began while this IO cycle was copying samples.
-        guard tryAcquireIOCommit(header, bit: kConfiguringWriteCommit) else {
-            if reconfigurationRequested(header) {
-                atomicStore(&header.pointee.configuringAck, 1)
-            }
-            return 0
-        }
-        if adjustedReadPos != readPos {
-            atomicStore(&header.pointee.readPosition, adjustedReadPos)
+            memcpy(audioData, buffer.advanced(by: firstPart), secondPart * MemoryLayout<Float>.size)
         }
         if atomicLoad(&header.pointee.active) == 0 {
             atomicStore(&header.pointee.active, 1)
         }
         atomicStore(&header.pointee.writePosition, writePos + UInt64(samplesToWrite))
-        releaseIOCommit(header, bit: kConfiguringWriteCommit)
 
         // TRACE: Log successful write to shared memory ring buffer
         // Note: Avoid logging every frame in production (use os_signpost for performance tracing)
         #if SOTF_AUDIO_TRACE
         if samplesToWrite > 0 {
             let newWritePos = writePos + UInt64(samplesToWrite)
-            halLog("[SHM TRACE] write: \(samplesToWrite/channelCount) frames, dropped=\(samplesToDrop/channelCount) frames, wpos=\(newWritePos), rpos=\(adjustedReadPos)")
+            halLog("[SHM TRACE] write: \(samplesToWrite/channelCount) frames, wpos=\(newWritePos), rpos=\(readPos)")
         }
         #endif
 
@@ -882,6 +869,12 @@ final class SharedAudioBuffer {
     /// Helper to write raw bytes (ciphertext) to ring buffer
     private func writeRawBytes(_ bytes: [UInt8], byteCount: Int, originalFrameCount: Int) -> Int {
         guard let header = header, let audioData = audioData else { return 0 }
+        guard atomicLoad(&header.pointee.configuring) & kConfiguringWriteCommit != 0,
+              let audioCapacity = validatedCapacity(
+                sampleRate: atomicLoad(&header.pointee.sampleRate),
+                bufferFrames: atomicLoad(&header.pointee.bufferFrames),
+                channelCount: atomicLoad(&header.pointee.channelCount)
+              ) else { return 0 }
         if reconfigurationRequested(header) {
             atomicStore(&header.pointee.configuringAck, 1)
             return 0
@@ -898,6 +891,8 @@ final class SharedAudioBuffer {
         
         let writePos = atomicLoad(&header.pointee.writePosition)
         let readPos = atomicLoad(&header.pointee.readPosition)
+        guard writePos >= readPos, writePos - readPos <= UInt64(audioCapacity),
+              writePos <= UInt64.max - UInt64(floatCount) else { return 0 }
         let used = clampedUsedSampleCount(
             writePos: writePos,
             readPos: readPos,
@@ -936,22 +931,10 @@ final class SharedAudioBuffer {
             }
         }
         
-        guard tryAcquireIOCommit(header, bit: kConfiguringWriteCommit) else {
-            if reconfigurationRequested(header) {
-                atomicStore(&header.pointee.configuringAck, 1)
-            }
-            return 0
-        }
-        // Corruption repair only (floatCount > available returned above):
-        // cursors can never legitimately invert, so resync to the writer.
-        if writePos < readPos {
-            atomicStore(&header.pointee.readPosition, writePos)
-        }
         if atomicLoad(&header.pointee.active) == 0 {
             atomicStore(&header.pointee.active, 1)
         }
         atomicStore(&header.pointee.writePosition, writePos + UInt64(floatCount))
-        releaseIOCommit(header, bit: kConfiguringWriteCommit)
         
         return originalFrameCount
     }
@@ -959,13 +942,32 @@ final class SharedAudioBuffer {
     /// Read audio from shared memory (called from DoIOOperation for input)
     /// Uses lock-free ring buffer algorithm
     func readAudio(_ buffer: UnsafeMutablePointer<Float>, frameCount: Int, channelCount: Int) -> Int {
-        guard let header = header, let audioData = audioData else {
+        guard frameCount > 0, frameCount <= Int(kMaximumBufferFrames),
+              channelCount > 0, channelCount <= Int(kMaximumChannels) else { return 0 }
+        guard validatedMapping, let header = header, let audioData = audioData else {
             // Fill with silence
             memset(buffer, 0, frameCount * channelCount * MemoryLayout<Float>.size)
             return 0
         }
-        if reconfigurationRequested(header) {
-            atomicStore(&header.pointee.configuringAck, 1)
+        guard tryAcquireIOCommit(header, bit: kConfiguringReadCommit) else {
+            if reconfigurationRequested(header) { atomicStore(&header.pointee.configuringAck, 1) }
+            memset(buffer, 0, frameCount * channelCount * MemoryLayout<Float>.size)
+            return 0
+        }
+        defer { releaseIOCommit(header, bit: kConfiguringReadCommit) }
+        guard atomicLoad(&header.pointee.version) == kSharedMemoryVersion,
+              atomicLoad(&header.pointee.channelCount) == UInt32(channelCount),
+              let audioCapacity = validatedCapacity(
+                sampleRate: atomicLoad(&header.pointee.sampleRate),
+                bufferFrames: atomicLoad(&header.pointee.bufferFrames),
+                channelCount: UInt32(channelCount)
+              ) else {
+            memset(buffer, 0, frameCount * channelCount * MemoryLayout<Float>.size)
+            return 0
+        }
+        let currentWrite = atomicLoad(&header.pointee.writePosition)
+        let currentRead = atomicLoad(&header.pointee.readPosition)
+        guard currentWrite >= currentRead, currentWrite - currentRead <= UInt64(audioCapacity) else {
             memset(buffer, 0, frameCount * channelCount * MemoryLayout<Float>.size)
             return 0
         }
@@ -973,10 +975,12 @@ final class SharedAudioBuffer {
         // Check for encryption. The encrypted path is allocation-free
         // (caller buffers + RealtimeChaChaPoly), so it is always compiled in.
         if atomicLoad(&header.pointee.encrypted) != 0 {
-            if let cipher = cipherMatchingHeader(header) {
+            // Silence is the default even if no matching key is published.
+            memset(buffer, 0, frameCount * channelCount * MemoryLayout<Float>.size)
+            return withMatchingCipher(header) { cipher in
                 let requestedSampleCount = frameCount * channelCount
-                let writePos = atomicLoad(&header.pointee.writePosition)
-                let readPos = atomicLoad(&header.pointee.readPosition)
+                let writePos = currentWrite
+                let readPos = currentRead
                 let available = writePos >= readPos ? Int(writePos - readPos) : 0
 
                 if available >= kEncryptedRecordHeaderFloats {
@@ -1038,16 +1042,14 @@ final class SharedAudioBuffer {
                         }
                     }
                 }
+                return 0
             }
-            // Decryption failed or no key
-            memset(buffer, 0, frameCount * channelCount * MemoryLayout<Float>.size)
-            return 0
         }
 
         // Standard unencrypted read
         let sampleCount = frameCount * channelCount
-        let writePos = atomicLoad(&header.pointee.writePosition)
-        let readPos = atomicLoad(&header.pointee.readPosition)
+        let writePos = currentWrite
+        let readPos = currentRead
 
         // Calculate available data
         let available = writePos >= readPos ? Int(writePos - readPos) : 0
@@ -1101,8 +1103,12 @@ final class SharedAudioBuffer {
 
     /// Helper to read raw bytes (ciphertext) from ring buffer
     private func copyRawBytes(at position: UInt64, into buffer: inout [UInt8], byteCount: Int, floatCount: Int) {
-        guard let audioData = audioData else { return }
-        guard byteCount <= buffer.count else { return }
+        guard let audioData = audioData, let header,
+              let audioCapacity = validatedCapacity(
+                sampleRate: atomicLoad(&header.pointee.sampleRate),
+                bufferFrames: atomicLoad(&header.pointee.bufferFrames),
+                channelCount: atomicLoad(&header.pointee.channelCount)
+              ), byteCount <= buffer.count, floatCount <= audioCapacity else { return }
 
         let readIndex = Int(position % UInt64(audioCapacity))
         let firstPartFloats = min(floatCount, audioCapacity - readIndex)
@@ -1122,15 +1128,6 @@ final class SharedAudioBuffer {
                 memcpy(base.advanced(by: bytesToReadFirst), srcSecond, bytesToReadSecond)
             }
         }
-    }
-
-    private func readRawBytes(_ buffer: inout [UInt8], floatCount: Int) {
-        guard let header = header else { return }
-        
-        let readPos = atomicLoad(&header.pointee.readPosition)
-        copyRawBytes(at: readPos, into: &buffer, byteCount: buffer.count, floatCount: floatCount)
-
-        _ = commitReadPosition(header, readPos + UInt64(floatCount))
     }
 
     // MARK: - Config Negotiation Methods (version 3+)

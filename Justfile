@@ -39,6 +39,11 @@ ntest:
 test-configbar:
 	scripts/test-configbar.sh
 
+[group('test')]
+[macos]
+test-installer:
+	"${PYTHON:-python3}" scripts/tests/test_installer_user_files.py
+
 # Process-level E2E smoke: lab daemon + real ConfigBar binary over IPC.
 # Manual/nightly tier; needs a logged-in GUI session for the menu-bar app.
 [group('test')]
@@ -62,6 +67,8 @@ systemwide-lab:
 	{{cargo}} test -p sotf-daemon --features hal --test ipc_line_tests -- --test-threads=1
 	{{cargo}} test --manifest-path ../sotf-daw/Cargo.toml -p driver-hal --lib
 	{{cargo}} test -p sotf-daemon --test hal_driver_contract_tests
+	just test-hal-driver-swift
+	just test-installer
 	scripts/test-configbar.sh target/configbar-swiftpm
 
 # Run the isolated Linux systemwide-audio lab: same subprocess coverage as

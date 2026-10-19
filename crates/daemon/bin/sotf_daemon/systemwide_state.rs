@@ -10,14 +10,29 @@ pub(super) struct PipelineRecovery {
     pub(super) actions: Vec<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct SystemwideState {
     pub(super) pipeline: PipelineSupervisor,
+    /// Explicit Pause/Stop prevents background startup recovery.
+    pub(super) playback_wanted: bool,
+    /// Output processing timing is independent of a native capture endpoint.
+    pub(super) processing_timing: Option<(u32, u32)>,
     /// Durable control-plane state for a transition that left the engine
     /// stopped. This is separate from `AppliedPipeline`: the last applied
     /// plan remains authoritative even when a later transition cannot be
     /// applied or restored.
     pub(super) pipeline_recovery: Option<PipelineRecovery>,
+}
+
+impl Default for SystemwideState {
+    fn default() -> Self {
+        Self {
+            pipeline: PipelineSupervisor::default(),
+            processing_timing: None,
+            playback_wanted: true,
+            pipeline_recovery: None,
+        }
+    }
 }
 
 impl SystemwideState {
@@ -150,6 +165,10 @@ impl SystemwideState {
         output_device: Option<String>,
     ) -> Result<(), String> {
         self.pipeline.set_desired_output_device(output_device)
+    }
+
+    pub(super) fn restore_output_preference(&mut self, output_device: Option<String>) {
+        self.pipeline.restore_output_preference(output_device);
     }
 
     pub(super) fn commit_idle_reconfigure(&mut self, plan: &PipelinePlan) {

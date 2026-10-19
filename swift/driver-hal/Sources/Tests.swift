@@ -62,37 +62,328 @@ final class HALDriverTests {
     /// Run all tests
     @discardableResult
     static func runAllTests() -> Bool {
-        halLog("Running HAL driver tests...")
-
-        var passed = 0
+        let tests: [(String, () -> Bool)] = [
+            ("testZeroTimestampSurvivesRateReanchor", testZeroTimestampSurvivesRateReanchor),
+            ("testClockSnapshotsDuringRateChanges", testClockSnapshotsDuringRateChanges),
+            ("testRingBufferBasicOperations", testRingBufferBasicOperations),
+            ("testRingBufferWrapAround", testRingBufferWrapAround),
+            ("testRingBufferMultiChannel", testRingBufferMultiChannel),
+            ("testRingBufferConcurrentSPSC", testRingBufferConcurrentSPSC),
+            ("testSharedAudioHeaderLayout", testSharedAudioHeaderLayout),
+            ("testVolumeConversionAndSharedRoundTrip", testVolumeConversionAndSharedRoundTrip),
+            ("testSampleRateRequestRemainsTransactional", testSampleRateRequestRemainsTransactional),
+            ("testCrossProcessReconfigurationProtocol", testCrossProcessReconfigurationProtocol),
+            ("testGeometryCacheSurvivesDaemonRestart", testGeometryCacheSurvivesDaemonRestart),
+            ("testMappingValidationAndReaderOwnership", testMappingValidationAndReaderOwnership),
+            ("testEncryptionRoundTrip", testEncryptionRoundTrip),
+            ("testEncryptionWithDifferentKeys", testEncryptionWithDifferentKeys),
+            ("testEncryptionFrameCounterNonceUniqueness", testEncryptionFrameCounterNonceUniqueness),
+            ("testRealtimeCipherMatchesCryptoKit", testRealtimeCipherMatchesCryptoKit),
+            ("testKeyManagerFingerprint", testKeyManagerFingerprint),
+            ("testCipherPublicationKeepsPinnedReaderAlive", testCipherPublicationKeepsPinnedReaderAlive),
+            ("testCipherSlotExcludesDelayedReaders", testCipherSlotExcludesDelayedReaders),
+            ("testConcurrentLocalVolumePublication", testConcurrentLocalVolumePublication),
+            ("testConsoleSessionRetiresMappingKeyAndLoopback", testConsoleSessionRetiresMappingKeyAndLoopback),
+            ("testSharedMemoryEncryptedRealtimeRoundTrips", testSharedMemoryEncryptedRealtimeRoundTrips),
+        ]
         var failed = 0
-
-        // Clock tests
-        if testZeroTimestampSurvivesRateReanchor() { passed += 1 } else { failed += 1 }
-
-        // Ring buffer tests
-        if testRingBufferBasicOperations() { passed += 1 } else { failed += 1 }
-        if testRingBufferWrapAround() { passed += 1 } else { failed += 1 }
-        if testRingBufferMultiChannel() { passed += 1 } else { failed += 1 }
-        if testRingBufferConcurrentSPSC() { passed += 1 } else { failed += 1 }
-
-        // Cross-language shared-memory ABI
-        if testSharedAudioHeaderLayout() { passed += 1 } else { failed += 1 }
-        if testVolumeConversionAndSharedRoundTrip() { passed += 1 } else { failed += 1 }
-        if testSampleRateRequestRemainsTransactional() { passed += 1 } else { failed += 1 }
-        if testCrossProcessReconfigurationProtocol() { passed += 1 } else { failed += 1 }
-        if testGeometryCacheSurvivesDaemonRestart() { passed += 1 } else { failed += 1 }
-
-        // Encryption tests
-        if testEncryptionRoundTrip() { passed += 1 } else { failed += 1 }
-        if testEncryptionWithDifferentKeys() { passed += 1 } else { failed += 1 }
-        if testEncryptionFrameCounterNonceUniqueness() { passed += 1 } else { failed += 1 }
-        if testRealtimeCipherMatchesCryptoKit() { passed += 1 } else { failed += 1 }
-        if testKeyManagerFingerprint() { passed += 1 } else { failed += 1 }
-        if testSharedMemoryEncryptedRealtimeRoundTrips() { passed += 1 } else { failed += 1 }
-
-        halLog("Tests complete: \(passed) passed, \(failed) failed")
+        for (name, test) in tests {
+            let passed = test()
+            print("\(passed ? "PASS" : "FAIL"): \(name)")
+            if !passed { failed += 1 }
+        }
+        print("HAL tests: \(tests.count - failed) passed, \(failed) failed, \(tests.count) total")
         return failed == 0
+    }
+
+    private static func transportFixtureHeader() -> SharedAudioHeader {
+        SharedAudioHeader(
+            magic: 0x534F5446, version: 7, sampleRate: 48_000, bufferFrames: 64, channelCount: 2,
+            writePosition: 0, readPosition: 0, active: 0, configChanged: 0,
+            driverReady: 0, engineReady: 1, encrypted: 0, volumeScalarBits: Float(1).bitPattern,
+            keyFingerprint: 0, frameCounter: 0, requestedSampleRate: 48_000,
+            requestedBufferFrames: 64, actualSampleRate: 48_000, actualBufferFrames: 64,
+            configStatus: 0, configSource: 0, configErrorCode: 0, outputMuted: 0,
+            encryptionOverflowCount: 0, daemonHeartbeatMs: 0, configuring: 0,
+            configuringAck: 0, requestedChannelCount: 2, volumeGeneration: 0
+        )
+    }
+
+    /// Concurrent property updates and maintenance must finish with one tuple.
+    static func testConcurrentLocalVolumePublication() -> Bool {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("sotf-volume-\(UUID())")
+        let path = root.appendingPathComponent("audio.shm")
+        let oldPath = ProcessInfo.processInfo.environment["SOTF_HAL_SHARED_MEMORY_PATH"]
+        defer {
+            if let oldPath { setenv("SOTF_HAL_SHARED_MEMORY_PATH", oldPath, 1) }
+            else { unsetenv("SOTF_HAL_SHARED_MEMORY_PATH") }
+            try? FileManager.default.removeItem(at: root)
+        }
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            var header = transportFixtureHeader()
+            let aligned = (MemoryLayout<SharedAudioHeader>.size + 63) & ~63
+            var bytes = Data(count: aligned + 64 * 2 * 8 * MemoryLayout<Float>.size)
+            withUnsafeBytes(of: &header) { bytes.replaceSubrange(0..<$0.count, with: $0) }
+            try bytes.write(to: path)
+            chmod(path.path, 0o600)
+            setenv("SOTF_HAL_SHARED_MEMORY_PATH", path.path, 1)
+            let state = DriverState()
+            guard state.sharedAudio.initialize(sampleRate: 48_000, bufferFrames: 64, channelCount: 2) else { return false }
+            DispatchQueue.concurrentPerform(iterations: 3) { role in
+                for index in 0..<200 {
+                    if role == 0 { state.commitOutputVolume(scalar: Float(index % 10) / 10) }
+                    else if role == 1 { state.commitOutputVolume(muted: index % 2 == 0) }
+                    else { state.syncVolumeFromSharedMemory() }
+                }
+            }
+            let local = state.outputVolume()
+            let shared = state.sharedAudio.outputVolume()
+            return shared.generation != 0 && shared.scalarBits == local.scalar.bitPattern
+                && shared.muted == local.muted
+        } catch { print("Volume fixture failed: \(error)"); return false }
+    }
+
+    /// An old daemon may remain live while the console transport changes.
+    static func testConsoleSessionRetiresMappingKeyAndLoopback() -> Bool {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("sotf-session-\(UUID())")
+        let oldAudio = ProcessInfo.processInfo.environment["SOTF_HAL_SHARED_MEMORY_PATH"]
+        let oldKey = ProcessInfo.processInfo.environment["SOTF_HAL_SESSION_KEY_PATH"]
+        let manager = EncryptionKeyManager.shared
+        defer {
+            if let oldAudio { setenv("SOTF_HAL_SHARED_MEMORY_PATH", oldAudio, 1) }
+            else { unsetenv("SOTF_HAL_SHARED_MEMORY_PATH") }
+            if let oldKey { setenv("SOTF_HAL_SESSION_KEY_PATH", oldKey, 1) }
+            else { unsetenv("SOTF_HAL_SESSION_KEY_PATH") }
+            manager.reloadFromCurrentEnvironment()
+            try? FileManager.default.removeItem(at: root)
+        }
+        func fixture(_ name: String, keyByte: UInt8) throws -> (String, String) {
+            let audio = root.appendingPathComponent(name + ".shm")
+            let key = root.appendingPathComponent(name + ".key")
+            var header = transportFixtureHeader()
+            let aligned = (MemoryLayout<SharedAudioHeader>.size + 63) & ~63
+            var bytes = Data(count: aligned + 64 * 2 * 8 * MemoryLayout<Float>.size)
+            withUnsafeBytes(of: &header) { bytes.replaceSubrange(0..<$0.count, with: $0) }
+            try bytes.write(to: audio)
+            try Data(repeating: keyByte, count: 32).write(to: key)
+            chmod(audio.path, 0o600)
+            chmod(key.path, 0o600)
+            return (audio.path, key.path)
+        }
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            let a = try fixture("a", keyByte: 1)
+            setenv("SOTF_HAL_SHARED_MEMORY_PATH", a.0, 1)
+            setenv("SOTF_HAL_SESSION_KEY_PATH", a.1, 1)
+            manager.reloadFromCurrentEnvironment()
+            let state = DriverState()
+            guard state.sharedAudio.initialize(sampleRate: 48_000, bufferFrames: 64, channelCount: 2) else { return false }
+            let oldLease = state.acquireSharedAudioForCallback()
+            var held = true
+            defer { if held { state.finishSharedAudioCallback(slot: oldLease.slot) } }
+            guard oldLease.slot != UInt32.max else { return false }
+            let marker = [Float](repeating: 0.75, count: 128)
+            _ = marker.withUnsafeBufferPointer {
+                state.outputRingBuffer?.writeInterleaved($0.baseAddress!, frameCount: 64)
+            }
+            setenv("SOTF_HAL_SHARED_MEMORY_PATH", root.appendingPathComponent("missing.shm").path, 1)
+            setenv("SOTF_HAL_SESSION_KEY_PATH", root.appendingPathComponent("missing.key").path, 1)
+            state.noticeConsoleSessionChange()
+            guard state.acquireSharedAudioForCallback().slot == UInt32.max,
+                  !state.reconcileConsoleSession(), oldLease.buffer.isConnected else { return false }
+            state.finishSharedAudioCallback(slot: oldLease.slot)
+            held = false
+            guard state.reconcileConsoleSession(), !oldLease.buffer.isConnected,
+                  manager.getFingerprint() == nil else { return false }
+            state.attemptInitRetryIfNeeded()
+            guard state.acquireSharedAudioForCallback().slot == UInt32.max else { return false }
+            var output = [Float](repeating: -1, count: 128)
+            let frames = output.withUnsafeMutableBufferPointer {
+                state.outputRingBuffer?.readInterleaved($0.baseAddress!, frameCount: 64)
+            }
+            guard frames == 0, output.allSatisfy({ $0 == 0 }) else { return false }
+            let c = try fixture("c", keyByte: 3)
+            setenv("SOTF_HAL_SHARED_MEMORY_PATH", c.0, 1)
+            setenv("SOTF_HAL_SESSION_KEY_PATH", c.1, 1)
+            guard state.reconcileConsoleSession() else { return false }
+            state.attemptInitRetryIfNeeded()
+            let newLease = state.acquireSharedAudioForCallback()
+            defer { state.finishSharedAudioCallback(slot: newLease.slot) }
+            return newLease.slot != UInt32.max && newLease.buffer.isConnected
+                && manager.getFingerprint() == AudioCipher(keyBytes: [UInt8](repeating: 3, count: 32)).getFingerprint()
+        } catch { print("Session fixture failed: \(error)"); return false }
+    }
+
+    /// Exercise the production Swift mapper and producer with hostile headers.
+    static func testMappingValidationAndReaderOwnership() -> Bool {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("sotf-mapping-\(UUID().uuidString)")
+        let path = directory.appendingPathComponent("audio.shm")
+        let oldPath = ProcessInfo.processInfo.environment["SOTF_HAL_SHARED_MEMORY_PATH"]
+        defer {
+            if let oldPath { setenv("SOTF_HAL_SHARED_MEMORY_PATH", oldPath, 1) }
+            else { unsetenv("SOTF_HAL_SHARED_MEMORY_PATH") }
+            try? FileManager.default.removeItem(at: directory)
+        }
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            setenv("SOTF_HAL_SHARED_MEMORY_PATH", path.path, 1)
+            let alignedHeader = (MemoryLayout<SharedAudioHeader>.size + 63) & ~63
+            let capacity = 64 * 2 * 8
+            let buffer = SharedAudioBuffer()
+            defer { buffer.closeSharedMemory() }
+
+            func fixture(version: UInt32 = 7, rate: UInt32 = 48_000, frames: UInt32 = 64,
+                         channels: UInt32 = 2, write: UInt64 = 0, read: UInt64 = 0,
+                         configuring: UInt32 = 0) -> Data {
+                var data = Data(count: alignedHeader + capacity * MemoryLayout<Float>.size)
+                data.withUnsafeMutableBytes { bytes in
+                    bytes.storeBytes(of: UInt32(0x534F5446), toByteOffset: 0, as: UInt32.self)
+                    bytes.storeBytes(of: version, toByteOffset: 4, as: UInt32.self)
+                    bytes.storeBytes(of: rate, toByteOffset: 8, as: UInt32.self)
+                    bytes.storeBytes(of: frames, toByteOffset: 12, as: UInt32.self)
+                    bytes.storeBytes(of: channels, toByteOffset: 16, as: UInt32.self)
+                    bytes.storeBytes(of: write, toByteOffset: MemoryLayout<SharedAudioHeader>.offset(of: \.writePosition)!, as: UInt64.self)
+                    bytes.storeBytes(of: read, toByteOffset: MemoryLayout<SharedAudioHeader>.offset(of: \.readPosition)!, as: UInt64.self)
+                    bytes.storeBytes(of: configuring, toByteOffset: MemoryLayout<SharedAudioHeader>.offset(of: \.configuring)!, as: UInt32.self)
+                }
+                return data
+            }
+
+            let malformed = [fixture(version: 999), fixture(rate: UInt32.max),
+                             fixture(frames: 1_048_576), fixture(channels: 0), fixture(channels: 33),
+                             fixture(write: 0, read: 1), fixture(write: UInt64(capacity + 1)),
+                             Data(count: 64)]
+            for data in malformed {
+                try data.write(to: path)
+                chmod(path.path, 0o600)
+                guard !buffer.initialize(sampleRate: 48_000, bufferFrames: 64, channelCount: 2),
+                      !buffer.isConnected, try Data(contentsOf: path) == data else {
+                    halLog("    FAIL: malformed mapping accepted, retained, or modified")
+                    return false
+                }
+            }
+
+            // A failed initialization must not poison a later valid attempt.
+            let full = fixture(write: UInt64(capacity), configuring: 2)
+            try full.write(to: path)
+            chmod(path.path, 0o600)
+            guard buffer.initialize(sampleRate: 48_000, bufferFrames: 64, channelCount: 2),
+                  buffer.isConnected else { return false }
+            let input = [Float](repeating: 1, count: 128)
+            let written = input.withUnsafeBufferPointer {
+                buffer.writeAudio($0.baseAddress!, frameCount: 64, channelCount: 2)
+            }
+            let after = try Data(contentsOf: path)
+            let readPosition = after.withUnsafeBytes {
+                $0.loadUnaligned(fromByteOffset: MemoryLayout<SharedAudioHeader>.offset(of: \.readPosition)!, as: UInt64.self)
+            }
+            guard written == 0, readPosition == 0,
+                  after.suffix(capacity * MemoryLayout<Float>.size) == full.suffix(capacity * MemoryLayout<Float>.size) else {
+                halLog("    FAIL: full-ring producer modified reader-owned data")
+                return false
+            }
+            buffer.closeSharedMemory()
+
+            try fixture().write(to: path)
+            chmod(path.path, 0o600)
+            guard buffer.initialize(sampleRate: 48_000, bufferFrames: 64, channelCount: 2) else { return false }
+            let accepted = input.withUnsafeBufferPointer {
+                buffer.writeAudio($0.baseAddress!, frameCount: 64, channelCount: 2)
+            }
+            var output = [Float](repeating: 0, count: input.count)
+            let read = output.withUnsafeMutableBufferPointer {
+                buffer.readAudio($0.baseAddress!, frameCount: 64, channelCount: 2)
+            }
+            guard accepted == 64, read == 64, output == input else { return false }
+            return true
+        } catch {
+            halLog("    FAIL: mapping regression fixture: \(error)")
+            return false
+        }
+    }
+
+    /// An exclusively retired slot rejects a reader delayed before pinning.
+    static func testCipherSlotExcludesDelayedReaders() -> Bool {
+        let gate = UnsafeMutablePointer<UInt64>.allocate(capacity: 1)
+        gate.initialize(to: 0)
+        defer { gate.deinitialize(count: 1); gate.deallocate() }
+        guard sotf_cipher_try_write(gate) else { return false }
+        guard !sotf_cipher_try_pin(gate) else { return false }
+        sotf_cipher_end_write(gate)
+        guard sotf_cipher_try_pin(gate) else { return false }
+        guard !sotf_cipher_try_write(gate) else { return false }
+        sotf_atomic_fetch_sub_u64(gate, 1)
+        guard sotf_cipher_try_write(gate) else { return false }
+        sotf_cipher_end_write(gate)
+        return true
+    }
+
+    /// Hold a realtime reader across multiple publications and slot reuse.
+    static func testCipherPublicationKeepsPinnedReaderAlive() -> Bool {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("sotf-cipher-\(UUID().uuidString)")
+        let path = directory.appendingPathComponent("session.key")
+        let oldPath = ProcessInfo.processInfo.environment["SOTF_HAL_SESSION_KEY_PATH"]
+        let manager = EncryptionKeyManager.shared
+        defer {
+            if let oldPath { setenv("SOTF_HAL_SESSION_KEY_PATH", oldPath, 1) }
+            else { unsetenv("SOTF_HAL_SESSION_KEY_PATH") }
+            manager.reloadFromCurrentEnvironment()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            let first = [UInt8](repeating: 1, count: 32)
+            let last = [UInt8](repeating: 2, count: 32)
+            let expectedFirst = AudioCipher(keyBytes: first).getFingerprint()
+            let expectedLast = AudioCipher(keyBytes: last).getFingerprint()
+            try Data(first).write(to: path)
+            chmod(path.path, 0o600)
+            setenv("SOTF_HAL_SESSION_KEY_PATH", path.path, 1)
+            manager.reloadFromCurrentEnvironment()
+            let started = DispatchSemaphore(value: 0)
+            let resume = DispatchSemaphore(value: 0)
+            let finished = DispatchGroup()
+            let result = UnsafeMutablePointer<UInt64>.allocate(capacity: 1)
+            result.initialize(to: 0)
+            defer { result.deinitialize(count: 1); result.deallocate() }
+            finished.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                let valid = manager.withCipher { cipher in
+                    started.signal()
+                    guard resume.wait(timeout: .now() + 5) == .success else { return 0 }
+                    return cipher?.getFingerprint() == expectedFirst ? 1 : 0
+                }
+                sotf_atomic_store_u64(result, UInt64(valid))
+                finished.leave()
+            }
+            defer { resume.signal(); finished.wait() }
+            guard started.wait(timeout: .now() + 5) == .success else {
+                resume.signal()
+                finished.wait()
+                return false
+            }
+            // Publication into the pinned slot must remain deferred, including
+            // repeated replacements of the pending value.
+            for value in 3...20 {
+                try Data(repeating: UInt8(value), count: 32).write(to: path)
+                manager.reloadFromCurrentEnvironment()
+            }
+            try Data(last).write(to: path)
+            manager.reloadFromCurrentEnvironment()
+            resume.signal()
+            finished.wait()
+            guard sotf_atomic_load_u64(result) == 1 else { return false }
+            _ = manager.checkAndReload()
+            return manager.withCipher { $0?.getFingerprint() == expectedLast ? 1 : 0 } == 1
+        } catch {
+            halLog("    FAIL: cipher publication fixture: \(error)")
+            return false
+        }
     }
 
     /// Regression: re-anchoring the clock on a sample-rate change lands the
@@ -107,7 +398,7 @@ final class HALDriverTests {
             clock.start(sampleRate: 48000)
             usleep(delayMicroseconds)
             clock.setSampleRate(96000)
-            let (sampleTime, hostTime, _) = clock.getZeroTimeStamp(period: 512)
+            guard let (sampleTime, hostTime, _) = clock.getZeroTimeStamp(period: 512) else { return false }
             guard hostTime > 0 else {
                 halLog("    FAIL: zero host time after re-anchor")
                 return false
@@ -122,6 +413,33 @@ final class HALDriverTests {
             }
         }
         return true
+    }
+
+    static func testClockSnapshotsDuringRateChanges() -> Bool {
+        let clock = DriverClock()
+        clock.start(sampleRate: 48000)
+        let writer = DispatchGroup()
+        writer.enter()
+        DispatchQueue.global(qos: .utility).async {
+            for index in 0..<10_000 {
+                clock.setSampleRate(index.isMultiple(of: 2) ? 96000 : 48000)
+            }
+            writer.leave()
+        }
+        defer { writer.wait() }
+        var lastSeed: UInt64 = 0
+        var observations = 0
+        for _ in 0..<20_000 {
+            guard let (sample, host, seed) = clock.getZeroTimeStamp(period: 512) else { continue }
+            guard sample.isFinite, sample >= 0, host > 0, host <= mach_absolute_time(),
+                  sample.truncatingRemainder(dividingBy: 512) == 0, seed >= lastSeed else {
+                halLog("    FAIL: incoherent clock snapshot during a rate change")
+                return false
+            }
+            lastSeed = seed
+            observations += 1
+        }
+        return observations > 0
     }
 
     /// Keep the Swift mirror byte-for-byte compatible with Rust's
@@ -1544,30 +1862,26 @@ final class HALDriverTests {
 
     /// Test key manager fingerprint consistency
     static func testKeyManagerFingerprint() -> Bool {
-        halLog("  Test: KeyManager fingerprint")
-
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("sotf-key-fingerprint-\(UUID())")
+        let path = root.appendingPathComponent("session.key").path
+        let key = (0..<32).map { UInt8($0) }
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try Data(key).write(to: URL(fileURLWithPath: path))
+            chmod(path, 0o600)
+        } catch { return false }
+        let previous = ProcessInfo.processInfo.environment["SOTF_HAL_SESSION_KEY_PATH"]
+        setenv("SOTF_HAL_SESSION_KEY_PATH", path, 1)
         let manager = EncryptionKeyManager.shared
-
-        // Fingerprint should be consistent
-        guard let fp1 = manager.getFingerprint(),
-              let fp2 = manager.getFingerprint() else {
-            halLog("    SKIP: KeyManager has no key loaded")
-            return true  // Not a failure, just skip
+        defer {
+            if let previous { setenv("SOTF_HAL_SESSION_KEY_PATH", previous, 1) }
+            else { unsetenv("SOTF_HAL_SESSION_KEY_PATH") }
+            manager.reloadFromCurrentEnvironment()
+            try? FileManager.default.removeItem(at: root)
         }
-
-        guard fp1 == fp2 else {
-            halLog("    FAIL: Fingerprint should be consistent")
-            return false
-        }
-
-        // Fingerprint should be 8 bytes
-        guard fp1.count == 8 else {
-            halLog("    FAIL: Fingerprint should be 8 bytes, got \(fp1.count)")
-            return false
-        }
-
-        halLog("    PASS")
-        return true
+        manager.reloadFromCurrentEnvironment()
+        let expected = AudioCipher(keyBytes: key).getFingerprint()
+        return manager.getFingerprint() == expected && manager.getFingerprint() == expected && expected.count == 8
     }
 }
 

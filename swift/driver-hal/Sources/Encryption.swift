@@ -255,7 +255,24 @@ final class AudioCipher {
 
 /// Encryption key manager
 final class EncryptionKeyManager {
-    private var cipher: AudioCipher?
+    // One maintenance writer publishes into the inactive slot. Audio readers
+    // pin a slot before inspecting its reference; reclamation stays here.
+    private let controlLock = NSLock()
+    private var cipher0: AudioCipher?
+    private var cipher1: AudioCipher?
+    private var activeSlot: UInt32 = 0
+    private var readers0: UInt64 = 0
+    private var readers1: UInt64 = 0
+    private var pendingCipher: AudioCipher?
+    private var hasPendingCipher = false
+    private var cipher: AudioCipher? {
+        get { sotf_atomic_load_u32(&activeSlot) == 0 ? cipher0 : cipher1 }
+        set {
+            pendingCipher = newValue
+            hasPendingCipher = true
+            publishPendingCipher()
+        }
+    }
     private var keyPath: String
     private var lastMtime: Date?
     private var enabled: Bool = false
@@ -266,6 +283,48 @@ final class EncryptionKeyManager {
     private init() {
         keyPath = getSessionKeyPath()
         loadKey()
+    }
+
+    private func publishPendingCipher() {
+        guard hasPendingCipher else { return }
+        let next: UInt32 = sotf_atomic_load_u32(&activeSlot) == 0 ? 1 : 0
+        // Exclude a delayed reader that loaded this slot before publication.
+        // Merely observing a zero reader count does not close that race.
+        let acquired = next == 0 ? sotf_cipher_try_write(&readers0) : sotf_cipher_try_write(&readers1)
+        guard acquired else { return }
+        if next == 0 { cipher0 = pendingCipher } else { cipher1 = pendingCipher }
+        sotf_atomic_store_u32(&activeSlot, next)
+        if next == 0 { sotf_cipher_end_write(&readers0) }
+        else { sotf_cipher_end_write(&readers1) }
+        pendingCipher = nil
+        hasPendingCipher = false
+    }
+
+    // Keep reference temporaries and the nonescaping body in a separate stack
+    // frame. All ARC releases finish before the caller drops the reader pin.
+    @inline(never)
+    private func invokeCipher(slot: UInt32, body: (AudioCipher?) -> Int) -> Int {
+        body(slot == 0 ? cipher0 : cipher1)
+    }
+
+    /// Access a cipher without blocking or releasing its final reference on IO.
+    func withCipher(_ body: (AudioCipher?) -> Int) -> Int {
+        // Publication can race acquisition. Bounded retries keep IO wait-free
+        // with respect to the maintenance writer; a missed key drops this block.
+        for _ in 0..<3 {
+            let slot = sotf_atomic_load_u32(&activeSlot)
+            let pinned = slot == 0 ? sotf_cipher_try_pin(&readers0) : sotf_cipher_try_pin(&readers1)
+            guard pinned else { continue }
+            if sotf_atomic_load_u32(&activeSlot) == slot {
+                let result = invokeCipher(slot: slot, body: body)
+                if slot == 0 { sotf_atomic_fetch_sub_u64(&readers0, 1) }
+                else { sotf_atomic_fetch_sub_u64(&readers1, 1) }
+                return result
+            }
+            if slot == 0 { sotf_atomic_fetch_sub_u64(&readers0, 1) }
+            else { sotf_atomic_fetch_sub_u64(&readers1, 1) }
+        }
+        return body(nil)
     }
 
     /// Load the encryption key from file
@@ -309,6 +368,16 @@ final class EncryptionKeyManager {
 
     /// Check if the key file has changed and reload if necessary
     func checkAndReload() -> Bool {
+        controlLock.lock()
+        defer { controlLock.unlock() }
+        publishPendingCipher()
+        let currentPath = getSessionKeyPath()
+        if currentPath != keyPath {
+            keyPath = currentPath
+            lastMtime = nil
+            loadKey()
+            return true
+        }
         guard FileManager.default.fileExists(atPath: keyPath) else {
             if cipher != nil {
                 halLog("Key file deleted")
@@ -331,6 +400,8 @@ final class EncryptionKeyManager {
 
     /// Reload the key location after test or lab tooling changes the environment.
     func reloadFromCurrentEnvironment() {
+        controlLock.lock()
+        defer { controlLock.unlock() }
         keyPath = getSessionKeyPath()
         lastMtime = nil
         loadKey()
@@ -338,12 +409,15 @@ final class EncryptionKeyManager {
 
     /// Get the current cipher (may be nil if key not loaded)
     func getCipher() -> AudioCipher? {
+        // Cold-path API only. Realtime users must hold a withCipher pin.
+        controlLock.lock()
+        defer { controlLock.unlock() }
         return cipher
     }
 
     /// Get the key fingerprint
     func getFingerprint() -> [UInt8]? {
-        return cipher?.getFingerprint()
+        return getCipher()?.getFingerprint()
     }
 
     /// Check if encryption is enabled AND cipher is available
@@ -352,8 +426,14 @@ final class EncryptionKeyManager {
     /// has been loaded. This prevents the case where encryption is "enabled"
     /// but no key is available.
     var isEnabled: Bool {
-        get { enabled && cipher != nil }
+        get {
+            controlLock.lock()
+            defer { controlLock.unlock() }
+            return enabled && cipher != nil
+        }
         set {
+            controlLock.lock()
+            defer { controlLock.unlock() }
             enabled = newValue
             if newValue && cipher == nil {
                 halLog("Warning: Encryption enabled but no cipher available (key may not be loaded)")
@@ -365,6 +445,6 @@ final class EncryptionKeyManager {
 
     /// Check if encryption is available (cipher loaded, regardless of enabled state)
     var isAvailable: Bool {
-        return cipher != nil
+        return getCipher() != nil
     }
 }

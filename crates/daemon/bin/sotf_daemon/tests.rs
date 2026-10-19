@@ -1,8 +1,8 @@
 #![allow(clippy::field_reassign_with_default)]
 use super::audio_daemon::{
     AudioDaemon, CaptureResumeTracker, ConfigChangeDebouncer, METERING_LATENCY_BUDGET_MICROS,
-    PIPELINE_RESPONSE_BUDGET_BYTES, PLAYBACK_IDLE_REBUILD_THRESHOLD, RuntimeTelemetry,
-    VolumeSyncTracker, changed_plugin_parameters, encode_plugin_param_value,
+    PIPELINE_RESPONSE_BUDGET_BYTES, PLAYBACK_IDLE_REBUILD_THRESHOLD, PlaybackProgress,
+    RuntimeTelemetry, VolumeSyncTracker, changed_plugin_parameters, encode_plugin_param_value,
     join_initial_playback_thread, pipeline_timing_after_config_request,
     rack_plugins_to_linear_graph, reorder_linear_graph, startup_channel_geometry,
     wait_for_playback_observation,
@@ -53,6 +53,70 @@ use std::io::{BufRead, BufReader, Cursor, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
+
+#[test]
+fn progress_tracks_stages_and_distinguishes_stall_from_delayed_observation() {
+    let started = std::time::Instant::now();
+    let mut progress = PlaybackProgress::default();
+    let mut engine = sotf_audio::AudioEngineState::default();
+    progress.observe(started, 1, true, &engine);
+    engine.playback_frames_received = 128;
+    engine.playback_frames_written = 128;
+    engine.playback_callback_count = 4;
+    let flowing = started + std::time::Duration::from_millis(100);
+    progress.observe(flowing, 1, true, &engine);
+    for stage in 0..3 {
+        assert_eq!(
+            progress.status(flowing, 1, engine.playback_epoch, stage),
+            "fresh"
+        );
+    }
+    let later = started + std::time::Duration::from_secs(8);
+    assert_eq!(
+        progress.status(later, 1, engine.playback_epoch, 1),
+        "observation_delayed"
+    );
+    engine.playback_callback_count += 1;
+    progress.observe(later, 1, true, &engine);
+    assert_eq!(progress.status(later, 1, engine.playback_epoch, 0), "stale");
+    assert_eq!(progress.status(later, 1, engine.playback_epoch, 1), "fresh");
+    assert_eq!(progress.status(later, 1, engine.playback_epoch, 2), "stale");
+}
+
+#[test]
+fn progress_cannot_reuse_prior_pause_generation_or_stream_epoch_activity() {
+    let now = std::time::Instant::now();
+    let mut progress = PlaybackProgress::default();
+    let mut engine = sotf_audio::AudioEngineState::default();
+    progress.observe(now, 1, true, &engine);
+    engine.playback_callback_count = 10;
+    progress.observe(now, 1, true, &engine);
+    assert_eq!(progress.status(now, 1, engine.playback_epoch, 1), "fresh");
+    progress.observe(now, 1, false, &engine);
+    progress.observe(now, 1, true, &engine);
+    assert_eq!(
+        progress.status(now, 1, engine.playback_epoch, 1),
+        "awaiting_progress"
+    );
+    progress.observe(now, 2, true, &engine);
+    assert_eq!(
+        progress.status(now, 1, engine.playback_epoch, 1),
+        "unobserved_generation"
+    );
+    assert_eq!(
+        progress.status(now, 2, engine.playback_epoch, 1),
+        "awaiting_progress"
+    );
+    engine.playback_epoch += 1;
+    progress.observe(now, 2, true, &engine);
+    assert_eq!(
+        progress.status(now, 2, engine.playback_epoch, 1),
+        "awaiting_progress"
+    );
+    engine.playback_callback_count += 1;
+    progress.observe(now, 2, true, &engine);
+    assert_eq!(progress.status(now, 2, engine.playback_epoch, 1), "fresh");
+}
 
 fn test_plugin(plugin_type: &str) -> PluginConfig {
     PluginConfig {
@@ -891,6 +955,7 @@ mod ipc_safety_tests {
         last_ack: Option<(DriverConfig, ConfigResult)>,
         pending_config_change: Option<DriverConfig>,
         fail_next_config: Option<String>,
+        negotiated_config: Option<DriverConfig>,
         config_failures_remaining: usize,
         published_volume: Option<(f32, bool, u32)>,
         volume_generation: u32,
@@ -904,6 +969,41 @@ mod ipc_safety_tests {
     impl FakeDriver {
         fn new(state: Arc<Mutex<FakeDriverState>>) -> Self {
             Self { state }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeCaptureInput(Arc<Mutex<FakeDriverState>>);
+
+    impl driver_common::CaptureInput for FakeCaptureInput {
+        fn configuration(&self) -> DriverConfig {
+            let state = self.0.lock();
+            DriverConfig::new(
+                state.status.sample_rate,
+                state.status.buffer_frames,
+                state.status.channel_count,
+            )
+        }
+
+        fn available_frames(&self) -> usize {
+            4096
+        }
+
+        fn read_frames(&self, buffer: &mut [f32], expected: DriverConfig) -> usize {
+            if expected != self.configuration() {
+                return 0;
+            }
+            let channels = expected.channel_count as usize;
+            if channels == 0 {
+                return 0;
+            }
+            let frames = buffer.len() / channels;
+            for frame in buffer[..frames * channels].chunks_exact_mut(channels) {
+                for (channel, sample) in frame.iter_mut().enumerate() {
+                    *sample = (channel + 1) as f32 * 0.03125;
+                }
+            }
+            frames
         }
     }
 
@@ -921,6 +1021,12 @@ mod ipc_safety_tests {
         fn read_audio(&mut self, buffer: &mut [f32]) -> usize {
             buffer.fill(0.0);
             0
+        }
+
+        fn capture_source(&self) -> Option<driver_common::CaptureSource> {
+            Some(driver_common::CaptureSource::new(FakeCaptureInput(
+                Arc::clone(&self.state),
+            )))
         }
 
         fn available_frames(&self) -> usize {
@@ -944,6 +1050,15 @@ mod ipc_safety_tests {
             } else if state.config_failures_remaining > 0 {
                 state.config_failures_remaining -= 1;
                 ConfigResult::error("queued config failure")
+            } else if let Some(actual) = state.negotiated_config {
+                state.status.sample_rate = actual.sample_rate;
+                state.status.buffer_frames = actual.buffer_frames;
+                state.status.channel_count = actual.channel_count;
+                ConfigResult::negotiated(
+                    actual.sample_rate,
+                    actual.buffer_frames,
+                    actual.channel_count,
+                )
             } else {
                 if config.sample_rate > 0 {
                     state.status.sample_rate = config.sample_rate;
@@ -992,6 +1107,7 @@ mod ipc_safety_tests {
             last_ack: None,
             pending_config_change: None,
             fail_next_config: None,
+            negotiated_config: None,
             config_failures_remaining: 0,
             published_volume: None,
             volume_generation: 0,
@@ -1019,12 +1135,82 @@ mod ipc_safety_tests {
             system_state: Arc::new(Mutex::new(SystemwideState::default())),
             key_manager: Arc::new(Mutex::new(KeyManager::for_test())),
             pipeline_mutation: Arc::new(Mutex::new(())),
+            pipeline_intent_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             runtime_telemetry: Arc::new(RuntimeTelemetry::default()),
+            playback_progress: Arc::new(Mutex::new(PlaybackProgress::default())),
+            snapshot_cache: Arc::new(Mutex::new(None)),
             device_registry: Arc::new(Mutex::new(DeviceRegistry::default())),
             output_profiles: Arc::new(Mutex::new(
                 crate::output_profiles::OutputProfileStore::default(),
             )),
         }
+    }
+
+    #[test]
+    fn testkit_stop_supersedes_startup_before_worker_executes() {
+        let daemon = test_daemon_with_driver(fake_driver_state());
+        let startup_intent = daemon
+            .pipeline_intent_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let generation = daemon.system_state.lock().generation();
+        let stopped = daemon.handle_command(Command::Stop);
+        assert!(stopped.success, "{stopped:?}");
+        // Stop does not apply a pipeline spec, so the intent epoch is needed
+        // in addition to the configuration generation.
+        assert_eq!(daemon.system_state.lock().generation(), generation);
+        daemon
+            .spawn_initial_driver_playback_for_intent(startup_intent)
+            .join()
+            .unwrap();
+        assert_eq!(
+            daemon.manager.lock().get_state(),
+            sotf_audio::manager::StreamingState::Idle
+        );
+        assert_eq!(daemon.system_state.lock().generation(), generation);
+        assert!(daemon.system_state.lock().applied_spec().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn startup_after_idle_driver_configuration_obeys_latest_playback_intent() {
+        let state = fake_driver_state();
+        let daemon = test_daemon_with_driver(Arc::clone(&state));
+        let old_intent = daemon
+            .pipeline_intent_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        // A driver event supersedes boot, but leaves the engine idle.
+        daemon
+            .pipeline_intent_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        handle_driver_config_change(
+            &daemon.driver_manager,
+            &daemon.manager,
+            &daemon.device_registry,
+            DriverConfig::new(48_000, 512, 2),
+            &daemon.system_state,
+            &daemon.running,
+        );
+        daemon
+            .spawn_initial_driver_playback_for_intent(old_intent)
+            .join()
+            .unwrap();
+        assert!(daemon.should_retry_startup());
+        assert!(daemon.handle_command(Command::Stop).success);
+        assert!(!daemon.should_retry_startup());
+        assert!(daemon.handle_command(Command::Pause).success);
+        assert!(!daemon.should_retry_startup());
+        daemon.system_state.lock().playback_wanted = true;
+        state.lock().status.driver_ready = false;
+        assert!(!daemon.should_retry_startup());
+        state.lock().status.driver_ready = true;
+        assert!(daemon.should_retry_startup());
+        daemon.spawn_initial_driver_playback().join().unwrap();
+        assert_eq!(
+            daemon.manager.lock().get_playback_state(),
+            sotf_audio::PlaybackState::Playing
+        );
+        assert!(!daemon.should_retry_startup());
+        assert!(daemon.handle_command(Command::Stop).success);
     }
 
     /// Connected IPC test pair: `UnixStream::pair` on Unix, loopback TCP
@@ -1307,33 +1493,28 @@ mod ipc_safety_tests {
     }
 
     #[test]
-    fn snapshot_waits_for_pipeline_mutation_to_finish() {
+    fn snapshot_returns_complete_aged_observation_during_transition() {
         let daemon = test_daemon_with_driver(fake_driver_state());
+        let before = daemon.snapshot_json();
         let mutation = daemon.pipeline_mutation.lock();
         let snapshot_daemon = daemon.clone();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (finished_tx, finished_rx) = mpsc::channel();
-
-        let snapshot_thread = std::thread::spawn(move || {
-            started_tx.send(()).expect("signal snapshot start");
-            let snapshot = snapshot_daemon.snapshot_json();
-            finished_tx.send(snapshot).expect("return snapshot");
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(snapshot_daemon.snapshot_json()).unwrap();
         });
-
-        started_rx.recv().expect("snapshot thread started");
-        assert!(
-            finished_rx
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_err(),
-            "snapshot must not observe a transition while mutation lock is held"
-        );
-
+        let snapshot = rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .expect("status stays responsive");
+        assert_eq!(snapshot["applied"], before["applied"]);
+        assert_eq!(snapshot["observed"], before["observed"]);
+        assert_eq!(snapshot["observation"]["transition_in_progress"], true);
+        assert_eq!(snapshot["observation"]["available"], true);
         drop(mutation);
-        let snapshot = finished_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("snapshot completes after transition");
-        assert_eq!(snapshot["schema_version"], 1);
-        snapshot_thread.join().expect("snapshot thread joins");
+        worker.join().unwrap();
+        assert_eq!(
+            daemon.snapshot_json()["observation"]["transition_in_progress"],
+            false
+        );
     }
 
     #[test]
@@ -1383,6 +1564,22 @@ mod ipc_safety_tests {
             3,
             true,
         ));
+    }
+
+    #[test]
+    fn config_debounce_discards_requests_superseded_by_control_intent() {
+        let now = std::time::Instant::now();
+        let old = driver_common::DriverConfig::new(96_000, 512, 2);
+        let new = driver_common::DriverConfig::new(48_000, 256, 2);
+        let mut pending = ConfigChangeDebouncer::new();
+        assert_eq!(pending.observe_intent(now, Some(old), 10), None);
+        let settled = now + ConfigChangeDebouncer::DEBOUNCE;
+        assert_eq!(pending.observe_intent(settled, None, 11), None);
+        assert_eq!(pending.observe_intent(settled, Some(new), 11), None);
+        assert_eq!(
+            pending.observe_intent(settled + ConfigChangeDebouncer::DEBOUNCE, None, 11),
+            Some(new)
+        );
     }
 
     #[test]
@@ -2243,6 +2440,8 @@ mod ipc_safety_tests {
             pipeline.commit_applied(&plan);
         }
 
+        // A native reconnect notification reports the already active endpoint.
+        state.lock().status.channel_count = 10;
         handle_driver_config_change(
             &daemon.driver_manager,
             &daemon.manager,
@@ -2327,11 +2526,18 @@ mod ipc_safety_tests {
         assert_eq!(tracker.observe(None), None);
         assert_eq!(tracker.observe(Some((0.5, false, 0))), None);
         // First real publication applies (startup adopts persisted volume).
-        assert_eq!(tracker.observe(Some((0.5, true, 7))), Some((0.5, true)));
+        assert_eq!(tracker.observe(Some((0.5, true, 7))), Some((0.5, true, 7)));
+        // A failed engine application leaves this generation retryable.
+        assert_eq!(tracker.observe(Some((0.5, true, 7))), Some((0.5, true, 7)));
+        tracker.committed(7);
         // Same generation is not re-applied on later polls.
         assert_eq!(tracker.observe(Some((0.5, true, 7))), None);
         // Each new generation applies exactly once.
-        assert_eq!(tracker.observe(Some((0.75, false, 8))), Some((0.75, false)));
+        assert_eq!(
+            tracker.observe(Some((0.75, false, 8))),
+            Some((0.75, false, 8))
+        );
+        tracker.committed(8);
         assert_eq!(tracker.observe(Some((0.75, false, 8))), None);
     }
 
@@ -2582,6 +2788,454 @@ mod ipc_safety_tests {
         assert_eq!(driver.status.sample_rate, 48_000);
         assert_eq!(driver.status.buffer_frames, 512);
         assert_eq!(driver.status.channel_count, 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fallback_commits_its_own_rack_or_graph_without_overwriting_outgoing_profile() {
+        for graph_profile in [false, true] {
+            let daemon = test_daemon_with_driver(fake_driver_state());
+            for (id, gain, graph) in [
+                ("profile-a", -3.0, false),
+                ("profile-b", -9.0, graph_profile),
+            ] {
+                let profile = serde_json::from_value(serde_json::json!({
+                    "id": id, "name": id, "topology": if graph { "graph" } else { "rack" },
+                    "plugins": if graph { serde_json::json!([]) } else {
+                        serde_json::json!([{"plugin_type":"gain","parameters":{"gain_db":gain}}])
+                    },
+                    "graph": if graph { serde_json::json!({
+                        "nodes":[{"id":7,"plugin_type":"gain","parameters":{"gain_db":gain},"input_channels":2}],
+                        "edges":[]
+                    }) } else { Value::Null },
+                    "input_channels":2, "output_channels":2, "updated_at_unix_ms":0
+                })).expect("valid profile");
+                assert!(daemon.handle_set_output_profile(profile).success);
+            }
+            assert!(
+                daemon
+                    .handle_assign_output_profile(None, LAB_OUTPUT_DEVICE_NAME, "profile-b")
+                    .success
+            );
+            daemon.output_profiles.lock().set_current_in_memory(
+                None,
+                Some("Missing A".to_owned()),
+                Some("profile-a".to_owned()),
+            );
+            let mut plan = daemon
+                .system_state
+                .lock()
+                .prepare_plan(
+                    vec![PluginConfig::new(
+                        "gain",
+                        serde_json::json!({"gain_db":-3.0}),
+                    )],
+                    2,
+                    2,
+                    2,
+                )
+                .expect("outgoing plan");
+            plan.spec.output_device = Some("Missing A".to_owned());
+            daemon.system_state.lock().commit_applied(&plan);
+            let response = daemon.apply_pipeline_plan_for_output(
+                plan,
+                48_000,
+                512,
+                super::super::audio_daemon::PipelineApplyIntent::RebuildOutput,
+                super::super::misc::EffectiveOutputDevice {
+                    device: Some(LAB_OUTPUT_DEVICE_NAME.to_owned()),
+                    fallback: Some(super::super::misc::OutputDeviceFallback {
+                        desired: "Missing A".to_owned(),
+                        applied: LAB_OUTPUT_DEVICE_NAME.to_owned(),
+                    }),
+                },
+            );
+            assert!(response.success, "{response:?}");
+            assert_eq!(
+                daemon.manager.lock().get_playback_state(),
+                sotf_audio::PlaybackState::Playing
+            );
+            let applied = daemon
+                .system_state
+                .lock()
+                .applied_spec()
+                .expect("committed fallback");
+            assert_eq!(
+                applied.output_device.as_deref(),
+                Some(LAB_OUTPUT_DEVICE_NAME)
+            );
+            assert_eq!(
+                daemon
+                    .system_state
+                    .lock()
+                    .selected_output_device()
+                    .as_deref(),
+                Some("Missing A")
+            );
+            if graph_profile {
+                assert_eq!(
+                    applied.user_graph.unwrap().nodes[0].parameters["gain_db"],
+                    -9.0
+                );
+            } else {
+                assert_eq!(applied.user_plugins[0].parameters["gain_db"], -9.0);
+            }
+            let profiles = daemon
+                .handle_get_output_profiles()
+                .data
+                .expect("profile snapshot");
+            assert_eq!(profiles["current"]["profile_id"], "profile-b");
+            let outgoing = profiles["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|profile| profile["id"] == "profile-a")
+                .unwrap();
+            assert_eq!(outgoing["plugins"][0]["parameters"]["gain_db"], -3.0);
+            if !graph_profile {
+                let update = daemon.handle_command(Command::UpdatePlugin {
+                    index: 0,
+                    parameters: serde_json::json!({"gain_db":-12.0}),
+                });
+                assert!(update.success, "{update:?}");
+                assert_eq!(
+                    daemon
+                        .system_state
+                        .lock()
+                        .applied_output_device()
+                        .as_deref(),
+                    Some(LAB_OUTPUT_DEVICE_NAME)
+                );
+                assert_eq!(
+                    daemon
+                        .system_state
+                        .lock()
+                        .selected_output_device()
+                        .as_deref(),
+                    Some("Missing A")
+                );
+            }
+            // An automatic return to a restored output must recall A, even
+            // though the desired hardware preference stayed A throughout.
+            assert!(
+                daemon
+                    .handle_assign_output_profile(None, LAB_OUTPUT_DEVICE_NAME, "profile-a")
+                    .success
+            );
+            let restore_plan = {
+                let state = daemon.system_state.lock();
+                state.prepare_from_spec(state.desired_spec(), 2).unwrap()
+            };
+            // Simulate an old applied device distinct from the restored one;
+            // resolution is supplied explicitly so no physical device is used.
+            {
+                let mut state = daemon.system_state.lock();
+                let mut old = state.applied_spec().unwrap();
+                old.output_device = Some("Temporary B".to_owned());
+                let plan = state.prepare_from_spec(old, 2).unwrap();
+                state.commit_fallback_applied(&plan, Some(LAB_OUTPUT_DEVICE_NAME.to_owned()));
+            }
+            let mut restore_plan = restore_plan;
+            restore_plan.spec.output_device = Some(LAB_OUTPUT_DEVICE_NAME.to_owned());
+            let restored = daemon.apply_pipeline_plan_for_output(
+                restore_plan,
+                48_000,
+                512,
+                super::super::audio_daemon::PipelineApplyIntent::RebuildOutput,
+                super::super::misc::EffectiveOutputDevice {
+                    device: Some(LAB_OUTPUT_DEVICE_NAME.to_owned()),
+                    fallback: None,
+                },
+            );
+            assert!(restored.success, "{restored:?}");
+            let applied = daemon.system_state.lock().applied_spec().unwrap();
+            assert_eq!(applied.user_plugins[0].parameters["gain_db"], -3.0);
+            assert!(applied.user_graph.is_none());
+            assert_eq!(
+                daemon.output_profiles.lock().current().0.as_deref(),
+                Some("profile-a")
+            );
+            daemon.manager.lock().stop().expect("stop fixture");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_configuration_binds_incoming_profile_before_saving_live_chain() {
+        let daemon = test_daemon_with_driver(fake_driver_state());
+        for (id, gain) in [("outgoing", -3.0), ("incoming", -9.0)] {
+            let mut profile: crate::output_profiles::OutputProfile =
+                serde_json::from_value(serde_json::json!({
+                    "id":id,"name":id,"topology":"rack","plugins":[],"graph":null,
+                    "input_channels":2,"output_channels":2,"updated_at_unix_ms":0
+                }))
+                .unwrap();
+            profile.plugins = vec![PluginConfig::new(
+                "gain",
+                serde_json::json!({"gain_db":gain}),
+            )];
+            assert!(daemon.handle_set_output_profile(profile).success);
+        }
+        assert!(
+            daemon
+                .handle_assign_output_profile(None, LAB_OUTPUT_DEVICE_NAME, "incoming")
+                .success
+        );
+        daemon.output_profiles.lock().set_current_in_memory(
+            None,
+            Some("Old A".to_owned()),
+            Some("outgoing".to_owned()),
+        );
+        {
+            let mut state = daemon.system_state.lock();
+            let mut plan = state
+                .prepare_plan(
+                    vec![PluginConfig::new(
+                        "gain",
+                        serde_json::json!({"gain_db":-3.0}),
+                    )],
+                    2,
+                    2,
+                    2,
+                )
+                .unwrap();
+            plan.spec.output_device = Some("Old A".to_owned());
+            state.commit_applied(&plan);
+        }
+        let response = daemon.handle_command(Command::ApplyConfiguration {
+            sample_rate: None,
+            buffer_frames: None,
+            input_channels: None,
+            output_channels: None,
+            output_device: Some(LAB_OUTPUT_DEVICE_NAME.to_owned()),
+        });
+        assert!(response.success, "{response:?}");
+        let profiles = daemon.handle_get_output_profiles().data.unwrap();
+        assert_eq!(profiles["current"]["profile_id"], "incoming");
+        for (id, gain) in [("outgoing", -3.0), ("incoming", -9.0)] {
+            let profile = profiles["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|profile| profile["id"] == id)
+                .unwrap();
+            assert_eq!(profile["plugins"][0]["parameters"]["gain_db"], gain);
+        }
+        daemon.manager.lock().stop().unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn explicit_capture_samples_reach_both_monitors_through_gain_processing() {
+        for native_rate in [48_000, 32_000] {
+            let state = fake_driver_state();
+            state.lock().status.sample_rate = native_rate;
+            let daemon = test_daemon_with_driver(state);
+            daemon.system_state.lock().processing_timing = Some((48_000, 512));
+            let response = daemon.handle_command(Command::LoadPlugins {
+                plugins: vec![PluginConfig::new(
+                    "gain",
+                    serde_json::json!({"gain_db":-6.0}),
+                )],
+                input_channels: 2,
+                output_channels: 2,
+            });
+            assert!(response.success, "{response:?}");
+            let expected_gain = 10.0f64.powf(-6.0 / 20.0);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let response = daemon.handle_command(Command::GetMetering);
+                let metering = response.data.expect("metering response");
+                let input = metering["input"]["channel_peaks"].as_array().unwrap();
+                let output = metering["output"]["channel_peaks"].as_array().unwrap();
+                let samples_match = (0..2).all(|channel| {
+                    let original = (channel + 1) as f64 * 0.03125;
+                    input
+                        .get(channel)
+                        .and_then(Value::as_f64)
+                        .is_some_and(|value| (value - original).abs() < 0.002)
+                        && output
+                            .get(channel)
+                            .and_then(Value::as_f64)
+                            .is_some_and(|value| (value - original * expected_gain).abs() < 0.002)
+                });
+                let engine = daemon.manager.lock().get_engine_state();
+                if samples_match
+                    && engine.playback_callback_count > 0
+                    && engine.playback_frames_written > 0
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "capture was replaced by silence, reordered, or bypassed gain: {metering:?}; {engine:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_eq!(
+                daemon.system_state.lock().processing_timing,
+                Some((48_000, 512))
+            );
+            daemon.manager.lock().stop().unwrap();
+        }
+    }
+
+    #[test]
+    fn lab_route_is_independent_of_host_devices_and_never_falls_back_to_itself() {
+        for physical in [None, Some("Real Speakers")] {
+            for desired in [None, Some(LAB_OUTPUT_DEVICE_NAME)] {
+                let route = effective_output_for_sink(
+                    super::super::misc::EffectiveOutputDevice {
+                        device: physical.map(str::to_owned),
+                        fallback: None,
+                    },
+                    SinkType::LabNull,
+                    desired,
+                );
+                assert_eq!(route.device.as_deref(), Some(LAB_OUTPUT_DEVICE_NAME));
+                assert!(route.fallback.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn status_only_backend_cannot_claim_a_running_pipeline() {
+        let state = fake_driver_state();
+        state.lock().status.platform_supported = false;
+        let daemon = test_daemon_with_driver(Arc::clone(&state));
+        daemon
+            .spawn_initial_driver_playback()
+            .join()
+            .expect("startup worker");
+        assert_eq!(
+            daemon.manager.lock().get_state(),
+            sotf_audio::manager::StreamingState::Idle
+        );
+        assert!(daemon.system_state.lock().applied_spec().is_none());
+        let response = daemon.handle_command(Command::Play);
+        assert!(!response.success);
+        assert!(response.error.unwrap().contains("status-only"));
+        assert!(!state.lock().engine_ready);
+        assert!(state.lock().requested_configs.is_empty());
+    }
+
+    #[test]
+    fn native_capture_reconnect_preserves_processing_timing_and_acknowledges_native_geometry() {
+        let state = fake_driver_state();
+        state.lock().status.sample_rate = 32_000;
+        state.lock().status.buffer_frames = 32;
+        let daemon = test_daemon_with_driver(Arc::clone(&state));
+        daemon.system_state.lock().processing_timing = Some((48_000, 512));
+        handle_driver_config_change(
+            &daemon.driver_manager,
+            &daemon.manager,
+            &daemon.device_registry,
+            DriverConfig::new(32_000, 32, 2),
+            &daemon.system_state,
+            &daemon.running,
+        );
+        assert_eq!(
+            daemon.system_state.lock().processing_timing,
+            Some((48_000, 512))
+        );
+        let ack = state.lock().last_ack.clone().unwrap();
+        assert_eq!(ack.0, DriverConfig::new(32_000, 32, 2));
+        assert_eq!(ack.1, ConfigResult::Accepted);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn applied_pipeline_adopts_all_negotiated_capture_dimensions() {
+        let state = fake_driver_state();
+        state.lock().negotiated_config = Some(DriverConfig::new(96_000, 256, 4));
+        let daemon = test_daemon_with_driver(Arc::clone(&state));
+        daemon
+            .system_state
+            .lock()
+            .set_desired_output_device(Some(LAB_OUTPUT_DEVICE_NAME.to_owned()))
+            .unwrap();
+        let response = daemon.handle_command(Command::LoadPlugins {
+            plugins: vec![],
+            input_channels: 6,
+            output_channels: 4,
+        });
+        assert!(response.success, "{response:?}");
+        let applied = daemon.system_state.lock().applied_spec().unwrap();
+        assert_eq!(applied.input_channels, 4);
+        assert_eq!(applied.output_channels, 4);
+        assert_eq!(state.lock().status.sample_rate, 96_000);
+        assert_eq!(state.lock().status.buffer_frames, 256);
+        assert_eq!(
+            daemon
+                .driver_manager
+                .lock()
+                .capture_source()
+                .unwrap()
+                .configuration(),
+            DriverConfig::new(96_000, 256, 4)
+        );
+        assert_eq!(
+            daemon.manager.lock().get_playback_state(),
+            sotf_audio::PlaybackState::Playing
+        );
+        assert_eq!(
+            daemon.system_state.lock().processing_timing,
+            Some((48_000, 512)),
+            "native capture negotiation must not change physical processing timing"
+        );
+        daemon.manager.lock().stop().unwrap();
+    }
+
+    #[test]
+    fn volume_publication_waits_for_temporary_mute_to_be_restored() {
+        let state = fake_driver_state();
+        let daemon = Arc::new(test_daemon_with_driver(Arc::clone(&state)));
+        let transition = daemon.pipeline_mutation.lock();
+        daemon
+            .manager
+            .lock()
+            .set_mute(true)
+            .expect("temporary teardown mute");
+        let epoch = daemon
+            .pipeline_intent_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker_daemon = Arc::clone(&daemon);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(worker_daemon.handle_command(Command::SetVolume { volume: 0.25 }))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        assert!(state.lock().published_volume.is_none());
+        daemon
+            .manager
+            .lock()
+            .set_mute(false)
+            .expect("restore user mute");
+        drop(transition);
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .success
+        );
+        worker.join().unwrap();
+        let published = state.lock().published_volume.expect("published gain");
+        assert_eq!((published.0, published.1), (0.25, false));
+        assert_eq!(
+            daemon
+                .pipeline_intent_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            epoch
+        );
     }
 
     #[test]
@@ -3056,7 +3710,7 @@ mod ipc_safety_tests {
         let requested_plan = {
             let mut state = daemon.system_state.lock();
             let previous_plan = state
-                .prepare_with_selected_device("Definitely Missing Physical Output".to_string())
+                .prepare_with_selected_device(LAB_OUTPUT_DEVICE_NAME.to_string())
                 .expect("safe explicit output name");
             state.commit_applied(&previous_plan);
             state
@@ -4046,7 +4700,10 @@ mod command_roundtrip_tests {
             system_state: Arc::new(Mutex::new(SystemwideState::default())),
             key_manager: Arc::new(Mutex::new(KeyManager::default())),
             pipeline_mutation: Arc::new(Mutex::new(())),
+            pipeline_intent_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             runtime_telemetry: Arc::new(RuntimeTelemetry::default()),
+            playback_progress: Arc::new(Mutex::new(PlaybackProgress::default())),
+            snapshot_cache: Arc::new(Mutex::new(None)),
             device_registry: Arc::new(Mutex::new(DeviceRegistry::default())),
             output_profiles: Arc::new(Mutex::new(
                 crate::output_profiles::OutputProfileStore::default(),

@@ -20,6 +20,83 @@ Update this document whenever a change affects:
 - safety invariants around CoreAudio, real-time callbacks, physical output
   device selection, encryption, or installer lifecycle.
 
+## October 2026 audit hardening
+
+Implementation and remaining verification are tracked in
+`AUDIT-FIXES-20261018.md` and private issue `sotf-systemwide#1`.
+
+- Swift validates protocol version, bounded geometry, mapped coverage, and
+  cursors before publishing driver readiness. Failed initialization discards
+  the mapping. IO reserves its transport bit before copying and uses bounded
+  geometry/cursor snapshots; only the consumer advances the read cursor.
+  Full rings reject incoming data instead of overwriting a reader's payload.
+- Encryption key discovery remains maintenance work. Immutable cipher slots
+  are pinned for the entire realtime operation; inactive-slot replacement and
+  final reclamation happen on the maintenance writer. The timestamp callback
+  reads preallocated atomic snapshots rather than taking the clock mutex.
+- Cipher and mapping slot reuse uses an exclusive writer gate, closing the
+  delayed-reader race. Callback acquisition has a finite retry bound and
+  returns silence/drops input on contention rather than waiting.
+- Console transport identity is checked from maintenance and client lifecycle
+  control calls. A change closes callback admission, waits for pinned readers,
+  retires both mappings, clears pending configuration and loopback PCM, and
+  reloads the new user's key. Missing replacement resources keep capture gated.
+  Actual fast-user-switch timing still requires native OS validation.
+- Device property callbacks publish atomic bits; the watcher consumes at most
+  one of each event per pass. Repeated events cannot grow an unbounded queue.
+  Debounced configuration work is discarded after a newer control intent.
+- IPC volume changes and driver-volume application share the transition guard,
+  so temporary reconfiguration mute is not published as user mute. Successful
+  volume generations are committed only after both gain/mute operations succeed.
+- Startup carries a separate intent epoch, including Stop/Pause intents that
+  do not commit a new configuration. It checks supersession under the pipeline
+  mutation guard before applying work. Device waits do not retain the state
+  mutex, and terminal timeout paths retain a recovery explanation.
+- Status reads do not heal readiness. The supervisor tracks frame-receive,
+  callback and frame-write advances per pipeline generation and engine epoch.
+  The seven-second control freshness window accommodates the shared engine's
+  five-second stats publication; it is not an audio deadline guarantee.
+  Snapshots use the transition guard opportunistically. During a transition
+  they return one complete cached observation with `observation.age_ms`,
+  `observation.available`, and `observation.transition_in_progress`; clients
+  must treat a cached observation as historical. Before the first complete
+  observation, only the schema and unavailable-transition metadata are returned.
+- Route callers commit the actual output's profile identity before syncing the
+  successful live chain. Automatic fallback uses its assigned profile or a
+  separate empty unconfigured profile, and restoration recalls the original
+  output's profile. Live edits preserve the actual fallback route and the
+  preferred hardware selection. A newly changed route rejects a concurrent
+  DSP edit so it can be retried against the correct output. Failed apply/rollback
+  does not persist the incoming chain under the outgoing profile. No-op and
+  timing-only commands do not autosave an unchanged live chain.
+- Output processing timing is owned by `SystemwideState` separately from the
+  native capture endpoint's rate and block size. Explicit `CaptureSource`
+  inputs use the shared engine's resampler; native negotiation changes source
+  geometry without silently replacing output timing. Snapshots expose both.
+  Lab and CPAL capture sources carry real samples into the engine; NullDriver
+  is status-only and cannot start a successful systemwide playback pipeline.
+- Startup recovery retains a single retry worker and uses the latest intent
+  epoch after idle driver reconfiguration or delayed capture readiness. An
+  explicit Pause/Stop disables automatic startup; unavailable capture cannot
+  open an output and report successful playback. Failed resume falls back to
+  rebuilding the stream.
+- Windows authentication is admitted to bounded, owned handshake workers.
+  Runtime directories and token files are pinned and checked with Win32 handles;
+  tokens receive a protected owner-only DACL at creation, before secret bytes
+  are written. Unix poll/Windows WSAPoll wake accepts on readiness without the
+  previous 50 ms accept-loop polling penalty.
+- Installer writes below a user's home, including log rotation and plist
+  preparation, run with that user's privileges. The readiness log offset is
+  captured before launching the daemon, and log reads/smoke probes run as the
+  console user too.
+- The normal macOS lab executes the Swift HAL behavioral suite. Hardware
+  capture tests require explicit opt-in; callback queue/error tests remain
+  device-free. Marked samples through gain and both monitors, native-rate
+  resampling, profile round trips/restarts, paused resume, long-idle rebuild,
+  and startup supersession are behavioral regressions. Physical devices,
+  installed-driver lifecycle and release deadline measurements remain native
+  acceptance work. Joint protocol/engine findings are listed in the audit ledger.
+
 ## Scope
 
 `systemwide` is the SOTF subsystem that captures operating-system audio,

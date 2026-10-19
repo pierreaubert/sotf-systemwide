@@ -262,6 +262,11 @@ impl PipelineSupervisor {
         Ok(())
     }
 
+    /// Restore preference as part of the already committed rollback generation.
+    pub(super) fn restore_output_preference(&mut self, output_device: Option<String>) {
+        self.desired.output_device = output_device;
+    }
+
     pub(super) fn commit_idle_reconfigure(&mut self, plan: &PipelinePlan) {
         self.generation = self.generation.saturating_add(1);
         self.desired = plan.spec.clone();

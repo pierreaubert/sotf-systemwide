@@ -1230,6 +1230,8 @@ INSTALLER_COMMON
     # Self-contained stdlib smoke test, staged next to the app postinstall.
     cp "$PROJECT_ROOT/scripts/lib/daemon_smoke.py" "$pkg_scripts/daemon_smoke.py"
     chmod 755 "$pkg_scripts/daemon_smoke.py"
+    cp "$PROJECT_ROOT/scripts/lib/prepare_user_files.sh" "$pkg_scripts/prepare_user_files.sh"
+    chmod 755 "$pkg_scripts/prepare_user_files.sh"
 
     # Copy app to pkg root
     cp -R "$APP_BUNDLE" "$pkg_root/Applications/"
@@ -1281,79 +1283,35 @@ LOG_DIR="$USER_HOME/Library/Logs/SotF"
 DAEMON_AGENT_DST="$LAUNCH_AGENTS_DIR/$DAEMON_AGENT_LABEL.plist"
 CONFIGBAR_AGENT_DST="$LAUNCH_AGENTS_DIR/$CONFIGBAR_AGENT_LABEL.plist"
 
-install_agent() {
-    local label="$1"
-    local destination="$2"
-    local stdout_path="$3"
-    local stderr_path="$4"
-
-    /bin/rm -f "$destination"
-    /usr/bin/ditto "$AGENT_TEMPLATE_DIR/$label.plist" "$destination"
-    /usr/libexec/PlistBuddy -c "Set :StandardOutPath $stdout_path" "$destination"
-    /usr/libexec/PlistBuddy -c "Set :StandardErrorPath $stderr_path" "$destination"
-    # The checked-in plists are templates: refuse to install one still
-    # carrying a placeholder, which would log to a literal __SOTF_ path.
-    if grep -q "__SOTF_" "$destination"; then
-        echo "ERROR: placeholder left in installed agent plist: $destination" >&2
-        exit 1
-    fi
-    /usr/sbin/chown "$CONSOLE_USER:$CONSOLE_GROUP" "$destination"
-    /bin/chmod 644 "$destination"
+# User-home paths are controlled by the console user, including their parent
+# directories. Drop privileges for every access rather than checking paths as
+# root and then following them in a later operation.
+as_console_user() {
+    /usr/bin/sudo -u "$CONSOLE_USER" -- "$@"
 }
-
-prepare_log() {
-    local log_path="$1"
-    local log_size=0
-
-    if [ -f "$log_path" ]; then
-        log_size="$(/usr/bin/stat -f '%z' "$log_path" 2>/dev/null || echo 0)"
-        if [ "$log_size" -ge "$LOG_ROLLOVER_BYTES" ]; then
-            /bin/mv -f "$log_path" "$log_path.1"
-            /usr/sbin/chown "$CONSOLE_USER:$CONSOLE_GROUP" "$log_path.1"
-            /bin/chmod 600 "$log_path.1"
-        fi
-    fi
-    /usr/bin/touch "$log_path"
-    /usr/sbin/chown "$CONSOLE_USER:$CONSOLE_GROUP" "$log_path"
-    /bin/chmod 600 "$log_path"
-}
-
-/bin/mkdir -p "$LAUNCH_AGENTS_DIR" "$LOG_DIR"
-/usr/sbin/chown "$CONSOLE_USER:$CONSOLE_GROUP" "$LAUNCH_AGENTS_DIR" "$LOG_DIR"
-/bin/chmod 700 "$LOG_DIR"
-
-install_agent \
-    "$DAEMON_AGENT_LABEL" \
-    "$DAEMON_AGENT_DST" \
-    "$LOG_DIR/sotf-daemon.log" \
-    "$LOG_DIR/sotf-daemon.log"
-install_agent \
-    "$CONFIGBAR_AGENT_LABEL" \
-    "$CONFIGBAR_AGENT_DST" \
-    "$LOG_DIR/sotf-systemwide.log" \
-    "$LOG_DIR/sotf-systemwide.error.log"
+as_console_user /bin/bash "$SCRIPT_DIR/prepare_user_files.sh" \
+    "$AGENT_TEMPLATE_DIR" "$LAUNCH_AGENTS_DIR" "$LOG_DIR" "$LOG_ROLLOVER_BYTES"
 
 # Replace any live instances with the freshly installed plists. ConfigBar is
 # started by the final package component after the HAL payload has landed.
 "/bin/launchctl" bootout "gui/$CONSOLE_UID/$DAEMON_AGENT_LABEL" >/dev/null 2>&1 || true
 "/bin/launchctl" bootout "gui/$CONSOLE_UID/$CONFIGBAR_AGENT_LABEL" >/dev/null 2>&1 || true
 
-prepare_log "$LOG_DIR/sotf-daemon.log"
-prepare_log "$LOG_DIR/sotf-systemwide.log"
-prepare_log "$LOG_DIR/sotf-systemwide.error.log"
+# Capture the starting offset before launch: a fast daemon can bind before
+# launchctl returns. Read user-owned logs with the user's privileges as well.
+DAEMON_LOG="$LOG_DIR/sotf-daemon.log"
+DAEMON_LOG_OFFSET="$(as_console_user /usr/bin/stat -f '%z' "$DAEMON_LOG" 2>/dev/null || echo 0)"
 installer_step "Starting the SotF background audio service"
 /bin/launchctl bootstrap "gui/$CONSOLE_UID" "$DAEMON_AGENT_DST"
 /bin/launchctl print "gui/$CONSOLE_UID/$DAEMON_AGENT_LABEL" >/dev/null
 echo "Registered $DAEMON_AGENT_LABEL LaunchAgent for $CONSOLE_USER (gui/$CONSOLE_UID)"
 
 installer_step "Smoke-testing the SotF background audio service"
-# The daemon prints the control-socket path it bound; only log lines written
-# after this point belong to the freshly started instance.
-DAEMON_LOG="$LOG_DIR/sotf-daemon.log"
-DAEMON_LOG_OFFSET="$(/usr/bin/stat -f '%z' "$DAEMON_LOG" 2>/dev/null || echo 0)"
+# The daemon prints the control-socket path it bound; inspect lines written
+# since the pre-launch offset, then verify the endpoint with the smoke client.
 DAEMON_SOCKET=""
 for elapsed in $(/usr/bin/seq 1 30); do
-    DAEMON_SOCKET="$(/usr/bin/tail -c +$((DAEMON_LOG_OFFSET + 1)) "$DAEMON_LOG" 2>/dev/null | /usr/bin/grep 'Audio daemon listening on ' | /usr/bin/tail -n 1 | /usr/bin/sed 's/.*listening on //' || true)"
+    DAEMON_SOCKET="$(as_console_user /usr/bin/tail -c +$((DAEMON_LOG_OFFSET + 1)) "$DAEMON_LOG" 2>/dev/null | /usr/bin/grep 'Audio daemon listening on ' | /usr/bin/tail -n 1 | /usr/bin/sed 's/.*listening on //' || true)"
     [ -n "$DAEMON_SOCKET" ] && [ -S "$DAEMON_SOCKET" ] && break
     DAEMON_SOCKET=""
     if [ $((elapsed % 5)) -eq 0 ]; then
@@ -1363,7 +1321,7 @@ for elapsed in $(/usr/bin/seq 1 30); do
 done
 if [ -z "$DAEMON_SOCKET" ]; then
     echo "Error: daemon did not bind its control socket within 30s; last log lines:"
-    /usr/bin/tail -n 30 "$DAEMON_LOG" 2>/dev/null || true
+    as_console_user /usr/bin/tail -n 30 "$DAEMON_LOG" 2>/dev/null || true
     exit 1
 fi
 echo "Daemon control socket: $DAEMON_SOCKET"
@@ -1374,11 +1332,11 @@ echo "Daemon control socket: $DAEMON_SOCKET"
 # ConfigBar surfaces the fault at runtime. A powered-off USB interface must
 # not fail an otherwise healthy install.
 SMOKE_STATUS=0
-SMOKE_OUTPUT="$(/usr/bin/python3 "$SCRIPT_DIR/daemon_smoke.py" "$DAEMON_SOCKET" 2>&1)" || SMOKE_STATUS=$?
+SMOKE_OUTPUT="$(as_console_user /usr/bin/python3 "$SCRIPT_DIR/daemon_smoke.py" "$DAEMON_SOCKET" 2>&1)" || SMOKE_STATUS=$?
 echo "$SMOKE_OUTPUT"
 if [ "$SMOKE_STATUS" -ne 0 ]; then
     echo "Error: daemon smoke test failed; last daemon log lines:"
-    /usr/bin/tail -n 30 "$DAEMON_LOG" 2>/dev/null || true
+    as_console_user /usr/bin/tail -n 30 "$DAEMON_LOG" 2>/dev/null || true
     exit 1
 fi
 

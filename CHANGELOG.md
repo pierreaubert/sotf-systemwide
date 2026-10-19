@@ -6,6 +6,24 @@ release is recorded here.
 
 ## Unreleased
 
+- Hardened Swift HAL mapping validation, full-ring ownership, cipher
+  publication, and timestamp snapshots. Added malformed-mapping, held-reader,
+  concurrent key-rotation, and clock-update regressions, including TSan runs.
+- Fixed outgoing-profile corruption during route changes and stale startup
+  work overwriting a newer Stop intent. Recovery now runs in the supervisor;
+  status reads are observational. Failed volume/mute synchronization retries.
+- Installer user files and log access run as the console user, and readiness
+  detection includes messages emitted before launchctl returns.
+- Preallocated the CPAL callback queue, preserved complete interleaved frames
+  on overflow, and moved stream-error recovery off the callback. The audit
+  ledger records the verification and remaining shared-protocol dependencies.
+- Connected explicit capture sources to playback and separated native input
+  timing from output processing. Fixed fallback/restoration profile ownership,
+  paused resume, forced idle rebuilds and generation-scoped progress tracking.
+  Snapshots stay responsive during transitions and identify cached observations.
+- Added console-session transport retirement, protected Windows token ACLs,
+  bounded authentication workers and readiness-driven IPC acceptance.
+
 - Added an exhaustive startup combination matrix (exchange-file state ×
   crypto-key state × daemon/HAL start order, plus config-negotiation
   round-trips) in driver-hal, and UI-before-daemon / daemon-dies polling

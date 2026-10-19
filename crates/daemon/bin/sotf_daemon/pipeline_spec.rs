@@ -32,8 +32,12 @@ pub(super) struct PipelineSpec {
 /// same channel geometry, and same user plugins/graph (compared by value, so
 /// key order and float formatting cannot cause a spurious restart).
 pub(super) fn pipeline_specs_match(first: &PipelineSpec, second: &PipelineSpec) -> bool {
-    if first.output_device != second.output_device
-        || first.input_channels != second.input_channels
+    first.output_device == second.output_device && pipeline_dsp_matches(first, second)
+}
+
+/// Compare processing intent independently from the physical route preference.
+pub(super) fn pipeline_dsp_matches(first: &PipelineSpec, second: &PipelineSpec) -> bool {
+    if first.input_channels != second.input_channels
         || first.output_channels != second.output_channels
     {
         return false;

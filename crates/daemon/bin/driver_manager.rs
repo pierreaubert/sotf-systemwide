@@ -88,6 +88,11 @@ impl DriverManager {
         self.driver.status()
     }
 
+    /// Share sample transport with the engine without moving device ownership.
+    pub fn capture_source(&self) -> Option<driver_common::CaptureSource> {
+        self.driver.capture_source()
+    }
+
     /// Get a mutable reference to the underlying driver.
     #[allow(dead_code)]
     pub fn driver_mut(&mut self) -> &mut dyn AudioDriver {
@@ -101,12 +106,24 @@ impl DriverManager {
     }
 
     /// Set engine_ready flag on the driver.
-    pub fn set_engine_ready(&mut self, ready: bool) {
-        if self.engine_ready == ready {
-            return;
+    pub fn set_engine_ready(&mut self, ready: bool) -> bool {
+        if self.engine_ready == ready && self.driver.engine_ready_matches(ready) {
+            return true;
         }
-        self.driver.set_engine_ready(ready);
-        self.engine_ready = ready;
+        match self.driver.set_engine_ready_checked(ready) {
+            Ok(()) => {
+                self.engine_ready = ready;
+                true
+            }
+            Err(error) => {
+                log::warn!("Driver readiness remains pending: {error}");
+                false
+            }
+        }
+    }
+
+    pub fn readiness_is_current(&self) -> bool {
+        self.engine_ready && self.driver.engine_ready_matches(true)
     }
 
     /// Poll for driver-initiated config changes.
@@ -190,7 +207,9 @@ fn create_platform_driver_for_choice(choice: Option<&str>) -> Box<dyn AudioDrive
 #[derive(Debug)]
 struct LabDriver {
     status: DriverStatus,
-    phase: f32,
+    phase: std::sync::Arc<parking_lot::Mutex<f32>>,
+    capture_config: std::sync::Arc<parking_lot::Mutex<DriverConfig>>,
+    capture_initialized: std::sync::Arc<std::sync::atomic::AtomicBool>,
     engine_ready: bool,
     idle_marker: Option<std::path::PathBuf>,
 }
@@ -209,7 +228,11 @@ impl LabDriver {
                 true,
                 0,
             ),
-            phase: 0.0,
+            phase: std::sync::Arc::new(parking_lot::Mutex::new(0.0)),
+            capture_config: std::sync::Arc::new(parking_lot::Mutex::new(DriverConfig::new(
+                48_000, 512, 2,
+            ))),
+            capture_initialized: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             engine_ready: false,
             idle_marker: std::env::var_os("SOTF_SYSTEMWIDE_RUNTIME_DIR")
                 .map(|dir| std::path::PathBuf::from(dir).join("lab-capture-idle")),
@@ -225,14 +248,63 @@ impl LabDriver {
     }
 }
 
+#[derive(Debug)]
+struct LabCaptureInput {
+    phase: std::sync::Arc<parking_lot::Mutex<f32>>,
+    config: std::sync::Arc<parking_lot::Mutex<DriverConfig>>,
+    initialized: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    idle_marker: Option<std::path::PathBuf>,
+}
+
+impl driver_common::CaptureInput for LabCaptureInput {
+    fn configuration(&self) -> DriverConfig {
+        *self.config.lock()
+    }
+
+    fn available_frames(&self) -> usize {
+        if self.initialized.load(std::sync::atomic::Ordering::Acquire)
+            && !self.idle_marker.as_ref().is_some_and(|path| path.exists())
+        {
+            4096
+        } else {
+            0
+        }
+    }
+
+    fn read_frames(&self, buffer: &mut [f32], expected: DriverConfig) -> usize {
+        let config = self.config.lock();
+        if *config != expected
+            || self.available_frames() == 0
+            || config.sample_rate == 0
+            || config.channel_count == 0
+        {
+            return 0;
+        }
+        let channels = config.channel_count as usize;
+        let frames = buffer.len() / channels;
+        let step = 440.0 / config.sample_rate as f32;
+        let mut phase = self.phase.lock();
+        for frame in buffer[..frames * channels].chunks_exact_mut(channels) {
+            let sample = (*phase * std::f32::consts::TAU).sin() * 0.1;
+            *phase = (*phase + step) % 1.0;
+            frame.fill(sample);
+        }
+        frames
+    }
+}
+
 impl AudioDriver for LabDriver {
     fn initialize(&mut self) -> Result<(), DriverError> {
         self.status.capture_active = true;
+        self.capture_initialized
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
     fn shutdown(&mut self) {
         self.status.capture_active = false;
+        self.capture_initialized
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     fn status(&self) -> DriverStatus {
@@ -250,17 +322,27 @@ impl AudioDriver for LabDriver {
         let channels = self.status.channel_count.max(1) as usize;
         let sample_rate = self.status.sample_rate as f32;
         let step = 440.0 / sample_rate;
+        let mut phase = self.phase.lock();
 
         let complete_samples = buffer.len() - (buffer.len() % channels);
         for frame in buffer[..complete_samples].chunks_exact_mut(channels) {
-            let sample = (self.phase * std::f32::consts::TAU).sin() * 0.1;
-            self.phase = (self.phase + step) % 1.0;
+            let sample = (*phase * std::f32::consts::TAU).sin() * 0.1;
+            *phase = (*phase + step) % 1.0;
             for out in frame {
                 *out = sample;
             }
         }
 
         complete_samples / channels
+    }
+
+    fn capture_source(&self) -> Option<driver_common::CaptureSource> {
+        Some(driver_common::CaptureSource::new(LabCaptureInput {
+            phase: std::sync::Arc::clone(&self.phase),
+            config: std::sync::Arc::clone(&self.capture_config),
+            initialized: std::sync::Arc::clone(&self.capture_initialized),
+            idle_marker: self.idle_marker.clone(),
+        }))
     }
 
     fn available_frames(&self) -> usize {
@@ -289,6 +371,11 @@ impl AudioDriver for LabDriver {
         if config.channel_count != 0 {
             self.status.channel_count = config.channel_count;
         }
+        *self.capture_config.lock() = DriverConfig::new(
+            self.status.sample_rate,
+            self.status.buffer_frames,
+            self.status.channel_count,
+        );
         ConfigResult::Accepted
     }
 
@@ -319,6 +406,7 @@ mod tests {
     struct CountingDriver {
         ready_calls: Arc<AtomicUsize>,
         ready: bool,
+        ready_failures: usize,
     }
 
     #[test]
@@ -326,6 +414,7 @@ mod tests {
         let driver = || CountingDriver {
             ready_calls: Arc::new(AtomicUsize::new(0)),
             ready: false,
+            ready_failures: 0,
         };
         let ordinary = DriverManager::from_driver(Box::new(driver()));
         assert_eq!(ordinary.output_sink_type(), SinkType::Cpal);
@@ -369,6 +458,17 @@ mod tests {
             self.ready_calls.fetch_add(1, Ordering::Relaxed);
             self.ready = ready;
         }
+        fn set_engine_ready_checked(&mut self, ready: bool) -> Result<(), DriverError> {
+            if ready && self.ready_failures > 0 {
+                self.ready_failures -= 1;
+                return Err(DriverError::not_available("injected unavailable mapping"));
+            }
+            self.set_engine_ready(ready);
+            Ok(())
+        }
+        fn engine_ready_matches(&self, ready: bool) -> bool {
+            self.ready == ready
+        }
     }
 
     #[test]
@@ -377,6 +477,7 @@ mod tests {
         let driver = CountingDriver {
             ready_calls: Arc::clone(&calls),
             ready: false,
+            ready_failures: 0,
         };
         let mut manager = DriverManager::from_driver(Box::new(driver));
 
@@ -389,6 +490,25 @@ mod tests {
         manager.set_engine_ready(true);
         manager.shutdown();
         assert_eq!(calls.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn failed_or_lost_readiness_publication_is_retried() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut manager = DriverManager::from_driver(Box::new(CountingDriver {
+            ready_calls: Arc::clone(&calls),
+            ready: false,
+            ready_failures: 1,
+        }));
+        assert!(!manager.set_engine_ready(true));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(manager.set_engine_ready(true));
+        assert!(manager.set_engine_ready(true));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // An externally replaced mapping may lose a previously cached flag.
+        manager.driver_mut().set_engine_ready(false);
+        assert!(manager.set_engine_ready(true));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
     }
 
     #[test]
@@ -452,6 +572,26 @@ mod tests {
             buffer[6].is_nan(),
             "partial-frame tail must remain untouched"
         );
+    }
+
+    #[test]
+    fn lab_engine_source_produces_audio_before_readiness_and_stops_with_driver() {
+        let mut driver = LabDriver::new();
+        let source = driver.capture_source().expect("explicit lab source");
+        assert_eq!(source.available_frames(), 0);
+        driver.initialize().expect("initialize capture");
+        let geometry = source.configuration();
+        let mut pcm = [f32::NAN; 7];
+        assert_eq!(source.read_frames(&mut pcm, geometry), 3);
+        assert_eq!(pcm[0], pcm[1]);
+        assert_eq!(pcm[2], pcm[3]);
+        assert!(pcm[2] > 0.0);
+        assert!(pcm[6].is_nan());
+        driver.request_config(DriverConfig::new(96_000, 256, 4));
+        assert_eq!(source.read_frames(&mut pcm, geometry), 0);
+        driver.shutdown();
+        assert_eq!(source.available_frames(), 0);
+        assert_eq!(source.read_frames(&mut pcm, source.configuration()), 0);
     }
 
     #[test]

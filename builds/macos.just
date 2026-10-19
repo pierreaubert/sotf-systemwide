@@ -82,9 +82,18 @@ test-hal-driver-swift:
 	mkdir -p "$CLANG_CACHE_DIR"
 	HAL_SWIFT_DIR="swift/driver-hal"
 	BUILD_DIR="target/debug/SotFHALTests.bundle"
+	SWIFT_SANITIZER_FLAGS=()
+	case "${SOTF_HAL_SANITIZER:-}" in
+		"") ;;
+		thread|address)
+			SWIFT_SANITIZER_FLAGS=("-sanitize=${SOTF_HAL_SANITIZER}")
+			BUILD_DIR="target/debug/SotFHALTests-${SOTF_HAL_SANITIZER}.bundle"
+			;;
+		*) echo "Unsupported SOTF_HAL_SANITIZER" >&2; exit 2 ;;
+	esac
 	mkdir -p "$BUILD_DIR/Contents/MacOS" "$BUILD_DIR/Contents/Resources"
 	WORKER_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
-	{{cargo}} build -p driver-hal --features swift-stress-worker --bin hal-transport-worker
+	{{cargo}} build --manifest-path ../sotf-daw/Cargo.toml -p driver-hal --features swift-stress-worker --bin hal-transport-worker
 	if [[ "$WORKER_TARGET_DIR" = /* ]]; then
 		WORKER_PATH="$WORKER_TARGET_DIR/debug/hal-transport-worker"
 	else
@@ -93,6 +102,7 @@ test-hal-driver-swift:
 	test -x "$WORKER_PATH"
 	echo "Building and running Swift HAL tests..."
 	CLANG_MODULE_CACHE_PATH="$CLANG_CACHE_DIR" swiftc \
+		"${SWIFT_SANITIZER_FLAGS[@]}" \
 		-o "$BUILD_DIR/Contents/MacOS/SotFHALTests" \
 		-module-name SotFHALTests \
 		-import-objc-header "$HAL_SWIFT_DIR/Sources/BridgingHeader.h" \

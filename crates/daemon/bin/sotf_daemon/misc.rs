@@ -730,27 +730,15 @@ pub(super) fn effective_output_for_sink(
     if sink_type != SinkType::LabNull {
         return effective;
     }
-    let Some(device) = effective.device else {
-        return effective;
-    };
-    if device == LAB_OUTPUT_DEVICE_NAME {
-        return EffectiveOutputDevice {
-            device: Some(device),
-            fallback: effective.fallback,
-        };
-    }
-    let desired = effective
-        .fallback
-        .as_ref()
-        .map(|fallback| fallback.desired.clone())
-        .or_else(|| desired_device.map(str::to_string))
-        .unwrap_or(device);
+    let fallback = desired_device
+        .filter(|name| *name != LAB_OUTPUT_DEVICE_NAME)
+        .map(|desired| OutputDeviceFallback {
+            desired: desired.to_owned(),
+            applied: LAB_OUTPUT_DEVICE_NAME.to_owned(),
+        });
     EffectiveOutputDevice {
-        device: Some(LAB_OUTPUT_DEVICE_NAME.to_string()),
-        fallback: Some(OutputDeviceFallback {
-            desired,
-            applied: LAB_OUTPUT_DEVICE_NAME.to_string(),
-        }),
+        device: Some(LAB_OUTPUT_DEVICE_NAME.to_owned()),
+        fallback,
     }
 }
 
@@ -1284,14 +1272,17 @@ mod tests {
             "Mac mini Speakers"
         );
 
-        // None (engine chooses) and the lab name itself pass through, and
+        // An implicit lab route is canonicalized without a self-fallback;
         // the CPAL sink is never adapted.
         let none = EffectiveOutputDevice {
             device: None,
             fallback: None,
         };
         let adapted = effective_output_for_sink(none, SinkType::LabNull, None);
-        assert_eq!(adapted.device, None);
+        assert_eq!(
+            adapted.device.as_deref(),
+            Some(super::LAB_OUTPUT_DEVICE_NAME)
+        );
         assert!(adapted.fallback.is_none());
 
         let resolved =

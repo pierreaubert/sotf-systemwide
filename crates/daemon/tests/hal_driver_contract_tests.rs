@@ -140,7 +140,7 @@ fn swift_encrypted_transport_uses_caller_buffer_aead_on_realtime_paths() {
     let daemon = read_repo_file("sotf-systemwide/crates/daemon/bin/sotf_daemon/audio_daemon.rs");
     let write_audio = function_body(&shared_memory, "func writeAudio(");
     let read_audio = function_body(&shared_memory, "func readAudio(");
-    let cipher_match = function_body(&shared_memory, "private func cipherMatchingHeader");
+    let cipher_match = function_body(&shared_memory, "private func withMatchingCipher");
     let maintenance = function_body(&driver, "private func runMaintenanceTick");
     let io_body = function_body(&driver, "private func driverDoIOOperation");
 
@@ -415,19 +415,18 @@ fn swift_ioproc_logging_is_absent_by_default() {
 }
 
 #[test]
-fn swift_driver_clock_state_is_lock_protected() {
+fn swift_driver_clock_only_locks_control_operations() {
     let timing = read_repo_file("sotf-systemwide/swift/driver-hal/Sources/Timing.swift");
     let clock = function_body(&timing, "final class DriverClock");
 
     assert!(
         clock.contains("private let lock = NSLock()"),
-        "DriverClock needs a lock because IOProc and control threads access the same fields"
+        "DriverClock serializes control writers before publishing atomic snapshots"
     );
     for function_name in [
         "func start(sampleRate:",
         "func stop()",
         "func setSampleRate",
-        "func getZeroTimeStamp",
         "func getCurrentSampleTime()",
         "func getSeed()",
     ] {
@@ -437,6 +436,8 @@ fn swift_driver_clock_state_is_lock_protected() {
             "{function_name} must hold the DriverClock lock while reading or mutating clock state"
         );
     }
+    let callback = function_body(clock, "func getZeroTimeStamp");
+    assert!(callback.contains("readSnapshot()") && !callback.contains("lock.lock()"));
     assert!(
         clock.contains("getCurrentSampleTimeLocked"),
         "sample-time math should stay inside the locked section without recursively locking"
@@ -710,7 +711,8 @@ fn swift_maintenance_uses_mapping_generation_handoff_for_active_clients() {
     assert!(
         state.contains("private let sharedAudioSlots = [SharedAudioBuffer(), SharedAudioBuffer()]")
             && handoff.contains("sotf_atomic_store_u32(&activeSharedAudioSlot")
-            && handoff.contains("sharedAudioReaderCount(slot: replacementSlot) == 0"),
+            && handoff.contains("sotf_cipher_try_write(&sharedAudioSlot0Readers)")
+            && handoff.contains("sotf_cipher_end_write(&sharedAudioSlot0Readers)"),
         "maintenance must prepare and atomically publish an inactive mmap generation"
     );
     assert!(
@@ -802,28 +804,27 @@ fn swift_hal_supports_daemon_requested_channel_counts_up_to_32() {
 }
 
 #[test]
-fn swift_shared_memory_drops_old_capture_when_ring_is_full() {
+fn swift_shared_memory_keeps_reader_cursor_owned_by_reader() {
     let source = read_repo_file("sotf-systemwide/swift/driver-hal/Sources/SharedMemory.swift");
     let write_audio = function_body(&source, "func writeAudio");
     let write_raw = function_body(&source, "private func writeRawBytes");
 
     assert!(
-        write_audio.contains("samplesToWrite")
-            && write_audio.contains("samplesToDrop")
-            && write_audio.contains("atomicStore(&header.pointee.readPosition, adjustedReadPos)"),
-        "unencrypted live capture writes must drop oldest samples before publishing current audio"
+        !write_audio.contains("atomicStore(&header.pointee.readPosition")
+            && !write_raw.contains("atomicStore(&header.pointee.readPosition"),
+        "a producer must never advance the consumer cursor"
     );
     assert!(
-        write_audio.contains("sourceOffset")
-            && !write_audio.contains("if toWrite <= 0 { return 0 }"),
-        "oversized live capture writes should keep the newest complete frames instead of returning 0"
+        write_audio.find("tryAcquireIOCommit").unwrap() < write_audio.find("memcpy").unwrap(),
+        "the writer must guard copying as well as publishing against reconfiguration"
     );
     assert!(
         write_raw.contains("floatCount > audioCapacity")
-            && write_raw.contains("floatCount > available")
-            && write_raw.contains("atomicStore(&header.pointee.readPosition, writePos)"),
-        "encrypted capture writes must drop old records at record boundaries when the ring is full"
+            && write_raw.contains("floatCount > available"),
+        "encrypted overflow rejects incoming records without discarding unread payload"
     );
+    // Runtime behavior is exercised by testMappingValidationAndReaderOwnership
+    // in the Swift suite, which is part of the normal macOS lab gate.
 }
 
 #[test]

@@ -18,6 +18,10 @@
 //! Call sites use [`IpcStream`] for per-client handlers on both platforms.
 //! The Windows accept loop also uses `IpcListener`.
 
+#[cfg(windows)]
+#[path = "windows_acl.rs"]
+mod windows_acl;
+
 #[cfg(any(windows, test))]
 use std::ffi::OsString;
 #[cfg(any(windows, test))]
@@ -35,9 +39,70 @@ pub type IpcStream = std::os::unix::net::UnixStream;
 #[cfg(windows)]
 pub type IpcStream = std::net::TcpStream;
 
+/// Unix IPC listener, shared with readiness polling.
+#[cfg(unix)]
+pub type IpcListener = std::os::unix::net::UnixListener;
+
 /// Listening IPC socket for the Windows loopback transport.
 #[cfg(windows)]
 pub type IpcListener = std::net::TcpListener;
+
+/// Wait for a connection or a bounded shutdown-check deadline.
+pub fn wait_for_listener(
+    listener: &IpcListener,
+    timeout: std::time::Duration,
+) -> std::io::Result<bool> {
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let mut descriptor = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live listener descriptor and one writable pollfd; polling
+        // neither closes nor transfers ownership of the borrowed descriptor.
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(std::io::Error::other("IPC listener readiness failed"));
+        }
+        Ok(descriptor.revents & libc::POLLIN != 0)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            POLLERR, POLLHUP, POLLIN, POLLNVAL, WSAGetLastError, WSAPOLLFD, WSAPoll,
+        };
+        let mut descriptor = WSAPOLLFD {
+            fd: listener.as_raw_socket() as usize,
+            events: POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live Winsock listener and one writable WSAPOLLFD; the
+        // listener's lifetime covers the call and ownership remains unchanged.
+        let result = unsafe { WSAPoll(&mut descriptor, 1, timeout_ms) };
+        if result < 0 {
+            // SAFETY: reads this thread's last Winsock error after WSAPoll.
+            return Err(std::io::Error::from_raw_os_error(unsafe {
+                WSAGetLastError()
+            }));
+        }
+        if descriptor.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+            return Err(std::io::Error::other("IPC listener readiness failed"));
+        }
+        Ok(descriptor.revents & POLLIN != 0)
+    }
+}
 
 /// Encode a bound loopback port for the port file (Windows).
 ///
@@ -407,6 +472,7 @@ pub fn token_file_for_port_file(port_file: &Path) -> PathBuf {
 /// replace non-regular files.
 #[cfg(windows)]
 pub fn write_token_file(token_file: &Path, token: &IpcAuthToken) -> std::io::Result<()> {
+    use std::io::Write;
     if let Ok(metadata) = std::fs::symlink_metadata(token_file)
         && !metadata.is_file()
     {
@@ -427,7 +493,8 @@ pub fn write_token_file(token_file: &Path, token: &IpcAuthToken) -> std::io::Res
             ),
         )
     })?;
-    std::fs::create_dir_all(parent)?;
+    let acl = windows_acl::PrivateAcl::new()?;
+    let _directory = acl.secure_directory(parent)?;
     let temp_path = token_file.with_extension(format!(
         "tmp-{}-{}",
         std::process::id(),
@@ -437,7 +504,9 @@ pub fn write_token_file(token_file: &Path, token: &IpcAuthToken) -> std::io::Res
             .unwrap_or(0)
     ));
     (|| {
-        std::fs::write(&temp_path, encode_auth_token_file_contents(token))?;
+        let mut file = acl.create_file(&temp_path)?;
+        file.write_all(encode_auth_token_file_contents(token).as_bytes())?;
+        file.sync_all()?;
         std::fs::rename(&temp_path, token_file)?;
         Ok(())
     })()
@@ -456,15 +525,21 @@ pub fn write_token_file(token_file: &Path, token: &IpcAuthToken) -> std::io::Res
 /// Read a auth token back from `token_file` (Windows).
 #[cfg(windows)]
 pub fn read_token_file(token_file: &Path) -> std::io::Result<IpcAuthToken> {
-    let text = std::fs::read_to_string(token_file).map_err(|error| {
-        std::io::Error::new(
-            error.kind(),
-            format!(
-                "failed to read IPC token file {}: {error}",
-                token_file.display()
-            ),
-        )
-    })?;
+    use std::io::Read;
+    let acl = windows_acl::PrivateAcl::new()?;
+    let mut text = String::new();
+    acl.open_file(token_file)?
+        .take(IPC_AUTH_TOKEN_LINE_MAX_BYTES as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to read IPC token file {}: {error}",
+                    token_file.display()
+                ),
+            )
+        })?;
     decode_auth_token_file_contents(&text).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -485,7 +560,7 @@ pub fn read_token_file(token_file: &Path) -> std::io::Result<IpcAuthToken> {
 /// wrong.
 #[cfg(windows)]
 pub fn authenticate_client(
-    stream: &std::net::TcpStream,
+    mut stream: &std::net::TcpStream,
     expected: &IpcAuthToken,
 ) -> std::io::Result<()> {
     use std::io::Read;
@@ -550,6 +625,35 @@ pub fn windows_port_file_is_live(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_wait_observes_connections_and_clears_after_accept() {
+        #[cfg(unix)]
+        let directory = tempfile::tempdir().expect("private endpoint");
+        #[cfg(unix)]
+        let path = directory.path().join("poll.sock");
+        #[cfg(unix)]
+        let listener = IpcListener::bind(&path).expect("bind IPC listener");
+        #[cfg(windows)]
+        let listener =
+            IpcListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        assert!(!wait_for_listener(&listener, std::time::Duration::ZERO).unwrap());
+        std::thread::scope(|scope| {
+            let waiting =
+                scope.spawn(|| wait_for_listener(&listener, std::time::Duration::from_secs(5)));
+            #[cfg(unix)]
+            let _client = IpcStream::connect(&path).expect("connect while waiting");
+            #[cfg(windows)]
+            let _client =
+                IpcStream::connect(listener.local_addr().unwrap()).expect("connect while waiting");
+            assert!(waiting.join().expect("poll worker").expect("listener wake"));
+            let _accepted = listener.accept().expect("ready connection");
+            assert!(!wait_for_listener(&listener, std::time::Duration::ZERO).unwrap());
+        });
+    }
 
     #[test]
     fn port_file_roundtrip_preserves_valid_ports() {

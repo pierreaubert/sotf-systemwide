@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "driver-common"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "log",
  "serde",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "driver-hal"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "bytemuck",
  "chacha20poly1305",
@@ -5079,7 +5079,7 @@ dependencies = [
 
 [[package]]
 name = "sotf-capture"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "audioadapter-buffers",
  "autoeq",
@@ -5149,6 +5149,7 @@ dependencies = [
  "sotf-plugins",
  "sotf-room-eq-graph",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

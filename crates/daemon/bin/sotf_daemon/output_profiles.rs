@@ -386,6 +386,21 @@ impl OutputProfileStore {
 
     /// Record a successful route application: current route plus last-used
     /// memory so a replugged device recalls its chain.
+    /// Remember the requested assignment without mislabeling a fallback's live chain.
+    pub(super) fn record_route_if_active(
+        &mut self,
+        uid: Option<&str>,
+        name: &str,
+        profile: &str,
+        actual: Option<&str>,
+    ) -> Result<(), String> {
+        if actual == Some(name) {
+            self.record_route(uid, name, profile)
+        } else {
+            self.assign(uid, name, profile)
+        }
+    }
+
     pub(super) fn record_route(
         &mut self,
         device_uid: Option<&str>,
@@ -411,6 +426,50 @@ impl OutputProfileStore {
         }
         Self::warn_if_session_only(self.save()?, "record route");
         Ok(())
+    }
+
+    /// Return an explicit device assignment, without borrowing the global default.
+    pub(super) fn assigned_profile_for_name(&self, name: &str) -> Option<OutputProfile> {
+        self.assignments
+            .get(&Self::device_key(None, name))
+            .and_then(|id| self.profiles.get(id))
+            .cloned()
+    }
+
+    /// An unassigned fallback must start uncorrected, preserving every saved
+    /// chain. Give it its own profile so later live edits cannot overwrite A.
+    pub(super) fn ensure_fallback_profile(
+        &mut self,
+        name: &str,
+        input_channels: usize,
+        output_channels: usize,
+    ) -> Result<OutputProfile, String> {
+        if let Some(profile) = self.assigned_profile_for_name(name) {
+            return Ok(profile);
+        }
+        let mut label = "Unconfigured: ".to_owned();
+        for ch in name.chars() {
+            if label.len() + ch.len_utf8() > 80 {
+                break;
+            }
+            label.push(ch);
+        }
+        let profile = OutputProfile {
+            id: String::new(),
+            name: label,
+            topology: "rack".to_owned(),
+            plugins: Vec::new(),
+            graph: None,
+            input_channels,
+            output_channels,
+            updated_at_unix_ms: 0,
+        };
+        let id = self.upsert(profile)?;
+        self.assign(None, name, &id)?;
+        self.profiles
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| "Fallback profile was not stored".to_owned())
     }
 
     /// Write the live chain through to the current profile so edits made on
@@ -564,6 +623,44 @@ mod tests {
             output_channels: 2,
             updated_at_unix_ms: 0,
         }
+    }
+
+    #[test]
+    fn unassigned_fallback_has_a_distinct_empty_profile_and_preserves_default() {
+        let mut store = OutputProfileStore::default();
+        store.profiles.insert(
+            DEFAULT_PROFILE_ID.to_owned(),
+            rack_profile(DEFAULT_PROFILE_ID),
+        );
+        let fallback = store
+            .ensure_fallback_profile("Other Speakers", 4, 2)
+            .unwrap();
+        assert_ne!(fallback.id, DEFAULT_PROFILE_ID);
+        assert!(fallback.plugins.is_empty());
+        assert!(fallback.graph.is_none());
+        assert_eq!((fallback.input_channels, fallback.output_channels), (4, 2));
+        assert_eq!(
+            store.profiles[DEFAULT_PROFILE_ID].plugins[0].parameters["gain_db"],
+            -3.0
+        );
+        assert_eq!(
+            store
+                .ensure_fallback_profile("Other Speakers", 2, 2)
+                .unwrap()
+                .id,
+            fallback.id
+        );
+        assert_eq!(store.profiles.len(), 2);
+        store
+            .assign(None, "Explicit Default", DEFAULT_PROFILE_ID)
+            .unwrap();
+        assert_eq!(
+            store
+                .ensure_fallback_profile("Explicit Default", 2, 2)
+                .unwrap()
+                .id,
+            DEFAULT_PROFILE_ID
+        );
     }
 
     #[test]

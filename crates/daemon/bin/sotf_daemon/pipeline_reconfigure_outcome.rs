@@ -4,7 +4,10 @@ use super::consts::MAX_HAL_CHANNELS;
 use super::consts::SUPPORTED_SAMPLE_RATES;
 use super::device_registry::DeviceRegistry;
 use super::driver_manager::DriverManager;
+use super::misc::OutputDeviceFallback;
+use super::output_profiles::OutputProfileStore;
 use super::systemwide_state::SystemwideState;
+use super::types::PipelinePlan;
 use super::types::PipelineReconfigureOutcome;
 use driver_common::DriverConfig;
 use parking_lot::Mutex;
@@ -73,11 +76,16 @@ pub(super) fn publish_reconfigured_driver_readiness(
         return Err(error);
     }
 
-    driver_manager.lock().set_engine_ready(true);
+    if !driver_manager.lock().set_engine_ready(true) {
+        let error = "Driver readiness publication failed after reconfiguration".to_string();
+        system_state.lock().mark_pipeline_recovery(error.clone());
+        return Err(error);
+    }
     Ok(())
 }
 
-/// Handle a driver-initiated config change
+/// Test entry point without a persisted per-output profile store.
+#[cfg(test)]
 pub(super) fn handle_driver_config_change(
     driver_manager: &Arc<Mutex<DriverManager>>,
     audio_manager: &Arc<Mutex<AudioEngineManager>>,
@@ -86,6 +94,51 @@ pub(super) fn handle_driver_config_change(
     system_state: &Arc<Mutex<SystemwideState>>,
     running: &Arc<Mutex<bool>>,
 ) {
+    handle_driver_config_change_inner(
+        driver_manager,
+        audio_manager,
+        device_registry,
+        config,
+        system_state,
+        running,
+        None,
+    );
+}
+
+/// Production driver events use the same profile ownership as IPC and startup.
+pub(super) fn handle_driver_config_change_with_profiles(
+    driver_manager: &Arc<Mutex<DriverManager>>,
+    audio_manager: &Arc<Mutex<AudioEngineManager>>,
+    device_registry: &Arc<Mutex<DeviceRegistry>>,
+    config: DriverConfig,
+    system_state: &Arc<Mutex<SystemwideState>>,
+    running: &Arc<Mutex<bool>>,
+    profiles: &Arc<Mutex<OutputProfileStore>>,
+) {
+    handle_driver_config_change_inner(
+        driver_manager,
+        audio_manager,
+        device_registry,
+        config,
+        system_state,
+        running,
+        Some(profiles),
+    );
+}
+
+/// Handle a driver-initiated config change.
+fn handle_driver_config_change_inner(
+    driver_manager: &Arc<Mutex<DriverManager>>,
+    audio_manager: &Arc<Mutex<AudioEngineManager>>,
+    device_registry: &Arc<Mutex<DeviceRegistry>>,
+    config: DriverConfig,
+    system_state: &Arc<Mutex<SystemwideState>>,
+    running: &Arc<Mutex<bool>>,
+    profiles: Option<&Arc<Mutex<OutputProfileStore>>>,
+) {
+    let capture_source = driver_manager.lock().capture_source();
+    let capture_config = capture_source.as_ref().map(|source| source.configuration());
+    let native_event = capture_config == Some(config);
     let requested_rate = config.sample_rate;
     let requested_frames = config.buffer_frames;
     let requested_channels = config.channel_count;
@@ -112,7 +165,12 @@ pub(super) fn handle_driver_config_change(
     // One bound everywhere (IPC, watcher, HAL): the shared-memory layout
     // caps buffer_frames at MAX_HAL_BUFFER_FRAMES and Swift refuses larger
     // values, so accepting 4097..=65536 here diverged daemon/HAL geometry.
-    if requested_frames == 0 || requested_frames > super::misc::MAX_BUFFER_FRAMES {
+    let max_frames = if native_event {
+        8192
+    } else {
+        super::misc::MAX_BUFFER_FRAMES
+    };
+    if requested_frames == 0 || requested_frames > max_frames {
         log::warn!(
             "Invalid config request: buffer_frames={}, out of range",
             requested_frames
@@ -151,6 +209,25 @@ pub(super) fn handle_driver_config_change(
             .copied()
             .unwrap_or(48000)
     };
+
+    // A native endpoint reconnect is an input fact, not an output rate intent.
+    let mut processing_frames = requested_frames;
+    if native_event {
+        let fallback_rate = if SUPPORTED_SAMPLE_RATES.contains(&requested_rate) {
+            requested_rate
+        } else {
+            48_000
+        };
+        let fallback_frames = if (64..=4096).contains(&requested_frames) {
+            requested_frames
+        } else {
+            512
+        };
+        (actual_rate, processing_frames) = system_state
+            .lock()
+            .processing_timing
+            .unwrap_or((fallback_rate, fallback_frames));
+    }
 
     // Same device-support negotiation as the IPC apply path. A HAL rate
     // request can outlive the interface it was set for: the stored setup
@@ -198,18 +275,35 @@ pub(super) fn handle_driver_config_change(
         audio_manager,
         system_state,
         actual_rate,
-        requested_frames,
-        requested_channels as usize,
-        output_sink_type,
+        processing_frames,
+        capture_config.map_or(requested_channels, |native| native.channel_count) as usize,
+        ReconfigureBackend {
+            sink_type: output_sink_type,
+            capture_source,
+            profiles,
+        },
     ) {
         Ok(outcome) => {
-            let (active_config, result) = acknowledged_config_for_outcome(
+            let (mut active_config, mut result) = acknowledged_config_for_outcome(
                 requested_rate,
                 requested_frames,
                 requested_channels,
                 actual_rate,
                 outcome,
             );
+            if let Some(native) = capture_config {
+                active_config = native;
+                result = if native == config {
+                    driver_common::ConfigResult::Accepted
+                } else {
+                    driver_common::ConfigResult::negotiated(
+                        native.sample_rate,
+                        native.buffer_frames,
+                        native.channel_count,
+                    )
+                };
+            }
+            system_state.lock().processing_timing = Some((actual_rate, processing_frames));
             if matches!(
                 outcome,
                 PipelineReconfigureOutcome::Restarted | PipelineReconfigureOutcome::Restored { .. }
@@ -286,8 +380,70 @@ pub(super) fn reconfigure_audio_pipeline(
         hal_sample_rate,
         hal_buffer_frames,
         input_channels,
-        SinkType::LabNull,
+        ReconfigureBackend {
+            sink_type: SinkType::LabNull,
+            capture_source: None,
+            profiles: None,
+        },
     )
+}
+
+struct ResolvedReconfigureRoute {
+    plan: PipelinePlan,
+    fallback: Option<OutputDeviceFallback>,
+    profile: Option<(String, String)>,
+}
+
+fn resolve_reconfigure_route(
+    mut plan: PipelinePlan,
+    state: &Arc<Mutex<SystemwideState>>,
+    profiles: Option<&Arc<Mutex<OutputProfileStore>>>,
+    sink: SinkType,
+) -> Result<ResolvedReconfigureRoute, String> {
+    let desired = plan.spec.output_device.clone();
+    let effective = super::misc::effective_output_for_sink(
+        super::misc::resolve_effective_output_device(desired.as_deref()),
+        sink.clone(),
+        desired.as_deref(),
+    );
+    if let Some(name) = effective.device.as_deref() {
+        if !super::misc::is_safe_output_device_name(name) {
+            return Err("Refusing virtual physical output".to_owned());
+        }
+    } else if let Some(desired) = desired.as_deref() {
+        return Err(format!(
+            "Selected output device '{desired}' is not available: Audio device '{desired}' not found, and no safe physical fallback is available"
+        ));
+    }
+    plan.spec.output_device = effective.device;
+    let mut profile = None;
+    if (effective.fallback.is_some()
+        || state.lock().applied_output_device() != plan.spec.output_device)
+        && desired.is_some()
+        && let (Some(profiles), Some(name)) = (profiles, plan.spec.output_device.clone())
+    {
+        let input = plan.spec.input_channels;
+        let selected = AudioDaemon::fallback_profile_for_store(
+            profiles,
+            &name,
+            input,
+            plan.spec.output_channels,
+            sink,
+        )?;
+        plan = AudioDaemon::prepare_profile_plan(&state.lock(), plan.spec, &selected, Some(input))?;
+        profile = Some((name, selected.id));
+    }
+    Ok(ResolvedReconfigureRoute {
+        plan,
+        fallback: effective.fallback,
+        profile,
+    })
+}
+
+struct ReconfigureBackend<'a> {
+    sink_type: SinkType,
+    capture_source: Option<driver_common::CaptureSource>,
+    profiles: Option<&'a Arc<Mutex<OutputProfileStore>>>,
 }
 
 fn reconfigure_audio_pipeline_with_sink(
@@ -296,8 +452,13 @@ fn reconfigure_audio_pipeline_with_sink(
     hal_sample_rate: u32,
     hal_buffer_frames: u32,
     input_channels: usize,
-    sink_type: SinkType,
+    backend: ReconfigureBackend<'_>,
 ) -> Result<PipelineReconfigureOutcome, String> {
+    let ReconfigureBackend {
+        sink_type,
+        capture_source,
+        profiles,
+    } = backend;
     let plan = {
         let state = system_state.lock();
         if let Some(graph) = state.user_graph() {
@@ -327,43 +488,22 @@ fn reconfigure_audio_pipeline_with_sink(
             .and_then(|spec| state.prepare_from_spec(spec, input_channels).ok())
     };
 
-    let mut manager = audio_manager.lock();
-
-    let state = manager.get_state();
+    let state = audio_manager.lock().get_state();
     if state == sotf_audio::manager::StreamingState::Idle {
         log::debug!("No active playback, acknowledging config change");
         system_state.lock().commit_idle_reconfigure(&plan);
         return Ok(PipelineReconfigureOutcome::IdleUpdated);
     }
 
-    // Same stale-device degradation as the load path, resolved after the
-    // idle early return so an idle commit still records the desired device
-    // verbatim. The restore plan resolves too: the applied device may itself
-    // have vanished mid-session.
-    let effective = super::misc::effective_output_for_sink(
-        super::misc::resolve_effective_output_device(plan.spec.output_device.as_deref()),
-        sink_type.clone(),
-        plan.spec.output_device.as_deref(),
-    );
-    if let Some(fallback) = &effective.fallback {
-        log::warn!(
-            "Desired output device '{}' is not available; falling back to default output '{}'",
-            fallback.desired,
-            fallback.applied
-        );
-    }
-    let fallback = effective.fallback;
-    let mut plan = plan;
-    plan.spec.output_device = effective.device;
-    let mut previous_plan = previous_plan;
-    if let Some(previous) = previous_plan.as_mut() {
-        let effective = super::misc::effective_output_for_sink(
-            super::misc::resolve_effective_output_device(previous.spec.output_device.as_deref()),
-            sink_type.clone(),
-            previous.spec.output_device.as_deref(),
-        );
-        previous.spec.output_device = effective.device;
-    }
+    let resolved = resolve_reconfigure_route(plan, system_state, profiles, sink_type.clone())?;
+    let plan = resolved.plan;
+    let fallback = resolved.fallback;
+    let current_profile = resolved.profile;
+    // Resolve restoration before stopping too: it must never put A's DSP on B.
+    let previous = previous_plan
+        .map(|plan| resolve_reconfigure_route(plan, system_state, profiles, sink_type.clone()))
+        .transpose()?;
+    let mut manager = audio_manager.lock();
 
     log::info!("Reconfiguring driver playback pipeline");
 
@@ -384,6 +524,7 @@ fn reconfigure_audio_pipeline_with_sink(
         hal_sample_rate,
         hal_buffer_frames,
         sink_type.clone(),
+        capture_source.clone(),
     );
 
     match result {
@@ -393,6 +534,11 @@ fn reconfigure_audio_pipeline_with_sink(
                     .lock()
                     .commit_fallback_applied(&plan, Some(fallback.desired.clone())),
                 None => system_state.lock().commit_applied(&plan),
+            }
+            if let (Some(profiles), Some((name, id))) = (profiles, current_profile) {
+                profiles
+                    .lock()
+                    .set_current_in_memory(None, Some(name), Some(id));
             }
             log::info!("Driver playback restarted successfully");
             Ok(PipelineReconfigureOutcome::Restarted)
@@ -407,10 +553,19 @@ fn reconfigure_audio_pipeline_with_sink(
             );
             log::error!("Failed to restart driver playback: {}", e);
 
-            let Some(previous_plan) = previous_plan else {
+            let Some(previous) = previous else {
                 return Err(format!("Failed to restart driver playback: {}", e));
             };
 
+            let previous_plan = previous.plan;
+            if let Some(source) = capture_source.as_ref()
+                && source.configuration().channel_count as usize
+                    != previous_plan.spec.input_channels
+            {
+                return Err(format!(
+                    "Failed to restart driver playback: {e}; previous capture geometry is no longer available"
+                ));
+            }
             log::warn!("Attempting to restore the last working driver pipeline");
             let restore = AudioDaemon::start_pipeline_plan(
                 &mut manager,
@@ -418,8 +573,20 @@ fn reconfigure_audio_pipeline_with_sink(
                 hal_sample_rate,
                 hal_buffer_frames,
                 sink_type,
+                capture_source,
             );
             if restore.is_ok() {
+                match previous.fallback {
+                    Some(fallback) => system_state
+                        .lock()
+                        .commit_fallback_applied(&previous_plan, Some(fallback.desired)),
+                    None => system_state.lock().commit_applied(&previous_plan),
+                }
+                if let (Some(profiles), Some((name, id))) = (profiles, previous.profile) {
+                    profiles
+                        .lock()
+                        .set_current_in_memory(None, Some(name), Some(id));
+                }
                 log::warn!(
                     "Restored the last working driver pipeline after reconfiguration failure"
                 );

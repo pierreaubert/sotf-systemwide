@@ -56,9 +56,18 @@ class PackagingRouteTests(unittest.TestCase):
                 text = dockerfile.read_text()
                 self.assertNotIn("COPY . .", text)
                 self.assertNotRegex(text, r"(?m)^RUN cargo build\b")
-                self.assertIn("RUSTUP_TOOLCHAIN=1.99.0", text)
-                if "test-linux-arm64" not in dockerfile.name:
-                    self.assertIn("1.99.0", text)
+                toolchain = re.search(r"(?m)^ENV RUSTUP_TOOLCHAIN=(stable|\d+\.\d+\.\d+(?:-[\w-]+)?)\s*$", text)
+                self.assertIsNotNone(toolchain, "container must declare its toolchain")
+                version = toolchain.group(1)
+                if version == "stable":
+                    self.assertRegex(text, r"(?m)^FROM .*rust:(?:bookworm|stable)")
+                    self.assertIn("stable-aarch64-unknown-linux-gnu/bin/rustc", text)
+                else:
+                    base = re.search(r"(?m)^FROM .*rust:([\d.]+)-", text)
+                    if base:
+                        self.assertTrue(version == base.group(1) or version.startswith(base.group(1) + "."))
+                    else:
+                        self.assertRegex(text, rf"(?:--default-toolchain|rustup default|rustup toolchain install)\s+{re.escape(version)}(?:\s|$)")
 
     def test_systemwide_linux_gate_builds_with_the_full_sibling_tree(self) -> None:
         recipe = (ROOT / "sotf-systemwide/builds/systemwide.just").read_text()
@@ -77,11 +86,19 @@ class PackagingRouteTests(unittest.TestCase):
         self.assertEqual(mounted_root, ROOT.resolve())
         self.assertEqual(docker_context, ROOT.resolve())
         self.assertEqual(dockerfile_path, ROOT / "sotf/builds/systemwide/Dockerfile.test-linux-arm64")
-        for sibling in ("sotf", "sotf-daw", "sotf-systemwide", "gpui-toolkit", "autoeq"):
+        # Follow actual local path dependencies. GPUI is a Git dependency in
+        # the current manifests and does not require a sibling checkout.
+        siblings = {"sotf", "sotf-daw", "sotf-systemwide"}
+        for owner in tuple(siblings):
+            manifest = (mounted_root / owner / "Cargo.toml").read_text()
+            siblings.update(re.findall(r'path\s*=\s*"\.\./([a-zA-Z0-9_-]+)(?:/|")', manifest))
+        for sibling in siblings:
             self.assertTrue((mounted_root / sibling).is_dir(), sibling)
         self.assertIn("FROM --platform=linux/arm64 ubuntu:24.04", dockerfile)
         self.assertIn("libasound2-dev", dockerfile)
-        self.assertIn("ENV RUSTUP_TOOLCHAIN=1.99.0", dockerfile)
+        version = re.search(r"(?m)^ENV RUSTUP_TOOLCHAIN=(\d+\.\d+\.\d+)\s*$", dockerfile)
+        self.assertIsNotNone(version)
+        self.assertIn(f"--default-toolchain {version.group(1)}", dockerfile)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,32 @@ pub(super) enum DevicePropertyEvent {
     DefaultOutput,
 }
 
+/// Bounded notifications: callbacks publish bits, and the control owner rereads
+/// current hardware state. Repeated churn cannot allocate or build a backlog.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct PendingDeviceEvents(std::sync::atomic::AtomicU8);
+
+#[cfg(any(target_os = "macos", test))]
+impl PendingDeviceEvents {
+    fn publish(&self, event: DevicePropertyEvent) {
+        self.0
+            .fetch_or(1 << event as u8, std::sync::atomic::Ordering::Release);
+    }
+
+    fn drain(&self) -> Vec<DevicePropertyEvent> {
+        let bits = self.0.swap(0, std::sync::atomic::Ordering::AcqRel);
+        [
+            DevicePropertyEvent::NominalRate,
+            DevicePropertyEvent::DeviceList,
+            DevicePropertyEvent::DefaultOutput,
+        ]
+        .into_iter()
+        .filter(|event| bits & (1 << *event as u8) != 0)
+        .collect()
+    }
+}
+
 /// Build the driver config request for an externally observed nominal
 /// sample rate, or `None` when the pipeline already runs at that rate.
 ///
@@ -87,9 +113,8 @@ pub(super) use macos::OutputDeviceListener;
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::DevicePropertyEvent;
+    use super::{DevicePropertyEvent, PendingDeviceEvents};
     use std::ffi::{c_char, c_void};
-    use std::sync::mpsc::{Receiver, Sender, channel};
 
     type AudioObjectID = u32;
     type OSStatus = i32;
@@ -177,10 +202,10 @@ mod macos {
         if client_data.is_null() || addresses.is_null() {
             return NO_ERR;
         }
-        // SAFETY: `client_data` is the `Sender` leaked in
+        // SAFETY: `client_data` is the atomic event set leaked in
         // `OutputDeviceListener::new`; it is never reclaimed, so it
         // outlives every registration that carries it.
-        let sender = unsafe { &*(client_data as *const Sender<DevicePropertyEvent>) };
+        let pending = unsafe { &*(client_data as *const PendingDeviceEvents) };
         for index in 0..address_count {
             // SAFETY: CoreAudio passes `address_count` valid addresses.
             let selector = unsafe { (*addresses.add(index as usize)).selector };
@@ -190,7 +215,7 @@ mod macos {
                 SELECTOR_DEFAULT_OUTPUT => DevicePropertyEvent::DefaultOutput,
                 _ => continue,
             };
-            let _ = sender.send(event);
+            pending.publish(event);
         }
         NO_ERR
     }
@@ -321,12 +346,11 @@ mod macos {
 
     /// CoreAudio property listener for the applied output device.
     ///
-    /// Owned by the driver config watcher thread. The event `Sender` is
+    /// Owned by the driver config watcher thread. The atomic event set is
     /// intentionally leaked: CoreAudio may invoke the callback on its own
     /// threads, and a process-lifetime watcher never needs to reclaim it.
     pub(crate) struct OutputDeviceListener {
-        events: Receiver<DevicePropertyEvent>,
-        sender_ptr: *mut Sender<DevicePropertyEvent>,
+        pending_ptr: *mut PendingDeviceEvents,
         enabled: bool,
         watched_name: Option<String>,
         watched_id: Option<AudioObjectID>,
@@ -334,13 +358,12 @@ mod macos {
 
     impl OutputDeviceListener {
         pub(crate) fn new() -> Self {
-            let (sender, events) = channel();
-            let sender_ptr = Box::into_raw(Box::new(sender));
+            let pending_ptr = Box::into_raw(Box::new(PendingDeviceEvents::default()));
             let enabled = std::env::var("SOTF_DEVICE_LISTENER")
                 .map(|value| value.trim() != "0")
                 .unwrap_or(true);
             if enabled {
-                let client_data = sender_ptr.cast();
+                let client_data = pending_ptr.cast();
                 add_listener(SYSTEM_OBJECT, SELECTOR_DEVICES, client_data);
                 add_listener(SYSTEM_OBJECT, SELECTOR_DEFAULT_OUTPUT, client_data);
                 log::info!("CoreAudio device property listener registered");
@@ -348,8 +371,7 @@ mod macos {
                 log::info!("CoreAudio device property listener disabled by SOTF_DEVICE_LISTENER=0");
             }
             Self {
-                events,
-                sender_ptr,
+                pending_ptr,
                 enabled,
                 watched_name: None,
                 watched_id: None,
@@ -371,7 +393,7 @@ mod macos {
             }
             let Some(name) = name else { return };
             if let Some(id) = device_id_for_name(name)
-                && add_listener(id, SELECTOR_NOMINAL_SAMPLE_RATE, self.sender_ptr.cast())
+                && add_listener(id, SELECTOR_NOMINAL_SAMPLE_RATE, self.pending_ptr.cast())
             {
                 self.watched_id = Some(id);
             }
@@ -385,18 +407,14 @@ mod macos {
 
         fn clear_watch(&mut self) {
             if let Some(id) = self.watched_id.take() {
-                remove_listener(id, SELECTOR_NOMINAL_SAMPLE_RATE, self.sender_ptr.cast());
+                remove_listener(id, SELECTOR_NOMINAL_SAMPLE_RATE, self.pending_ptr.cast());
             }
         }
 
         pub(crate) fn drain_events(&mut self) -> Vec<DevicePropertyEvent> {
-            let mut drained = Vec::new();
-            while let Ok(event) = self.events.try_recv() {
-                if !drained.contains(&event) {
-                    drained.push(event);
-                }
-            }
-            drained
+            // SAFETY: this process-lifetime allocation is never reclaimed,
+            // and every access to its payload uses atomic operations.
+            unsafe { &*self.pending_ptr }.drain()
         }
 
         pub(crate) fn nominal_sample_rate(&self, name: &str) -> Option<u32> {
@@ -417,21 +435,21 @@ mod macos {
         fn drop(&mut self) {
             self.clear_watch();
             if self.enabled {
-                remove_listener(SYSTEM_OBJECT, SELECTOR_DEVICES, self.sender_ptr.cast());
+                remove_listener(SYSTEM_OBJECT, SELECTOR_DEVICES, self.pending_ptr.cast());
                 remove_listener(
                     SYSTEM_OBJECT,
                     SELECTOR_DEFAULT_OUTPUT,
-                    self.sender_ptr.cast(),
+                    self.pending_ptr.cast(),
                 );
             }
-            // `sender_ptr` stays leaked by design (see struct docs).
+            // `pending_ptr` stays leaked by design (see struct docs).
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::external_rate_request;
+    use super::{DevicePropertyEvent, PendingDeviceEvents, external_rate_request};
     use driver_common::DriverStatus;
 
     fn status(sample_rate: u32, buffer_frames: u32, channel_count: u32) -> DriverStatus {
@@ -446,6 +464,36 @@ mod tests {
             true,
             0,
         )
+    }
+
+    #[test]
+    fn device_event_storm_is_coalesced_and_next_batch_is_preserved() {
+        let pending = PendingDeviceEvents::default();
+        std::thread::scope(|scope| {
+            for event in [
+                DevicePropertyEvent::NominalRate,
+                DevicePropertyEvent::DeviceList,
+                DevicePropertyEvent::DefaultOutput,
+            ] {
+                let pending = &pending;
+                scope.spawn(move || {
+                    for _ in 0..100_000 {
+                        pending.publish(event);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            pending.drain(),
+            vec![
+                DevicePropertyEvent::NominalRate,
+                DevicePropertyEvent::DeviceList,
+                DevicePropertyEvent::DefaultOutput
+            ]
+        );
+        assert!(pending.drain().is_empty());
+        pending.publish(DevicePropertyEvent::DefaultOutput);
+        assert_eq!(pending.drain(), vec![DevicePropertyEvent::DefaultOutput]);
     }
 
     #[test]
