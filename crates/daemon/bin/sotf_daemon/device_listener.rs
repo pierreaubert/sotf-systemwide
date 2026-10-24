@@ -17,6 +17,13 @@ use driver_common::{DriverConfig, DriverStatus};
 
 /// A coalescable notification that output-device state may have changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(target_os = "macos", test)),
+    allow(
+        dead_code,
+        reason = "the portable listener is inert; CoreAudio constructs these notifications"
+    )
+)]
 pub(super) enum DevicePropertyEvent {
     NominalRate,
     DeviceList,

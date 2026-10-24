@@ -160,6 +160,11 @@ impl OutputProfileStore {
         Self::load_at(output_profiles_path())
     }
 
+    #[cfg(test)]
+    pub(super) fn load_test_path(path: PathBuf) -> Self {
+        Self::load_at(Some(path))
+    }
+
     fn load_at(path: Option<PathBuf>) -> Self {
         let Some(path) = path else {
             return Self::default();

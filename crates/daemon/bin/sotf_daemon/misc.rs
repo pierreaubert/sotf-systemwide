@@ -136,6 +136,10 @@ pub(super) fn transport_snapshot_and_faults(
         && engine_state.playback_frames_received > 0
         && engine_state.playback_frames_written == 0;
     let output_device_unresolved = playing && engine_state.playback_output_device.is_none();
+    let output_incident = engine_state
+        .playback_incident
+        .as_ref()
+        .filter(|incident| incident.is_active());
 
     let input_status = if !playing {
         "idle"
@@ -151,6 +155,8 @@ pub(super) fn transport_snapshot_and_faults(
 
     let output_status = if !playing {
         "idle"
+    } else if output_incident.is_some() {
+        "output_recovering"
     } else if output_callbacks_missing {
         "output_callbacks_missing"
     } else if output_frames_missing {
@@ -163,6 +169,14 @@ pub(super) fn transport_snapshot_and_faults(
 
     let mut faults = Vec::new();
     if playing {
+        if let Some(incident) = output_incident {
+            faults.push(serde_json::json!({
+                "code": "output_stream_incident", "severity": "error",
+                "kind": incident.kind, "incident_id": incident.id,
+                "stream_generation": incident.stream_generation,
+                "message": incident.message,
+            }));
+        }
         if driver_unavailable {
             faults.push(serde_json::json!({
                 "code": "driver_unavailable",
@@ -222,6 +236,8 @@ pub(super) fn transport_snapshot_and_faults(
             "output": {
                 "status": output_status,
                 "callbacks": engine_state.playback_callback_count,
+                "stream_generation": engine_state.playback_output_generation,
+                "incident": engine_state.playback_incident,
                 "frames_written": engine_state.playback_frames_written,
                 "frames_dropped": engine_state.playback_frames_dropped,
                 "device": engine_state.playback_output_device.as_deref(),

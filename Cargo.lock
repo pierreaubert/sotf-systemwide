@@ -1509,6 +1509,7 @@ dependencies = [
  "log",
  "memmap2",
  "rand 0.10.3",
+ "rustix",
  "sha2",
 ]
 
@@ -2982,7 +2983,7 @@ dependencies = [
 
 [[package]]
 name = "math-analog"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "math-dsp",
  "math-iir-fir",
@@ -3001,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "math-dsp"
-version = "0.5.34"
+version = "0.5.35"
 dependencies = [
  "clap",
  "hound",
@@ -3022,7 +3023,7 @@ dependencies = [
 
 [[package]]
 name = "math-iir-fir"
-version = "0.5.26"
+version = "0.5.27"
 dependencies = [
  "base64",
  "byteorder",
@@ -3056,7 +3057,7 @@ dependencies = [
 
 [[package]]
 name = "math-rir"
-version = "0.5.12"
+version = "0.5.13"
 dependencies = [
  "math-iir-fir",
  "rayon",
@@ -3729,6 +3730,7 @@ dependencies = [
 name = "plugins-spatial"
 version = "0.5.0"
 dependencies = [
+ "realfft",
  "rustfft",
  "sotf-host",
 ]
@@ -5078,8 +5080,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sotf-callback-metrics"
+version = "0.7.18"
+dependencies = [
+ "cpal",
+ "driver-common",
+ "libc",
+ "log",
+ "parking_lot",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "sotf-capture"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "audioadapter-buffers",
  "autoeq",
@@ -5089,11 +5104,13 @@ dependencies = [
  "ctrlc",
  "env_logger",
  "hound",
+ "libc",
  "log",
  "math-dsp",
  "math-rir",
  "rtrb",
  "rustfft",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -5207,6 +5224,7 @@ dependencies = [
  "ndarray",
  "notify",
  "num-complex",
+ "rand 0.10.3",
  "rayon",
  "realfft",
  "rtrb",
@@ -5526,6 +5544,7 @@ name = "sotf-plugin-ab-compare"
 version = "0.6.0"
 dependencies = [
  "math-iir-fir",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "sotf-host",
@@ -5668,6 +5687,7 @@ dependencies = [
  "log",
  "plugins-spatial",
  "rayon",
+ "realfft",
  "rustfft",
  "serde",
  "serde_json",
@@ -5746,6 +5766,7 @@ dependencies = [
 name = "sotf-plugin-dither"
 version = "0.5.13"
 dependencies = [
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "sotf-host",

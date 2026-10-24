@@ -1,0 +1,8 @@
+[package]
+name = "sotf-callback-allocator-miri"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Keep the allocator proof independent of native audio/FFI dependencies.
+[workspace]

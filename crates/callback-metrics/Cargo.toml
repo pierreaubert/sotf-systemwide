@@ -1,0 +1,20 @@
+[package]
+name = "sotf-callback-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+cpal.workspace = true
+driver-common.workspace = true
+parking_lot.workspace = true
+log.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[lints]
+workspace = true

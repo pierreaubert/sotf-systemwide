@@ -18,6 +18,8 @@ pub struct DriverManager {
     lab_backend: bool,
     #[cfg(test)]
     test_lab_output: bool,
+    #[cfg(test)]
+    test_output_sink: Option<SinkType>,
 }
 
 impl DriverManager {
@@ -33,6 +35,8 @@ impl DriverManager {
             lab_backend,
             #[cfg(test)]
             test_lab_output: false,
+            #[cfg(test)]
+            test_output_sink: None,
         }
     }
 
@@ -43,6 +47,7 @@ impl DriverManager {
             engine_ready: false,
             lab_backend: false,
             test_lab_output: false,
+            test_output_sink: None,
         }
     }
 
@@ -57,7 +62,16 @@ impl DriverManager {
         self.lab_backend
     }
 
+    #[cfg(test)]
+    pub fn set_test_output(&mut self, output: sotf_audio::lab_pcm::TestOutput) {
+        self.test_output_sink = Some(SinkType::TestOutput(output));
+    }
+
     pub fn output_sink_type(&self) -> SinkType {
+        #[cfg(test)]
+        if let Some(sink) = &self.test_output_sink {
+            return sink.clone();
+        }
         #[cfg(test)]
         if self.test_lab_output {
             return SinkType::LabNull;
@@ -127,13 +141,42 @@ impl DriverManager {
     }
 
     /// Poll for driver-initiated config changes.
-    pub fn poll_config_change(&mut self) -> Option<DriverConfig> {
-        self.driver.poll_config_change()
+    /// Poll without losing a cross-process request identity.
+    pub fn poll_config_request(&mut self) -> Option<driver_common::DriverConfigRequest> {
+        self.driver.poll_config_request()
     }
 
-    /// Acknowledge a config change.
-    pub fn acknowledge_config_change(&mut self, actual: DriverConfig, result: ConfigResult) {
-        self.driver.acknowledge_config_change(actual, result);
+    /// Recheck an intent after waiting for debounce and the transition guard.
+    pub fn config_request_is_current(&mut self, request_id: u64) -> bool {
+        self.driver.config_request_is_current(request_id)
+    }
+
+    /// Publish the result only if it still belongs to the current request.
+    pub fn acknowledge_config_request(
+        &mut self,
+        request_id: u64,
+        actual: DriverConfig,
+        result: ConfigResult,
+    ) -> bool {
+        self.driver
+            .acknowledge_config_request(request_id, actual, result)
+    }
+
+    /// Resolve a discarded mailbox request without affecting a newer identity.
+    pub fn reject_superseded_config_request(&mut self, request_id: u64) {
+        if request_id == 0 {
+            return;
+        }
+        let status = self.driver.status();
+        self.driver.acknowledge_config_request(
+            request_id,
+            DriverConfig::new(
+                status.sample_rate,
+                status.buffer_frames,
+                status.channel_count,
+            ),
+            ConfigResult::error("Superseded by a newer daemon control intent"),
+        );
     }
 
     /// Request a configuration change.
@@ -151,6 +194,15 @@ impl DriverManager {
     /// Returns the new generation when the driver has a volume control.
     pub fn set_output_volume(&mut self, volume: f32, muted: bool) -> Option<u32> {
         self.driver.set_output_volume(volume, muted)
+    }
+
+    /// Patch a user control without replacing a concurrent mute/volume edit.
+    pub fn patch_output_volume(
+        &mut self,
+        volume: Option<f32>,
+        muted: Option<bool>,
+    ) -> Option<(f32, bool, u32)> {
+        self.driver.patch_output_volume(volume, muted)
     }
 }
 

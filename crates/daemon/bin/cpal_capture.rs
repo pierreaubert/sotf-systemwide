@@ -48,6 +48,51 @@ const DEFAULT_BUFFER_FRAMES: u32 = 512;
 /// Queue capacity as a multiple of one driver buffer (`frames * channels`).
 const RING_CAPACITY_MULTIPLE: usize = 8;
 
+/// Fixed-capacity audio queue without parking_lot's allocating deadlock tracker.
+///
+/// Only the consumer/control path blocks. A callback uses `try_lock` and drops
+/// complete incoming frames on contention. After a panic, discard any partial
+/// interleaved frame before reusing the reserved storage; recovery never grows it.
+#[derive(Debug)]
+pub(crate) struct CaptureQueue(std::sync::Mutex<VecDeque<f32>>);
+
+impl CaptureQueue {
+    pub(crate) fn new(samples: VecDeque<f32>) -> Self {
+        let queue = Self(std::sync::Mutex::new(samples));
+        // Some std backends (including Darwin pthread mutexes) lazily allocate
+        // their backing object. Initialize it on this control thread before
+        // publishing the queue to a fresh device callback thread.
+        drop(queue.lock());
+        queue
+    }
+
+    fn recover<'a>(
+        &'a self,
+        result: std::sync::LockResult<std::sync::MutexGuard<'a, VecDeque<f32>>>,
+    ) -> std::sync::MutexGuard<'a, VecDeque<f32>> {
+        result.unwrap_or_else(|poisoned| {
+            let mut queue = poisoned.into_inner();
+            // f32 has no destructor. clear() retains capacity and drops every
+            // pre-panic sample, including a potentially incomplete frame.
+            queue.clear();
+            self.0.clear_poison();
+            queue
+        })
+    }
+
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<f32>> {
+        self.recover(self.0.lock())
+    }
+
+    fn try_lock(&self) -> Option<std::sync::MutexGuard<'_, VecDeque<f32>>> {
+        match self.0.try_lock() {
+            Ok(queue) => Some(queue),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(self.recover(Err(poisoned))),
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 const DRIVER_NAME: &str = "PipeWire monitor (cpal)";
 #[cfg(target_os = "windows")]
@@ -73,7 +118,7 @@ struct CaptureState {
 /// See the module docs for the platform mapping and queue discipline.
 pub struct CpalCaptureDriver {
     state: Arc<Mutex<CaptureState>>,
-    queue: Arc<Mutex<VecDeque<f32>>>,
+    queue: Arc<CaptureQueue>,
     queue_capacity_samples: Arc<AtomicUsize>,
     overflow_drops: Arc<AtomicU64>,
     stream_failed: Arc<AtomicBool>,
@@ -108,7 +153,7 @@ impl CpalCaptureDriver {
                 actual_channels: 2,
                 actual_frames: DEFAULT_BUFFER_FRAMES,
             })),
-            queue: Arc::new(Mutex::new(VecDeque::with_capacity(
+            queue: Arc::new(CaptureQueue::new(VecDeque::with_capacity(
                 DEFAULT_BUFFER_FRAMES as usize * 2 * RING_CAPACITY_MULTIPLE,
             ))),
             queue_capacity_samples: Arc::new(AtomicUsize::new(
@@ -173,7 +218,7 @@ impl Default for CpalCaptureDriver {
 #[derive(Debug)]
 struct CpalCaptureReader {
     state: Arc<Mutex<CaptureState>>,
-    queue: Arc<Mutex<VecDeque<f32>>>,
+    queue: Arc<CaptureQueue>,
     failed: Arc<AtomicBool>,
 }
 
@@ -212,7 +257,7 @@ impl CaptureInput for CpalCaptureReader {
 /// Push converted samples, dropping the oldest on overflow (shared by the
 /// realtime callback and the test seam so both obey one discipline).
 fn push_samples(
-    queue: &Arc<Mutex<VecDeque<f32>>>,
+    queue: &Arc<CaptureQueue>,
     capacity: &Arc<AtomicUsize>,
     drops: &Arc<AtomicU64>,
     channels: usize,
@@ -262,7 +307,7 @@ fn push_samples(
 /// Writes exactly `frames * channels` samples and never touches the
 /// partial-frame tail; returns the frame count. An empty queue (underrun)
 /// returns `0` and leaves `buffer` untouched.
-fn drain_frames(queue: &Mutex<VecDeque<f32>>, channels: usize, buffer: &mut [f32]) -> usize {
+fn drain_frames(queue: &CaptureQueue, channels: usize, buffer: &mut [f32]) -> usize {
     let channels = channels.max(1);
     let complete_samples = buffer.len() - (buffer.len() % channels);
     if complete_samples == 0 {
@@ -281,6 +326,25 @@ fn drain_frames(queue: &Mutex<VecDeque<f32>>, channels: usize, buffer: &mut [f32
     frames
 }
 
+/// Prepare the production sample-conversion and bounded-queue callback.
+pub(crate) fn make_input_callback<T: Copy + 'static>(
+    queue: Arc<CaptureQueue>,
+    capacity: Arc<AtomicUsize>,
+    drops: Arc<AtomicU64>,
+    channels: usize,
+    convert: fn(T) -> f32,
+) -> impl FnMut(&[T]) + Send + 'static {
+    move |data| {
+        push_samples(
+            &queue,
+            &capacity,
+            &drops,
+            channels,
+            data.iter().map(|sample| convert(*sample)),
+        );
+    }
+}
+
 /// Build an input stream converting hardware samples of type `T` to `f32`.
 ///
 /// Conversion is a `fn` parameter rather than a generic `Sample` bound because
@@ -289,7 +353,7 @@ fn drain_frames(queue: &Mutex<VecDeque<f32>>, channels: usize, buffer: &mut [f32
 fn build_stream_for_format<T>(
     device: &cpal::Device,
     config: &StreamConfig,
-    queue: Arc<Mutex<VecDeque<f32>>>,
+    queue: Arc<CaptureQueue>,
     capacity: Arc<AtomicUsize>,
     drops: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
@@ -298,18 +362,11 @@ fn build_stream_for_format<T>(
 where
     T: SizedSample + Copy + 'static,
 {
-    let channels = config.channels as usize;
+    let mut callback =
+        make_input_callback(queue, capacity, drops, config.channels as usize, convert);
     device.build_input_stream(
         config,
-        move |data: &[T], _| {
-            push_samples(
-                &queue,
-                &capacity,
-                &drops,
-                channels,
-                data.iter().map(|sample| convert(*sample)),
-            );
-        },
+        move |data: &[T], _| callback(data),
         move |_error| {
             failed.store(true, Ordering::Release);
         },
@@ -321,7 +378,7 @@ fn build_stream(
     device: &cpal::Device,
     config: &StreamConfig,
     format: SampleFormat,
-    queue: Arc<Mutex<VecDeque<f32>>>,
+    queue: Arc<CaptureQueue>,
     capacity: Arc<AtomicUsize>,
     drops: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
@@ -872,7 +929,7 @@ mod tests {
 
     #[test]
     fn drain_writes_complete_frames_and_preserves_tail() {
-        let queue = Mutex::new(VecDeque::from([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]));
+        let queue = CaptureQueue::new(VecDeque::from([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]));
         let mut buffer = vec![f32::NAN; 7];
         // 7 queued samples at 2 channels: 3 frames written, tail untouched.
         assert_eq!(drain_frames(&queue, 2, &mut buffer), 3);
@@ -883,7 +940,7 @@ mod tests {
 
     #[test]
     fn drain_reports_underrun_without_touching_buffer() {
-        let queue = Mutex::new(VecDeque::from([1.0f32]));
+        let queue = CaptureQueue::new(VecDeque::from([1.0f32]));
         let mut buffer = vec![9.0; 4];
         assert_eq!(drain_frames(&queue, 2, &mut buffer), 0);
         assert_eq!(buffer, vec![9.0; 4]);
@@ -951,6 +1008,39 @@ mod tests {
             [0.0; 101].into_iter(),
         );
         assert_eq!(driver.overflow_count(), 50);
+    }
+
+    #[test]
+    fn callback_poison_recovery_discards_partial_frames_and_preserves_storage() {
+        let driver = CpalCaptureDriver::new();
+        driver.refresh_capacity(64, 2);
+        let reserved = driver.queue.lock().capacity();
+        let interrupted = Arc::clone(&driver.queue);
+        assert!(
+            std::thread::spawn(move || {
+                interrupted.lock().extend([-9.0; 3]);
+                // Hold the guard through unwinding to simulate a consumer dying
+                // after a partial interleaved operation.
+                let _guard = interrupted.lock();
+                panic!("interrupted consumer");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(driver.queue.0.is_poisoned());
+        let mut callback = make_input_callback(
+            Arc::clone(&driver.queue),
+            Arc::clone(&driver.queue_capacity_samples),
+            Arc::clone(&driver.overflow_drops),
+            2,
+            |sample: f32| sample,
+        );
+        callback(&[1.0, 2.0, 3.0, 4.0]);
+        let mut output = [99.0; 6];
+        assert_eq!(drain_frames(&driver.queue, 2, &mut output), 2);
+        assert_eq!(output, [1.0, 2.0, 3.0, 4.0, 99.0, 99.0]);
+        assert!(!driver.queue.0.is_poisoned());
+        assert_eq!(driver.queue.lock().capacity(), reserved);
     }
 
     #[test]

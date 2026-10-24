@@ -12,7 +12,6 @@ use super::loudness::loudness_data_to_json;
 use super::loudness::loudness_info_to_json;
 #[cfg(unix)]
 use super::misc::bind_unix_socket;
-use super::misc::build_driver_plugin_chain;
 use super::misc::elevate_daemon_thread_to_audio_work;
 use super::misc::is_safe_output_device_name;
 use super::misc::push_metering_faults;
@@ -517,7 +516,7 @@ const PROGRESS_STALE_AFTER: Duration = Duration::from_secs(7);
 
 #[derive(Debug, Default)]
 pub(super) struct PlaybackProgress {
-    key: Option<(u64, u64)>,
+    key: Option<(u64, u64, u64)>,
     counters: [u64; 3],
     changed: [Option<Instant>; 3],
     started: Option<Instant>,
@@ -533,7 +532,11 @@ impl PlaybackProgress {
         generation: u64,
         engine: &sotf_audio::AudioEngineState,
     ) {
-        self.key = Some((generation, engine.playback_epoch));
+        self.key = Some((
+            generation,
+            engine.playback_epoch,
+            engine.playback_output_generation,
+        ));
         self.counters = [0; 3];
         self.changed = [None; 3];
         self.started = Some(now);
@@ -548,7 +551,11 @@ impl PlaybackProgress {
         playing: bool,
         engine: &sotf_audio::AudioEngineState,
     ) {
-        let key = (generation, engine.playback_epoch);
+        let key = (
+            generation,
+            engine.playback_epoch,
+            engine.playback_output_generation,
+        );
         let counters = [
             engine.playback_frames_received,
             engine.playback_callback_count,
@@ -585,9 +592,10 @@ impl PlaybackProgress {
         now: Instant,
         generation: u64,
         epoch: u64,
+        output_generation: u64,
         stage: usize,
     ) -> &'static str {
-        if self.key != Some((generation, epoch)) {
+        if self.key != Some((generation, epoch, output_generation)) {
             return "unobserved_generation";
         }
         if Self::age(now, self.observed).is_some_and(|age| age >= PROGRESS_STALE_AFTER) {
@@ -603,20 +611,21 @@ impl PlaybackProgress {
         }
     }
 
-    fn snapshot(&self, now: Instant, generation: u64, epoch: u64) -> Value {
+    fn snapshot(&self, now: Instant, generation: u64, epoch: u64, output_generation: u64) -> Value {
         let millis =
             |time| Self::age(now, time).map(|age| age.as_millis().min(u64::MAX as u128) as u64);
         serde_json::json!({
             "pipeline_generation": generation, "playback_epoch": epoch,
-            "generation_matches": self.key == Some((generation, epoch)),
+            "output_stream_generation": output_generation,
+            "generation_matches": self.key == Some((generation, epoch, output_generation)),
             "stale_after_ms": PROGRESS_STALE_AFTER.as_millis() as u64,
             "observation_age_ms": millis(self.observed),
             "frames_received_age_ms": millis(self.changed[0]),
             "callbacks_age_ms": millis(self.changed[1]),
             "frames_written_age_ms": millis(self.changed[2]),
-            "input": self.status(now, generation, epoch, 0),
-            "callbacks": self.status(now, generation, epoch, 1),
-            "output": self.status(now, generation, epoch, 2),
+            "input": self.status(now, generation, epoch, output_generation, 0),
+            "callbacks": self.status(now, generation, epoch, output_generation, 1),
+            "output": self.status(now, generation, epoch, output_generation, 2),
         })
     }
 }
@@ -704,8 +713,9 @@ impl VolumeSyncTracker {
 /// (HAL requests 96 kHz, status stays 48 kHz, request dropped forever).
 #[derive(Debug)]
 pub(super) struct ConfigChangeDebouncer {
-    pending: Option<(driver_common::DriverConfig, Instant)>,
+    pending: Option<(driver_common::DriverConfigRequest, Instant)>,
     intent_epoch: Option<u64>,
+    superseded: Option<driver_common::DriverConfigRequest>,
 }
 
 impl ConfigChangeDebouncer {
@@ -715,10 +725,12 @@ impl ConfigChangeDebouncer {
         Self {
             pending: None,
             intent_epoch: None,
+            superseded: None,
         }
     }
 
     /// Discard work queued before a newer serialized control intent.
+    #[cfg(test)]
     pub(super) fn observe_intent(
         &mut self,
         now: Instant,
@@ -732,23 +744,54 @@ impl ConfigChangeDebouncer {
         self.observe(now, polled)
     }
 
-    /// Feed one `poll_config_change` result; returns the config to apply
-    /// once it has been the latest distinct request for the debounce window.
+    /// Retain request identity across debounce, including equal-geometry intents.
+    pub(super) fn observe_request(
+        &mut self,
+        now: Instant,
+        polled: Option<driver_common::DriverConfigRequest>,
+        intent_epoch: u64,
+    ) -> Option<driver_common::DriverConfigRequest> {
+        if self.intent_epoch != Some(intent_epoch) {
+            if let Some((request, _)) = self.pending.take() {
+                self.superseded = Some(request);
+            }
+            self.intent_epoch = Some(intent_epoch);
+        }
+        self.observe_identified(now, polled)
+    }
+
+    pub(super) fn take_superseded(&mut self) -> Option<driver_common::DriverConfigRequest> {
+        self.superseded.take()
+    }
+
+    #[cfg(test)]
     pub(super) fn observe(
         &mut self,
         now: Instant,
         polled: Option<driver_common::DriverConfig>,
     ) -> Option<driver_common::DriverConfig> {
-        if let Some(config) = polled {
+        self.observe_identified(
+            now,
+            polled.map(driver_common::DriverConfigRequest::untracked),
+        )
+        .map(|request| request.config)
+    }
+
+    fn observe_identified(
+        &mut self,
+        now: Instant,
+        polled: Option<driver_common::DriverConfigRequest>,
+    ) -> Option<driver_common::DriverConfigRequest> {
+        if let Some(request) = polled {
             match &self.pending {
-                Some((pending, _)) if *pending == config => {}
-                _ => self.pending = Some((config, now)),
+                Some((pending, _)) if *pending == request => {}
+                _ => self.pending = Some((request, now)),
             }
         }
-        let (config, since) = self.pending?;
+        let (request, since) = self.pending?;
         if now.saturating_duration_since(since) >= Self::DEBOUNCE {
             self.pending = None;
-            Some(config)
+            Some(request)
         } else {
             None
         }
@@ -772,6 +815,8 @@ pub(super) struct SystemwideController {
     pub(super) runtime_telemetry: Arc<RuntimeTelemetry>,
     pub(super) playback_progress: Arc<Mutex<PlaybackProgress>>,
     pub(super) snapshot_cache: Arc<Mutex<Option<(Instant, Value)>>>,
+    /// Last complete meter observation, independent of full-snapshot polling.
+    pub(super) metering_cache: Arc<Mutex<Option<(Instant, Value)>>>,
     /// Bounded view of synchronous CoreAudio/CPAL discovery and capabilities.
     pub(super) device_registry: Arc<Mutex<DeviceRegistry>>,
     /// Per-output DSP profiles keyed by stable device identity.
@@ -886,7 +931,7 @@ impl SystemwideController {
         recovery_recorded && driver_ready && matches!(startup_observation, Ok(true))
     }
 
-    fn reconcile_readiness(&self, previous: &mut Option<(u64, u64)>) {
+    fn reconcile_readiness(&self, previous: &mut Option<(u64, u64, u64)>) {
         let Some(_mutation) = self.pipeline_mutation.try_lock() else {
             return;
         };
@@ -911,12 +956,36 @@ impl SystemwideController {
                 streaming == sotf_audio::manager::StreamingState::Playing,
                 &engine,
             );
-            progress.status(now, generation, engine.playback_epoch, 1) == "fresh"
+            progress.status(
+                now,
+                generation,
+                engine.playback_epoch,
+                engine.playback_output_generation,
+                1,
+            ) == "fresh"
         };
-        let progressed = previous.is_some_and(|(epoch, callbacks)| {
-            epoch == generation && engine.playback_callback_count > callbacks
+        let progressed = previous.is_some_and(|(epoch, stream, callbacks)| {
+            epoch == generation
+                && stream == engine.playback_output_generation
+                && engine.playback_callback_count > callbacks
         });
-        *previous = Some((generation, engine.playback_callback_count));
+        *previous = Some((
+            generation,
+            engine.playback_output_generation,
+            engine.playback_callback_count,
+        ));
+        if streaming == sotf_audio::manager::StreamingState::Playing
+            && engine
+                .playback_incident
+                .as_ref()
+                .is_some_and(|incident| incident.is_active())
+        {
+            // A stalled stream may publish no new callbacks. Withdraw readiness
+            // before the progress gate; only explicit resolution plus fresh
+            // current-stream progress may restore it below.
+            self.driver_manager.lock().set_engine_ready(false);
+            return;
+        }
         if !progressed
             || !fresh_callbacks
             || streaming != sotf_audio::manager::StreamingState::Playing
@@ -1008,6 +1077,16 @@ impl SystemwideController {
     pub(super) fn playback_startup_observation(
         state: &sotf_audio::engine::AudioEngineState,
     ) -> Result<bool, String> {
+        if let Some(incident) = state
+            .playback_incident
+            .as_ref()
+            .filter(|incident| incident.is_active())
+        {
+            return Err(format!(
+                "Playback output incident {:?}: {}",
+                incident.kind, incident.message
+            ));
+        }
         if let Some(error) = state
             .last_error
             .as_deref()
@@ -1038,6 +1117,7 @@ impl SystemwideController {
             runtime_telemetry: Arc::new(RuntimeTelemetry::default()),
             playback_progress: Arc::new(Mutex::new(PlaybackProgress::default())),
             snapshot_cache: Arc::new(Mutex::new(None)),
+            metering_cache: Arc::new(Mutex::new(None)),
             device_registry: Arc::new(Mutex::new(DeviceRegistry::default())),
             output_profiles: Arc::new(Mutex::new(OutputProfileStore::load())),
         }
@@ -1205,7 +1285,16 @@ impl SystemwideController {
                     println!("   Startup superseded by a newer pipeline mutation; standing down");
                     return;
                 }
-                if !super::misc::startup_error_is_device_availability(result.error.as_deref()) {
+                let typed_output_failure = daemon
+                    .manager
+                    .lock()
+                    .get_engine_state()
+                    .playback_incident
+                    .as_ref()
+                    .is_some_and(|incident| incident.is_active());
+                if !typed_output_failure
+                    && !super::misc::startup_error_is_device_availability(result.error.as_deref())
+                {
                     println!("   Driver playback failed: {:?}", result.error);
                     return;
                 }
@@ -1322,10 +1411,18 @@ impl SystemwideController {
                     startup_retry = Some(daemon.spawn_initial_driver_playback());
                 }
                 let polled_intent = daemon.pipeline_intent_epoch.load(Ordering::Acquire);
-                let polled = daemon.driver_manager.lock().poll_config_change();
-                if let Some(config) =
-                    config_debouncer.observe_intent(Instant::now(), polled, polled_intent)
+                let polled = daemon.driver_manager.lock().poll_config_request();
+                let matured =
+                    config_debouncer.observe_request(Instant::now(), polled, polled_intent);
+                if let Some(_mutation) = daemon.pipeline_mutation.try_lock()
+                    && let Some(request) = config_debouncer.take_superseded()
                 {
+                    daemon
+                        .driver_manager
+                        .lock()
+                        .reject_superseded_config_request(request.request_id);
+                }
+                if let Some(config) = matured {
                     // Driver callbacks are intents handled by the same
                     // serialized control boundary as startup and IPC.
                     let _mutation = daemon.pipeline_mutation.lock();
@@ -1340,6 +1437,11 @@ impl SystemwideController {
                             &daemon.running,
                             &daemon.output_profiles,
                         );
+                    } else {
+                        daemon
+                            .driver_manager
+                            .lock()
+                            .reject_superseded_config_request(config.request_id);
                     }
                 }
 
@@ -1441,7 +1543,7 @@ impl SystemwideController {
                             &daemon.driver_manager,
                             &daemon.manager,
                             &daemon.device_registry,
-                            config,
+                            driver_common::DriverConfigRequest::untracked(config),
                             &daemon.system_state,
                             &daemon.running,
                             &daemon.output_profiles,
@@ -1743,6 +1845,7 @@ impl SystemwideController {
             Instant::now(),
             generation,
             engine_state.playback_epoch,
+            engine_state.playback_output_generation,
         );
         if state_name == "Playing" {
             if transport["input_status"] == "flowing" && progress["input"] != "fresh" {
@@ -1882,6 +1985,7 @@ impl SystemwideController {
                     "underruns": engine_state.underruns,
                     "playback_output_device": engine_state.playback_output_device,
                     "playback_callback_count": engine_state.playback_callback_count,
+                    "playback_output_generation": engine_state.playback_output_generation,
                     "playback_buffer_fill_percent": engine_state.playback_buffer_fill_percent,
                     "playback_stream_error_count": engine_state.playback_stream_error_count,
                     "playback_frames_received": engine_state.playback_frames_received,
@@ -1889,6 +1993,7 @@ impl SystemwideController {
                     "playback_frames_dropped": engine_state.playback_frames_dropped,
                     "playback_effective_sample_rate": engine_state.playback_effective_sample_rate,
                     "last_error": engine_state.last_error,
+                    "playback_incident": engine_state.playback_incident,
                 },
                 "driver": {
                     "platform_supported": driver_status.platform_supported,
@@ -2023,6 +2128,7 @@ impl SystemwideController {
             "underruns": engine_state.underruns,
             "playback_output_device": engine_state.playback_output_device,
             "playback_callback_count": engine_state.playback_callback_count,
+                    "playback_output_generation": engine_state.playback_output_generation,
             "playback_buffer_fill_percent": engine_state.playback_buffer_fill_percent,
             "playback_stream_error_count": engine_state.playback_stream_error_count,
             "playback_frames_received": engine_state.playback_frames_received,
@@ -2030,6 +2136,7 @@ impl SystemwideController {
             "playback_frames_dropped": engine_state.playback_frames_dropped,
             "playback_effective_sample_rate": engine_state.playback_effective_sample_rate,
             "last_error": engine_state.last_error,
+                    "playback_incident": engine_state.playback_incident,
             "driver": {
                 "installed": driver_status.driver_installed,
                 "ready": driver_status.driver_ready,
@@ -2191,7 +2298,17 @@ impl SystemwideController {
         // the new generation and re-applies the identical values, which is
         // a no-op on the manager. Lock order: manager released above
         // before driver_manager is acquired.
-        self.driver_manager.lock().set_output_volume(volume, muted);
+        let published = self
+            .driver_manager
+            .lock()
+            .patch_output_volume(Some(volume), None);
+        if let Some((_, current_muted, _)) = published {
+            if let Err(error) = self.manager.lock().set_mute(current_muted) {
+                return Response::err(format!("Failed to apply current driver mute: {error}"));
+            }
+        } else {
+            self.driver_manager.lock().set_output_volume(volume, muted);
+        }
         Response::ok_empty()
     }
 
@@ -2569,6 +2686,10 @@ impl SystemwideController {
             .last_error
             .as_deref()
             .is_some_and(|error| !error.is_empty())
+            || engine_state
+                .playback_incident
+                .as_ref()
+                .is_some_and(|incident| incident.is_active())
         {
             return false;
         }
@@ -2589,14 +2710,32 @@ impl SystemwideController {
         let mut progress = self.playback_progress.lock();
         progress.observe(now, generation, true, &engine_state);
         let input_ok = matches!(
-            progress.status(now, generation, engine_state.playback_epoch, 0),
+            progress.status(
+                now,
+                generation,
+                engine_state.playback_epoch,
+                engine_state.playback_output_generation,
+                0
+            ),
             "fresh" | "awaiting_progress"
         );
         let written_ok = matches!(
-            progress.status(now, generation, engine_state.playback_epoch, 2),
+            progress.status(
+                now,
+                generation,
+                engine_state.playback_epoch,
+                engine_state.playback_output_generation,
+                2
+            ),
             "fresh" | "awaiting_progress"
         );
-        progress.status(now, generation, engine_state.playback_epoch, 1) == "fresh"
+        progress.status(
+            now,
+            generation,
+            engine_state.playback_epoch,
+            engine_state.playback_output_generation,
+            1,
+        ) == "fresh"
             && (!driver.capture_active || (input_ok && written_ok))
     }
 
@@ -2972,8 +3111,8 @@ impl SystemwideController {
         }
     }
 
-    /// Start one prepared pipeline, including the graph bootstrap/update
-    /// sequence and loudness monitor selection. Both IPC mutations and the
+    /// Start one prepared pipeline with its complete initial graph and
+    /// loudness monitor selection. Both IPC mutations and the
     /// driver reconfiguration watcher use this helper so their recovery paths
     /// cannot drift apart.
     pub(super) fn start_pipeline_plan(
@@ -2994,30 +3133,19 @@ impl SystemwideController {
                 ));
             }
         }
-        let bootstrap_plugins = if plan.runtime_graph.is_some() {
-            build_driver_plugin_chain(Vec::new()).0
-        } else {
-            plan.runtime_plugins.clone()
-        };
         manager
-            .start_driver_playback_with_source(
+            .start_driver_playback_with_graph_and_source(
                 plan.spec.output_device.clone(),
-                bootstrap_plugins,
+                plan.runtime_plugins.clone(),
                 plan.spec.output_channels,
                 sample_rate,
                 buffer_frames,
                 plan.spec.input_channels,
                 sink_type,
                 capture_source,
+                plan.runtime_graph.clone(),
             )
             .map_err(|error| error.to_string())?;
-
-        if let Some(graph) = plan.runtime_graph.clone()
-            && let Err(error) = manager.update_plugin_graph(graph)
-        {
-            let _ = manager.stop();
-            return Err(error);
-        }
 
         // Some engine revisions configure the driver source while leaving the
         // committed playback state Stopped. Activate through acknowledged
@@ -3324,10 +3452,49 @@ impl SystemwideController {
     }
 
     pub(super) fn handle_get_metering(&self) -> Response {
-        let _mutation = self.pipeline_mutation.lock();
-        let generation = self.system_state.lock().generation();
-        let mut metering = self.metering_snapshot();
-        metering["generation"] = serde_json::json!(generation);
+        if let Some(_mutation) = self.pipeline_mutation.try_lock() {
+            let generation = self.system_state.lock().generation();
+            let mut metering = self.metering_snapshot();
+            metering["generation"] = serde_json::json!(generation);
+            metering["observation"] = serde_json::json!({
+                "transition_in_progress": false, "age_ms": 0, "available": true,
+            });
+            *self.metering_cache.lock() = Some((Instant::now(), metering.clone()));
+            return Response::ok(metering);
+        }
+        // Use one complete prior observation. Reading current geometry or the
+        // manager here would put the polling client back behind the transition.
+        let mut observation = self.metering_cache.lock().clone();
+        {
+            let cached = self.snapshot_cache.lock();
+            if let Some((at, snapshot)) = cached.as_ref()
+                && observation
+                    .as_ref()
+                    .is_none_or(|(previous, _)| at > previous)
+                && let Some(metering) = snapshot
+                    .get("observed")
+                    .and_then(|observed| observed.get("metering"))
+                    .and_then(Value::as_object)
+            {
+                let mut metering = Value::Object(metering.clone());
+                metering["generation"] = snapshot.get("generation").cloned().unwrap_or(Value::Null);
+                observation = Some((*at, metering));
+            }
+        }
+        let Some((at, mut metering)) = observation else {
+            return Response::ok(serde_json::json!({
+                "input": empty_loudness_json(2), "output": empty_loudness_json(2),
+                "sources": {
+                    "input": metering_source_json(false, 2),
+                    "output": metering_source_json(false, 2),
+                },
+                "generation": null,
+                "observation": {"transition_in_progress": true, "age_ms": null, "available": false},
+            }));
+        };
+        metering["observation"] = serde_json::json!({
+            "transition_in_progress": true, "age_ms": at.elapsed().as_millis(), "available": true,
+        });
         Response::ok(metering)
     }
 
@@ -4173,13 +4340,13 @@ impl SystemwideController {
     ) -> Result<(), String> {
         match driver_hal::SharedAudioBuffer::open_default() {
             Ok(buffer) => {
-                if flush_audio {
-                    buffer.flush_audio();
-                }
-                if key_manager.is_enabled() {
-                    buffer.set_key_fingerprint(*key_manager.fingerprint());
-                }
-                buffer.set_encrypted(key_manager.is_enabled());
+                buffer
+                    .configure_encryption(
+                        key_manager.is_enabled(),
+                        *key_manager.fingerprint(),
+                        flush_audio,
+                    )
+                    .map_err(|error| format!("Failed to publish HAL encryption state: {error}"))?;
                 buffer.set_config_changed();
                 Ok(())
             }

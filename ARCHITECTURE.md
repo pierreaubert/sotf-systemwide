@@ -25,6 +25,41 @@ Update this document whenever a change affects:
 Implementation and remaining verification are tracked in
 `AUDIT-FIXES-20261018.md` and private issue `sotf-systemwide#1`.
 
+- Shared protocol v8 publishes request/ACK tuples under a bounded control gate,
+  with 64-bit request identities and an actual channel acknowledgement field.
+  The identity survives daemon debounce and CoreAudio perform/abort callbacks;
+  obsolete ACKs cannot clear newer requests. Geometry commits only update live
+  ring geometry. Contended ACKs are retained for control-thread retry, and HAL
+  readiness stays withdrawn while acknowledgement is pending. Daemon restart
+  atomically publishes a fresh rendezvous and request identity, preserving user
+  volume while discarding poisoned gates. The HAL retires the old immutable
+  object through mapping leases; its extent never changes. Audio IO never
+  acquires the control gate.
+- User scalar/mute/generation now occupy one atomic 64-bit word. Partial scalar
+  and mute updates use CAS to preserve the other writer's field. The old v7
+  words remain reserved in the layout. The v8 header is 184 bytes; its aligned
+  audio offset remains 192 bytes. Both peers reject incompatible versions;
+  HAL and daemon must be updated together.
+- `audio.shm` is a 32-byte rendezvous record, never a mapped audio file.
+  Audio lives in an allocated, unlinked Darwin POSIX shared-memory object,
+  whose extent cannot be truncated after allocation. A nonce-named Unix broker
+  authenticates peers and passes its descriptor; receivers validate object
+  type, owner, immutable extent and bounded length before mapping it. Production
+  Rust and Swift refuse legacy file mappings. Fixture access is explicitly unsafe
+  in Rust and compiled into Swift tests only.
+- Every geometry reset, queue flush and encryption transition advances a ring
+  identity under the IO exclusion gate. Cached decrypted samples carry that
+  identity, so a same-format reset or A→B→A transition cannot revive old samples.
+  The daemon publishes encryption mode, key fingerprint and optional flush as
+  one checked control transaction.
+- Engine output width, device and access mode arrive as one retained snapshot
+  tagged by the actual output-stream identity. Synchronous reconfiguration
+  receipts install that identity before state commit, rejecting retired-stream
+  metadata and statistics. Daemon freshness includes the stream identity.
+- Recoverable output incidents carry typed causes, stable IDs and explicit
+  callback-proven resolution receipts. They survive stream replacement and
+  cannot clear unrelated fatal errors. The supervisor withdraws readiness for
+  an active incident and requires resolution plus fresh progress to restore it.
 - Swift validates protocol version, bounded geometry, mapped coverage, and
   cursors before publishing driver readiness. Failed initialization discards
   the mapping. IO reserves its transport bit before copying and uses bounded
@@ -75,6 +110,9 @@ Implementation and remaining verification are tracked in
   geometry without silently replacing output timing. Snapshots expose both.
   Lab and CPAL capture sources carry real samples into the engine; NullDriver
   is status-only and cannot start a successful systemwide playback pipeline.
+  Live capture resampling uses the engine's preallocated output staging, so
+  every DSP block respects the negotiated processing frame count even when
+  the native rate differs. Partial output is retained for the next block.
 - Startup recovery retains a single retry worker and uses the latest intent
   epoch after idle driver reconfiguration or delayed capture readiness. An
   explicit Pause/Stop disables automatic startup; unavailable capture cannot
@@ -82,8 +120,16 @@ Implementation and remaining verification are tracked in
   rebuilding the stream.
 - Windows authentication is admitted to bounded, owned handshake workers.
   Runtime directories and token files are pinned and checked with Win32 handles;
-  tokens receive a protected owner-only DACL at creation, before secret bytes
-  are written. Unix poll/Windows WSAPoll wake accepts on readiness without the
+  new runtime directories, port files and tokens receive an explicit account
+  owner and protected owner-only DACL at creation. Missing directory parents
+  use the same descriptor; existing final directories must pass owner and
+  non-reparse checks before protection. Both rendezvous publishers use exclusive
+  creation, sync and rename, and failed creation never unlinks a planted stage.
+  Clients validate the port file before connecting or sending a credential;
+  port reads are bounded to 32 bytes. Listener startup rejects untrusted existing
+  rendezvous entries before liveness probes or stale reclamation. Legacy inherited
+  or foreign entries require separate migration/acceptance; they are not silently
+  adopted. Unix poll/Windows WSAPoll wake accepts on readiness without the
   previous 50 ms accept-loop polling penalty.
 - Installer writes below a user's home, including log rotation and plist
   preparation, run with that user's privileges. The readiness log offset is
@@ -96,6 +142,12 @@ Implementation and remaining verification are tracked in
   and startup supersession are behavioral regressions. Physical devices,
   installed-driver lifecycle and release deadline measurements remain native
   acceptance work. Joint protocol/engine findings are listed in the audit ledger.
+- The Swift gate builds both Rust workers into one explicit Cargo target
+  directory. Shipping-direction stress sends 32,768 sequence-marked frames
+  from Swift to the production Rust HAL reader for plaintext/encrypted stereo
+  and eight-channel layouts. It forces full-ring rejection before consumption
+  and verifies every sample across repeated wraps and mismatched block sizes.
+  The macOS aggregate also runs all Python script fixtures.
 
 ## Scope
 
@@ -151,7 +203,7 @@ capture drivers:
   connection rather than creating a daemon thread for every poll. The unused
   Tokio runtime was removed, and immutable available-plugin metadata is cached
   once per process.
-- The shared-memory protocol is version 6. Geometry changes use a requested
+- The shared-memory protocol is version 8. Geometry changes use a requested
   channel count plus a quiesce/ack handshake. The atomic `configuring` word is
   also a commit bitset: bit 0 blocks new IO commits, while bits 1 and 2 reserve
   the reader and writer cursor publications. Both Rust and Swift claim the
@@ -439,7 +491,7 @@ flowchart TB
 
     subgraph SharedTransport["Per-user transport"]
         uds[daemon.sock]
-        shm[audio.shm]
+        shm[Immutable shared memory / audio.shm rendezvous]
         sessionKey[session.key copy]
     end
 
@@ -683,14 +735,26 @@ private key before `AudioDaemon` construction or key rotation;
 need to kill unrelated daemons or race a second bind, and split-path lab
 configuration cannot create two owners for one transport.
 
-Both mapped endpoints validate the backing file outside realtime callbacks.
-Rust driver status clears observed capture/readiness when its mmap no longer
-matches the published `audio.shm` inode. The Swift HAL maintenance queue maps a
-replacement into an inactive slot and atomically publishes that generation
-without waiting for long-lived CoreAudio clients to stop. Each callback pins
-one slot for its complete operation; maintenance reuses an old slot only after
-its callback-reader count reaches zero. This prevents an unlinked mmap from
-reporting healthy transport while new readers attach to a different inode.
+Both endpoints validate the rendezvous inode outside realtime callbacks. The
+32-byte record contains the logical mapping length and a random 128-bit nonce;
+its first eight nonce bytes select a `.fd-` endpoint in the same private runtime
+directory. The broker accepts only the owner, `_coreaudiod`, or root, while the
+receiver requires the broker UID to match the marker owner. Both validate the
+received descriptor as an allocated Darwin POSIX shm object before mapping the
+explicit logical length. Connect and handshake waits are bounded and run only
+on control threads. Truncating the marker invalidates readiness but cannot
+revoke pages already pinned by either process.
+
+Rust driver status clears observed capture/readiness when the rendezvous no
+longer matches the published inode or length. The Swift HAL maintenance queue
+maps a replacement into an inactive slot and atomically publishes that generation
+without waiting for long-lived CoreAudio clients to stop. Each callback pins one
+slot for its complete operation; maintenance reuses an old slot only after its
+callback-reader count reaches zero. If the old daemon broker has exited, the
+surviving HAL restores its cached scalar/mute tuple before publishing readiness;
+a concurrent volume already published to the new mapping wins that CAS. Console
+session retirement resets the cache before attaching another user's transport.
+Broker shutdown removes only its own nonce endpoint after checking its inode.
 
 SIGINT and SIGTERM clear the daemon running flag. The shutdown path clears HAL
 `engine_ready`, stops the engine, closes retained client sockets, joins every
@@ -1426,3 +1490,147 @@ split it into more services; it is to make the daemon's desired state explicit
 and singly owned. Once the daemon can expose a coherent snapshot and run against
 fake drivers/transports, most systemwide behavior can be debugged and tested
 locally without installing the HAL driver or relying on manual audio tests.
+
+### Callback measurement boundary
+
+The native macOS aggregate runs `just bench-hal-transport` in addition to normal
+Swift behavior tests. The allocation build has its own bundle and test bridging
+header. It invokes the production audio/timestamp functions through wrappers
+compiled only with `SOTF_HAL_TESTING`, using a malloc-family observer linked only
+with `SOTF_HAL_ALLOCATION_PROBE`. Raw and Swift-object canaries verify observation
+before measured callbacks run. Timing/counter storage and fixture checks remain
+outside the callback window. Both load modes reuse one optimized executable.
+The fixture refreshes its simulated daemon heartbeat before each measured IO
+iteration. A separate callback regression verifies that zero/expired heartbeats
+still suppress capture and that a fresh heartbeat restores admission on the same
+mapping. No production readiness timeout is relaxed.
+Thread CPU and wall intervals remain separate, and host period overruns are
+retained. The local production bundle is also checked for probe symbols and
+dependencies. This does not establish installed-HAL scheduling, device deadlines,
+CPAL/DSP allocation or physical end-to-end latency. See the audit ledger and
+`audit-evidence/` for the exact scope and captured runs.
+
+The separate Swift-producer/Rust-consumer sequence matrix covers 2/8/32 channels,
+48/96/192 kHz and 64/128/512-frame geometry, plaintext and encrypted, both idle
+and under acknowledged configuration-error/volume churn. Each case fills the
+ring before starting its reader, then checks every accepted sample over 32 ring
+lengths. Fixtures scale ring depth with sample rate and keep integer markers
+within Float's exact range. Reports require the complete geometry set and an
+active storm; test-worker diagnostics use files and a monotonic timeout. These
+are host transport fixtures, separate from installed-device lifecycle acceptance.
+The sequence reader's synthetic 100-microsecond consumer clock advances from
+its prior scheduled tick. Late wakeups retain clock phase instead of restarting
+a full delay after every fragmented read. Per-phase read, verification and wait
+durations, empty-read counts and partial verified progress are emitted before
+propagating a timeout. The sample workload and normal 15-second worker deadline
+are unchanged; clock calibration does not establish native device deadlines.
+
+### Capture queue allocation boundary
+
+The capture measurement runner is Python and works without Bash, including
+from the Windows component entry point. It requires all 288 unique format,
+channel, frame and queue-mode cases, active allocation/free canaries, complete
+call counts and ordered timing quantiles. Cold-callback and steady allocation
+counts must be zero. Qualified reports retain the exact executable hash and
+matching before/after source snapshots; failed runs remove stale qualification
+and retain their raw data. JSON and Cargo logs use explicit UTF-8 encoding.
+
+CPAL data callbacks use a dedicated, pre-reserved `CaptureQueue`. Its standard
+mutex backend is initialized on the control thread before publication; callback
+access is always `try_lock`. Control state retains parking_lot diagnostics, but
+the audio queue bypasses their thread-local deadlock-tracking allocations.
+Consumer-panic recovery clears pending samples without freeing or growing the
+buffer, preventing old partial interleaved frames from reaching a new read.
+`make_input_callback` supplies the same conversion/queue closure to native CPAL
+and the standalone `sotf-callback-metrics` executable. Both native aggregate
+gates exercise cold-thread allocation, contention and poison recovery. The
+measurement observer never becomes the daemon's allocator; backend/hardware
+qualification remains separate from these closure measurements.
+
+### Lab playback continuity observation
+
+The shared engine's `test-util` feature exposes a per-engine `LabPcmProbe` for
+simulated playback only. It aggregates every sample after the production
+volume-ramp and clamp kernel, including underrun silence. Explicitly armed
+windows retain separate channel minima/maxima, invalid samples, frame/block
+counts and output-stream generations. Window reset, observation and snapshot
+use one mutex on the simulated worker; native audio callbacks never call it.
+A separate monotonic counter records attempted mute commands even if a quick
+mute/unmute pair falls between simulated output ticks. The handle is omitted
+from serialized engine state and normal daemon dependency features.
+
+The healthy-reapply regression waits for stable PCM, current driver readiness
+and nonzero engine progress reports before arming its final window. It invokes
+the pipeline transaction entry point directly and verifies unchanged samples,
+engine/stream/pipeline identity and mute-command count across repeated no-ops.
+Stopping the fixture happens after the observation window and counter read.
+This establishes simulated steady-state continuity; it does not qualify native
+hardware timing or profile fallback/restoration audio.
+
+### Complete graph before driver-source admission
+
+The simulated output preserves its nominal sample-clock phase when feeder
+wakeups arrive late. Each turn services elapsed ticks up to 4,096 frames (or
+one whole block for larger blocks), retaining excess clock debt for later
+turns. Observation timestamps record actual block arrival, without backdating.
+An immutable `test-util` `LabPcmObserver` can inspect complete post-clamp samples
+before the aggregate-window mutex is taken, including when no window is armed.
+
+Explicit `CaptureSource` inputs already provide pacing through availability
+and downstream backpressure. The decoder skips synthetic/disconnected-HAL
+frame sleeps for these inputs; it retains idle sleeps when no capture data is
+available. The release lab latency benchmark records both nominal synthetic
+capture-to-output and successful-source-read-to-output boundaries. Silent
+frames after signal begins are reported separately from exact marker delivery.
+This fixture measures the real decoder/DSP/queue path with simulated endpoints;
+native backend and physical loopback acceptance remain separate.
+
+`start_pipeline_plan` passes the prepared runtime graph into
+`AudioEngineManager::start_driver_playback_with_graph_and_source`. The shared
+engine builds that graph as its initial host, prepares its callback capacity,
+waits for installation and resolves output channels before creating playback
+or starting the capture source. The old source-only manager API delegates with
+no graph. `EngineConfig::initial_graph` is runtime-only and omitted from JSON.
+This replaces the old monitor-only bootstrap followed by a live graph swap,
+which could crossfade uncorrected samples into a newly selected graph profile.
+The shared start API also acknowledges transport activation before publishing
+`Playing`, so direct callers no longer require the daemon's compatibility step
+for an engine left in `Stopped` by driver-source setup.
+
+A `test-util` named output supplies its own probe before construction, allowing
+inspection from the very first simulated output block. The A→B→A profile gate
+injects only the resolved route/capability decision; it executes real profile
+recall, engine construction, DSP, output gain and disk reload for all four
+rack/graph combinations. Startup silence remains counted separately from
+nonzero sample extrema and any later silent frames. Named outputs never open
+hardware; physical hotplug and installed-HAL acceptance remain separate.
+
+### Meter polling during transitions and release IPC measurement
+
+`get_metering` tries the pipeline guard instead of waiting behind reconfiguration
+or volume commands. A stable read caches its entire payload and generation. A
+busy read chooses the newer complete meter observation or full-snapshot meter
+observation, preserves that observation's generation, and attaches
+`observation.transition_in_progress`, `age_ms` and `available`. It never reads
+current geometry or acquires the manager/state locks on the busy path. Meter-only
+clients maintain their own cache rather than relying on status polling. Before
+any observation exists, the familiar zero payload has `available: false`, a null
+age and a null generation; those zeros do not establish current geometry/audio.
+
+`just bench-ipc-control` builds the release daemon and measures fresh Unix-socket
+connections from socket creation through full response JSON decoding. Its owned
+lab child uses isolated state, keys and endpoint paths, disables native device
+listeners, and verifies actual lab callback/frame progress before measurement.
+It records raw timings and p50/p95/p99/max for ping, snapshots and meters under
+steady polling, volume changes, cold configuration changes and malformed requests
+with 24 incomplete clients kept alive. It verifies the partial clients remain
+held, records errors and command telemetry, checks graceful shutdown, and saves
+selected source/binary/log hashes and daemon CPU usage. The native macOS/Linux
+aggregate runs its protocol/timing canaries and benchmark.
+
+The client p99 meter target is 5 ms, matching the existing handler telemetry
+budget numerically but including client scheduling, connection setup and JSON
+work. The separate maximum response target is a 1 s liveness guard. Both are
+control-path regression targets; host scheduling outliers remain in the results.
+These tests do not generate native CoreAudio notifications, exercise Windows
+TCP authentication or measure native audio callbacks/physical loopback latency.

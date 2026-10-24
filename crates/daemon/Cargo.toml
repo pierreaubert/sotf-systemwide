@@ -12,6 +12,13 @@ categories.workspace = true
 default = []
 hal = ["driver-hal", "sotf-plugins/hal", "sotf-engine/hal"]
 asio = ["sotf-engine/asio"]
+# Explicit opt-in for the device-free end-to-end measurement executable.
+lab-latency-bench = []
+
+[[bench]]
+name = "lab_latency_benchmark"
+harness = false
+required-features = ["lab-latency-bench"]
 
 [[bin]]
 name = "sotf-daemon"
@@ -43,6 +50,7 @@ objc2-core-audio = { workspace = true, features = ["std", "objc2-core-audio-type
 objc2-core-foundation = { workspace = true, features = ["std", "CFString"], default-features = false }
 
 [dev-dependencies]
+sotf-engine = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 insta = { workspace = true }

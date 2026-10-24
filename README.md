@@ -101,6 +101,20 @@ cargo run --bin sotf-daemon --features hal --release
 
 ### Automated tests
 
+`just bench-hal-transport` runs optimized Swift/Rust transport fixtures across
+2/8/32 channels, 48/96/192 kHz and 64/128/512 frames, both encrypted and plaintext,
+idle and under control churn. It checks every accepted sample and writes
+`target/hal-transport-metrics/report.json`, alongside isolated HAL callback
+allocation/timing measurements. These host fixtures do not qualify physical
+audio deadlines or installed-HAL lifecycle behavior.
+
+`just bench-ipc-control` runs the release lab daemon through fresh-connection
+control-load measurements and writes `target/ipc-control-metrics/report.json`
+(under `CARGO_TARGET_DIR` when set). It uses private runtime state and keys,
+measures ping/snapshot/metering tails, and verifies post-load audio progress.
+This also runs in the native macOS/Linux gate; physical audio latency and
+Windows authentication load require separate qualification.
+
 Run the committed systemwide contract/component gates from the repository root:
 
 ```bash
@@ -119,11 +133,29 @@ artifact rejection, shutdown, and restart without installing or touching the
 CoreAudio HAL bundle.
 The macOS gate runs the Rust HAL, shared-protocol, daemon, and real local
 Unix-socket IPC tests; package-scoped strict Clippy; and Swift type-checks for
-the menu-bar client and HAL driver. The Linux recipe builds a pinned test image
+the menu-bar client and HAL driver. Its expanded Swift/Rust sequence workload
+defaults to the release Rust worker; set `SOTF_HAL_WORKER_PROFILE=debug` for a
+separate debug-worker diagnostic run. The Linux recipe builds a pinned test image
 and runs the portable HAL streaming guards, shared-protocol tests, daemon
 component/IPC tests, and package-scoped strict Clippy natively under
 `linux/arm64`. Its Cargo registry, Git checkout, and target caches live in named
 Docker volumes; the source tree is mounted read-only.
+
+On native Windows, with Python 3.11+, the Rust MSVC toolchain and Windows SDK,
+run from the same sibling-checkout layout:
+
+```powershell
+py -3 scripts/test_systemwide_windows.py
+```
+
+This entry point uses isolated lab-daemon state, runs the Windows ACL and
+loopback-authentication tests, engine regressions, capture-closure and latency
+measurements, and strict lint. It writes per-step logs and a source-checked
+component report under `target/systemwide-windows-gate`. It refuses other
+platforms and Wine before creating output or starting processes. Its success
+does not complete two-account ACL, physical capture/output, device-event or
+deadline acceptance; these remain explicit pending fields in the report.
+Native Windows execution of this new gate has not yet been performed.
 
 Neither gate installs the HAL bundle or changes the system output device. The
 ignored installed-HAL tests remain a manual macOS smoke layer. Run
@@ -177,9 +209,10 @@ warns without failing the install.
 - SIGINT/SIGTERM performs the same shutdown path as an IPC shutdown: clear HAL
   readiness, stop the engine, close retained client sockets, join every client
   handler and the watcher, and remove only the daemon's verified Unix socket.
-- Shared-memory protocol version 6 uses requested geometry plus a quiesce/ack
-  handshake. Rust and Swift IO paths honor the configuring gate and preserve
-  interleaved frame alignment.
+- Shared-memory protocol v8 identifies coherent requests and acknowledgements,
+  carries actual/restored geometry, and publishes volume/mute atomically. Rust
+  and Swift IO paths honor bounded quiescence and preserve interleaved frames;
+  the HAL and daemon require matching protocol builds.
 - The daemon rotates the shared-audio key once per process lifetime before
   opening the transport. It atomically publishes a daemon-private copy and a
   mode-0600 HAL-readable copy because sandboxed CoreAudio cannot read the
@@ -189,6 +222,10 @@ warns without failing the install.
   engine opens them.
 - `dump_state` reports metering and pipeline-reload request latency, response
   size, and budget-exceed telemetry for release diagnostics.
+- `get_metering` returns a complete cached observation during a pipeline
+  transition, with its original generation and `observation` age/availability.
+  Before any observation exists, the zero payload is explicitly unavailable
+  and its generation is null. Clients should honor those observation fields.
 - Rust and Swift access the shared-memory header with matching acquire/release
   atomics and a tested C layout.
 - CoreAudio callback staging is preallocated to the maximum supported HAL
@@ -228,6 +265,17 @@ for linear topology and opens its graph editor for DAG topology.
 ```
 
 ## Sub-crate documentation
+
+`just bench-lab-latency` runs the real engine with a paced synthetic capture
+source and an inspectable simulated output. It verifies sequence-marked PCM at
+2/8/32 input channels, 48/96/192 kHz and 64/128/512 frames with unity and half
+gain. The 32-channel cases select 16 outputs. Reports in
+`target/lab-latency/report.json` retain raw timestamp pairs, source/binary hashes,
+latency quantiles, silence counts and process CPU time. These measurements
+include observer overhead and do not qualify hardware latency or deadlines.
+Matching `sources-before.json` and `sources-after.json` manifests accompany a
+qualified report. Source changes withhold qualification, retain both snapshots
+and name the changed paths; a stale qualified report is removed before a run.
 
 This repo contains only the daemon crate; driver crates live in the sibling
 `sotf-daw` repo (see `ARCHITECTURE.md` for the full layout):

@@ -172,36 +172,85 @@ pub fn windows_socket_path_from_env(
         .join("daemon.sock")
 }
 
-/// Atomically publish `port` at `port_file` (Windows).
+/// Create or validate a private Windows IPC directory and retain its pin.
 ///
-/// Writes to a sibling temporary file and renames it over the destination so
-/// readers never observe a torn port number. Refuses to replace directories;
-/// a stale symlink is never followed — the rename lands on the link path
-/// itself only when the existing entry is a regular file or absent.
+/// # Errors
+/// Returns an error for foreign owners, reparse points, or failed protection.
 #[cfg(windows)]
-pub fn write_port_file(port_file: &Path, port: u16) -> std::io::Result<()> {
-    if let Ok(metadata) = std::fs::symlink_metadata(port_file)
-        && !metadata.is_file()
-    {
+pub fn secure_windows_runtime_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    windows_acl::PrivateAcl::new()?.secure_directory(path)
+}
+
+#[cfg(windows)]
+fn write_private_rendezvous_at(
+    destination: &Path,
+    temporary: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "IPC rendezvous requires a directory",
+            )
+        })?;
+    if temporary.parent() != Some(parent) {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "IPC port file {} exists and is not a regular file; refusing to replace",
-                port_file.display()
-            ),
+            std::io::ErrorKind::InvalidInput,
+            "IPC rendezvous staging must use the same directory",
         ));
     }
-    let parent = port_file.parent().ok_or_else(|| {
+    let acl = windows_acl::PrivateAcl::new()?;
+    let _directory = acl.secure_directory(parent)?;
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata)
+            if !metadata.is_file()
+                || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 =>
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "IPC rendezvous must be a regular non-reparse file",
+            ));
+        }
+        Ok(_) => {
+            let _existing = acl.open_file(destination)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut created = false;
+    let publication = (|| -> std::io::Result<()> {
+        let mut file = acl.create_file(temporary)?;
+        created = true;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(temporary, destination)
+    })();
+    publication.map_err(|error| {
+        // CREATE_NEW can fail on a planted entry. Never unlink an object we
+        // did not create while reporting that refusal.
+        if created {
+            let _ = std::fs::remove_file(temporary);
+        }
         std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
+            error.kind(),
             format!(
-                "IPC port file {} has no parent directory",
-                port_file.display()
+                "failed to publish private IPC rendezvous {}: {error}",
+                destination.display()
             ),
         )
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let temp_path = port_file.with_extension(format!(
+    })
+}
+
+#[cfg(windows)]
+fn write_private_rendezvous(destination: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temporary = destination.with_extension(format!(
         "tmp-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -209,42 +258,37 @@ pub fn write_port_file(port_file: &Path, port: u16) -> std::io::Result<()> {
             .map(|duration| duration.subsec_nanos())
             .unwrap_or(0)
     ));
-    (|| {
-        std::fs::write(&temp_path, encode_port_file_contents(port))?;
-        std::fs::rename(&temp_path, port_file)?;
-        Ok(())
-    })()
-    .map_err(|error: std::io::Error| {
-        let _ = std::fs::remove_file(&temp_path);
-        std::io::Error::new(
-            error.kind(),
-            format!(
-                "failed to publish IPC port file {}: {error}",
-                port_file.display()
-            ),
-        )
-    })
+    write_private_rendezvous_at(destination, &temporary, bytes)
+}
+
+/// Atomically publish an owner-protected port file without following reparse points.
+#[cfg(windows)]
+pub fn write_port_file(port_file: &Path, port: u16) -> std::io::Result<()> {
+    write_private_rendezvous(port_file, encode_port_file_contents(port).as_bytes())
 }
 
 /// Read a bound port back from `port_file` (Windows).
 #[cfg(windows)]
 pub fn read_port_file(port_file: &Path) -> std::io::Result<u16> {
-    let text = std::fs::read_to_string(port_file).map_err(|error| {
-        std::io::Error::new(
-            error.kind(),
-            format!(
-                "failed to read IPC port file {}: {error}",
-                port_file.display()
-            ),
-        )
-    })?;
+    use std::io::Read;
+    // Five decimal digits and a newline suffice for every generated port.
+    // Retain a small whitespace allowance while bounding malformed file reads.
+    const MAX_PORT_FILE_BYTES: usize = 32;
+    let acl = windows_acl::PrivateAcl::new()?;
+    let mut text = String::new();
+    acl.open_file(port_file)?
+        .take(MAX_PORT_FILE_BYTES as u64 + 1)
+        .read_to_string(&mut text)?;
+    if text.len() > MAX_PORT_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IPC port file is oversized",
+        ));
+    }
     decode_port_file_contents(&text).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "IPC port file {} holds an invalid port number",
-                port_file.display()
-            ),
+            "IPC port file holds an invalid port number",
         )
     })
 }
@@ -260,6 +304,26 @@ pub fn read_port_file(port_file: &Path) -> std::io::Result<u16> {
 /// client credential and a stale token never authenticates a new listener.
 #[cfg(windows)]
 pub fn bind_windows_listener(port_file: &Path) -> std::io::Result<(IpcListener, IpcAuthToken)> {
+    let parent = port_file.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "IPC port file requires a directory",
+        )
+    })?;
+    let acl = windows_acl::PrivateAcl::new()?;
+    let _directory = acl.secure_directory(parent)?;
+    let token_file = token_file_for_port_file(port_file);
+    // Refuse insecure or foreign rendezvous objects before probing a port or
+    // reclaiming a stale entry. Existing user data is not silently migrated.
+    for path in [port_file, token_file.as_path()] {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                let _validated = acl.open_file(path)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
     if let Ok(port) = read_port_file(port_file)
         && connect_loopback(port).is_ok()
     {
@@ -268,7 +332,6 @@ pub fn bind_windows_listener(port_file: &Path) -> std::io::Result<(IpcListener, 
             "Another daemon instance is already running",
         ));
     }
-    let token_file = token_file_for_port_file(port_file);
     for rendezvous_file in [port_file, token_file.as_path()] {
         if rendezvous_file.exists()
             && !std::fs::symlink_metadata(rendezvous_file)
@@ -472,54 +535,10 @@ pub fn token_file_for_port_file(port_file: &Path) -> PathBuf {
 /// replace non-regular files.
 #[cfg(windows)]
 pub fn write_token_file(token_file: &Path, token: &IpcAuthToken) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Ok(metadata) = std::fs::symlink_metadata(token_file)
-        && !metadata.is_file()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "IPC token file {} exists and is not a regular file; refusing to replace",
-                token_file.display()
-            ),
-        ));
-    }
-    let parent = token_file.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "IPC token file {} has no parent directory",
-                token_file.display()
-            ),
-        )
-    })?;
-    let acl = windows_acl::PrivateAcl::new()?;
-    let _directory = acl.secure_directory(parent)?;
-    let temp_path = token_file.with_extension(format!(
-        "tmp-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.subsec_nanos())
-            .unwrap_or(0)
-    ));
-    (|| {
-        let mut file = acl.create_file(&temp_path)?;
-        file.write_all(encode_auth_token_file_contents(token).as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&temp_path, token_file)?;
-        Ok(())
-    })()
-    .map_err(|error: std::io::Error| {
-        let _ = std::fs::remove_file(&temp_path);
-        std::io::Error::new(
-            error.kind(),
-            format!(
-                "failed to publish IPC token file {}: {error}",
-                token_file.display()
-            ),
-        )
-    })
+    write_private_rendezvous(
+        token_file,
+        encode_auth_token_file_contents(token).as_bytes(),
+    )
 }
 
 /// Read a auth token back from `token_file` (Windows).
@@ -820,6 +839,88 @@ mod tests {
             token_file_for_port_file(&port),
             PathBuf::from("/tmp/sotf-auth-test/daemon.token")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_port_publication_is_bounded_and_protected() {
+        let root = tempfile::tempdir().expect("fixture directory");
+        let port_file = root.path().join("private").join("daemon.sock");
+        write_port_file(&port_file, 43210).expect("protected port publication");
+        assert_eq!(read_port_file(&port_file).unwrap(), 43210);
+        windows_acl::PrivateAcl::new()
+            .unwrap()
+            .open_file(&port_file)
+            .expect("port protection precedes client read");
+        std::fs::write(&port_file, " ".repeat(33) + "43210").unwrap();
+        assert_eq!(
+            read_port_file(&port_file).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn client_refuses_unprotected_port_before_connecting_or_sending_a_credential() {
+        let root = tempfile::tempdir().expect("fixture directory");
+        let port_file = root.path().join("private").join("daemon.sock");
+        let token_file = token_file_for_port_file(&port_file);
+        let token = generate_auth_token().unwrap();
+        write_token_file(&token_file, &token).expect("protected token");
+        let listener = IpcListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::fs::write(
+            &port_file,
+            encode_port_file_contents(listener.local_addr().unwrap().port()),
+        )
+        .expect("inherited port fixture");
+        assert_eq!(
+            connect_windows(&port_file).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            bind_windows_listener(&port_file).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            write_port_file(&port_file, 43210).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(
+            port_file.exists(),
+            "refusal must not delete untrusted user data"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rendezvous_collision_preserves_planted_regular_files_and_hardlinks() {
+        let root = tempfile::tempdir().expect("fixture directory");
+        let directory = root.path().join("private");
+        let _pin = secure_windows_runtime_directory(&directory).unwrap();
+        let victim = directory.join("victim");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        let destination = directory.join("daemon.sock");
+        for hardlink in [false, true] {
+            let staged = directory.join(if hardlink {
+                "hardlink.tmp"
+            } else {
+                "regular.tmp"
+            });
+            if hardlink {
+                std::fs::hard_link(&victim, &staged).unwrap();
+            } else {
+                std::fs::write(&staged, b"unchanged").unwrap();
+            }
+            assert!(write_private_rendezvous_at(&destination, &staged, b"43210\n").is_err());
+            assert_eq!(std::fs::read(&staged).unwrap(), b"unchanged");
+            assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+            assert!(!destination.exists());
+        }
     }
 
     #[test]

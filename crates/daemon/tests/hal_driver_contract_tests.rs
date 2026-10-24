@@ -246,14 +246,15 @@ fn swift_consumes_daemon_initiated_config_requests() {
     let state_body = function_body(&source, "final class DriverState");
 
     assert!(
-        state_body.contains("sharedAudio.configChanged()")
-            && state_body.contains("sharedAudio.configSource() == 2"),
+        state_body.contains("sharedAudio.configurationSnapshot()")
+            && state_body.contains("snapshot.pending, snapshot.source == 2"),
         "Swift HAL must poll daemon-initiated config changes"
     );
     assert!(
-        state_body.contains("getRequestedSampleRate()")
-            && state_body.contains("getRequestedBufferFrames()"),
-        "Swift HAL must read requested daemon config values"
+        state_body.contains("let requestedRate = snapshot.sampleRate")
+            && state_body.contains("let requestedFrames = snapshot.bufferFrames")
+            && state_body.contains("let requestID = snapshot.requestID"),
+        "Swift HAL must consume one identified daemon configuration snapshot"
     );
     assert!(
         state_body.contains("acknowledgeConfigChange("),
@@ -290,8 +291,8 @@ fn swift_daemon_config_requests_go_through_coreaudio_reconfiguration() {
         "HAL must ask CoreAudio to quiesce IO before applying daemon-requested format changes"
     );
     assert!(
-        performer.contains("performPendingDaemonConfigChange()"),
-        "daemon-requested config must be applied from PerformDeviceConfigurationChange"
+        performer.contains("performPendingDaemonConfigChange(requestID: changeAction)"),
+        "CoreAudio must return the retained request identity when applying configuration"
     );
 }
 
@@ -471,12 +472,12 @@ fn swift_shared_memory_is_open_only_for_restricted_hal_process() {
 }
 
 #[test]
-fn swift_shared_memory_protocol_matches_rust_v7_configuring_handshake() {
+fn swift_shared_memory_protocol_matches_rust_v8_configuring_handshake() {
     let source = read_repo_file("sotf-systemwide/swift/driver-hal/Sources/SharedMemory.swift");
 
     assert!(
-        source.contains("private let kSharedMemoryVersion: UInt32 = 7"),
-        "Swift shared-memory protocol version must match Rust v7"
+        source.contains("private let kSharedMemoryVersion: UInt32 = 8"),
+        "Swift shared-memory protocol version must match Rust v8"
     );
     assert!(
         source.contains("var volumeScalarBits: UInt32")
@@ -484,6 +485,16 @@ fn swift_shared_memory_protocol_matches_rust_v7_configuring_handshake() {
             && source.contains("var volumeGeneration: UInt32"),
         "Swift SharedAudioHeader must mirror the Rust v7 volume fields"
     );
+    for field in [
+        "var controlLock: UInt32",
+        "var actualChannelCount: UInt32",
+        "var configRequestID: UInt64",
+        "var configAckID: UInt64",
+        "var volumeState: UInt64",
+        "var ringGeneration: UInt64",
+    ] {
+        assert!(source.contains(field), "missing v8 control field: {field}");
+    }
     assert!(
         source.contains("var configuring: UInt32"),
         "Swift SharedAudioHeader must include the Rust v5 configuring field"
@@ -503,6 +514,20 @@ fn swift_shared_memory_protocol_matches_rust_v7_configuring_handshake() {
             && source.contains("tryAcquireIOCommit"),
         "HAL write/config paths must observe the daemon configuring bitset"
     );
+}
+
+#[test]
+fn production_swift_attachment_requires_an_immutable_descriptor() {
+    let source = read_repo_file("sotf-systemwide/swift/driver-hal/Sources/SharedMemory.swift");
+    let descriptor =
+        read_repo_file("sotf-systemwide/swift/driver-hal/Sources/SharedMemoryDescriptor.h");
+    assert!(source.contains("sotf_receive_memory_descriptor"));
+    assert!(source.contains("#if SOTF_HAL_TESTING"));
+    assert!(source.contains("refusing a truncatable audio file"));
+    assert!(descriptor.contains("getpeereid(socket_fd"));
+    assert!(descriptor.contains("sotf_validate_memory_descriptor(received_fd"));
+    assert!(descriptor.contains("ftruncate(fd, info.st_size)"));
+    assert!(descriptor.contains("MSG_CTRUNC"));
 }
 
 #[test]
@@ -707,10 +732,14 @@ fn swift_maintenance_uses_mapping_generation_handoff_for_active_clients() {
     let state = function_body(&source, "final class DriverState");
     let handoff = function_body(&source, "func handoffStaleSharedAudioMappingIfNeeded");
     let io_body = function_body(&source, "private func driverDoIOOperation");
+    let initialize = function_body(&source, "func initializeSharedAudio");
 
     assert!(
         state.contains("private let sharedAudioSlots = [SharedAudioBuffer(), SharedAudioBuffer()]")
-            && handoff.contains("sotf_atomic_store_u32(&activeSharedAudioSlot")
+            && handoff.contains("publishSlot: replacementSlot")
+            && initialize.contains("sotf_atomic_store_u32(&activeSharedAudioSlot")
+            && initialize.contains("volumeLock.lock()")
+            && initialize.contains("initialVolumeScalar: _volumeScalar")
             && handoff.contains("sotf_cipher_try_write(&sharedAudioSlot0Readers)")
             && handoff.contains("sotf_cipher_end_write(&sharedAudioSlot0Readers)"),
         "maintenance must prepare and atomically publish an inactive mmap generation"
@@ -778,7 +807,7 @@ fn swift_hal_supports_daemon_requested_channel_counts_up_to_32() {
         "Swift HAL should allow channel configurations up to 32"
     );
     assert!(
-        config_handler.contains("let requestedChannels = sharedAudio.getRequestedChannelCount()")
+        config_handler.contains("let requestedChannels = snapshot.channelCount")
             && config_handler
                 .contains("requestedChannels >= 1 && requestedChannels <= kMaxChannelCount"),
         "daemon-initiated config validation should include channel count"
@@ -797,7 +826,8 @@ fn swift_hal_supports_daemon_requested_channel_counts_up_to_32() {
         "shared-memory config negotiation should carry pending channel geometry"
     );
     assert!(
-        initialize.contains("memorySize = Int(statBuf.st_size)")
+        initialize.contains("memorySize = Int(length)")
+            && initialize.contains("sotf_receive_memory_descriptor")
             && initialize.contains("closeSharedMemory()"),
         "Swift shared memory should map the daemon-sized capacity so later channel growth can fit"
     );

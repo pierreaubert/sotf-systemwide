@@ -138,7 +138,7 @@ fn daemon_load_plugins_carries_hal_input_channels() {
         "load_plugins should carry requested HAL input channels into driver config"
     );
     assert!(
-        source.contains("start_driver_playback_with_source(")
+        source.contains("start_driver_playback_with_graph_and_source(")
             && source.contains("plan.spec.input_channels"),
         "driver playback should be restarted with the resolved HAL input channel count"
     );

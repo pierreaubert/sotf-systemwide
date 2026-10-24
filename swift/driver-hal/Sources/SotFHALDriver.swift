@@ -209,14 +209,23 @@ private let kSupportedSampleRates: [Float64] = [44100.0, 48000.0, 88200.0, 96000
 private let kDefaultChannelCount: UInt32 = 2
 private let kMaxChannelCount: UInt32 = 32
 private let kZeroTimeStampPeriod: UInt32 = 16_384
-private let kDaemonConfigChangeAction: UInt64 = 0x53434647  // 'SCFG'
 
 // MARK: - Driver State
 
 private struct PendingDaemonConfig {
+    let requestID: UInt64
     let sampleRate: UInt32
     let bufferFrames: UInt32
     let channelCount: UInt32
+}
+
+private struct PendingConfigurationAck: Equatable {
+    let requestID: UInt64
+    let sampleRate: UInt32
+    let bufferFrames: UInt32
+    let channelCount: UInt32
+    let status: UInt32
+    let errorCode: UInt32
 }
 
 private struct PendingHostConfig: Equatable {
@@ -342,6 +351,9 @@ final class DriverState {
         volumeLock.unlock()
         clearPendingHostConfiguration()
         clearPendingDaemonConfig()
+        configAckLock.lock()
+        pendingConfigurationAck = nil
+        configAckLock.unlock()
         EncryptionKeyManager.shared.reloadFromCurrentEnvironment()
         transportSessionPath = nextPath
         requestedSessionPath = nil
@@ -403,8 +415,11 @@ final class DriverState {
     private let configurationLock = NSLock()
     private var pendingHostConfig: PendingHostConfig?
     private var hostConfigRequestSent = false
+    private var hostConfigRequestID: UInt64 = 0
     private let pendingDaemonConfigLock = NSLock()
     private var pendingDaemonConfig: PendingDaemonConfig?
+    private let configAckLock = NSLock()
+    private var pendingConfigurationAck: PendingConfigurationAck?
     private let objectLifecycleLock = NSLock()
     private var deviceObjectCreated = false
     private var observedStreamObjects = Set<AudioObjectID>()
@@ -433,18 +448,16 @@ final class DriverState {
         volumeLock.lock()
         if let scalar { _volumeScalar = clampVolumeScalar(scalar) }
         if let muted { _outputMuted = muted }
-        let current = (_volumeScalar, _outputMuted)
-
         let lease = acquireSharedAudioForCallback()
-        let generation = lease.buffer.setOutputVolume(
-            scalarBits: current.0.bitPattern,
-            muted: current.1
-        )
+        let published = lease.buffer.patchOutputVolume(scalarBits: scalar.map { clampVolumeScalar($0).bitPattern }, muted: muted)
         finishSharedAudioCallback(slot: lease.slot)
-
-        if generation != 0 {
-            _publishedVolumeGeneration = generation
+        if let published {
+            _volumeScalar = Float32(bitPattern: published.scalarBits)
+            _outputMuted = published.muted
+            _publishedVolumeGeneration = published.generation
         }
+        let current = (_volumeScalar, _outputMuted)
+        let generation = published?.generation ?? 0
         volumeLock.unlock()
         notifyVolumePropertiesChanged()
         halLog("[VOLUME] scalar=\(current.0) muted=\(current.1) generation=\(generation)")
@@ -485,6 +498,28 @@ final class DriverState {
         notifyPropertyChanged(objectID: kMuteControlObjectID, selector: kSelector_BooleanValue)
     }
 
+    /// Restore cached volume before publishing a fresh daemon mapping.
+    /// This control-thread lock also serializes media-key updates with slot publication.
+    func initializeSharedAudio(
+        _ audio: SharedAudioBuffer, sampleRate: UInt32, bufferFrames: UInt32,
+        channelCount: UInt32, publishSlot: UInt32? = nil
+    ) -> Bool {
+        volumeLock.lock()
+        defer { volumeLock.unlock() }
+        let initialized = audio.initialize(
+            sampleRate: sampleRate, bufferFrames: bufferFrames, channelCount: channelCount,
+            initialVolumeScalar: _volumeScalar, initialMuted: _outputMuted
+        )
+        if initialized {
+            let volume = audio.outputVolume()
+            _volumeScalar = Float32(bitPattern: volume.scalarBits)
+            _outputMuted = volume.muted
+            _publishedVolumeGeneration = volume.generation
+        }
+        if let publishSlot { sotf_atomic_store_u32(&activeSharedAudioSlot, publishSlot) }
+        return initialized
+    }
+
     /// Attempt to re-initialise shared memory if we're not connected.
     /// Throttled to one call per second. Safe to call from any thread.
     func attemptInitRetryIfNeeded() {
@@ -510,7 +545,7 @@ final class DriverState {
         }
         halLog("[RETRY] sharedAudio not connected, attempting re-initialise")
         let configuration = activeConfiguration()
-        let ok = sharedAudio.initialize(
+        let ok = initializeSharedAudio(sharedAudio,
             sampleRate: UInt32(configuration.sampleRate),
             bufferFrames: configuration.bufferFrames,
             channelCount: configuration.channelCount
@@ -558,12 +593,11 @@ final class DriverState {
         let replacement = sharedAudioSlots[Int(replacementSlot)]
         replacement.closeSharedMemory()
         let configuration = activeConfiguration()
-        _ = replacement.initialize(
+        _ = initializeSharedAudio(replacement,
             sampleRate: UInt32(configuration.sampleRate),
             bufferFrames: configuration.bufferFrames,
-            channelCount: configuration.channelCount
+            channelCount: configuration.channelCount, publishSlot: replacementSlot
         )
-        sotf_atomic_store_u32(&activeSharedAudioSlot, replacementSlot)
         halLog("[MAINT] published shared-memory mapping generation \(replacementSlot)")
         return true
     }
@@ -592,6 +626,7 @@ final class DriverState {
 
         if sharedAudio.isConnected {
             sharedAudio.setActive(isRunning)
+            flushConfigurationAcknowledgement(sharedAudio: sharedAudio)
             publishPendingHostConfigurationIfNeeded()
             handleHostConfigAcknowledgementIfNeeded()
             handleDaemonConfigRequestIfNeeded()
@@ -609,17 +644,19 @@ final class DriverState {
         )
     }
 
-    private func pendingHostConfiguration() -> (PendingHostConfig, Bool)? {
+    private func pendingHostConfiguration() -> (PendingHostConfig, Bool, UInt64)? {
         configurationLock.lock()
         defer { configurationLock.unlock() }
         guard let pendingHostConfig else { return nil }
-        return (pendingHostConfig, hostConfigRequestSent)
+        return (pendingHostConfig, hostConfigRequestSent, hostConfigRequestID)
     }
 
-    private func clearPendingHostConfiguration() {
+    private func clearPendingHostConfiguration(expectedID: UInt64? = nil) {
         configurationLock.lock()
+        if let expectedID, hostConfigRequestID != expectedID { configurationLock.unlock(); return }
         pendingHostConfig = nil
         hostConfigRequestSent = false
+        hostConfigRequestID = 0
         configurationLock.unlock()
     }
 
@@ -628,18 +665,19 @@ final class DriverState {
         let sharedAudio = lease.buffer
         defer { finishSharedAudioCallback(slot: lease.slot) }
 
-        guard let (pending, requestSent) = pendingHostConfiguration(), !requestSent else {
+        guard let (pending, requestSent, _) = pendingHostConfiguration(), !requestSent else {
             return
         }
 
         // A daemon-originated transition owns the shared header until its
         // CoreAudio callback completes. Do not overwrite that request with a
         // host-originated one while it is still pending.
-        if sharedAudio.configChanged(), sharedAudio.configSource() == 2 {
+        guard let snapshot = sharedAudio.configurationSnapshot() else { return }
+        if snapshot.pending && snapshot.source == 2 {
             return
         }
 
-        guard sharedAudio.requestConfigChange(
+        guard let requestID = sharedAudio.requestConfigChangeWithID(
             sampleRate: pending.sampleRate,
             bufferFrames: pending.bufferFrames,
             channelCount: pending.channelCount
@@ -650,6 +688,7 @@ final class DriverState {
         configurationLock.lock()
         if self.pendingHostConfig == pending {
             hostConfigRequestSent = true
+            hostConfigRequestID = requestID
         }
         configurationLock.unlock()
     }
@@ -659,39 +698,31 @@ final class DriverState {
         let sharedAudio = lease.buffer
         defer { finishSharedAudioCallback(slot: lease.slot) }
 
-        guard let (pending, requestSent) = pendingHostConfiguration(), requestSent else {
+        guard let (_, requestSent, requestID) = pendingHostConfiguration(), requestSent else {
             return
         }
-        guard sharedAudio.configSource() == 1 else { return }
-
-        let status = sharedAudio.getConfigStatus()
-        guard status != 0 else { return }
-
-        guard status == 1 || status == 2 else {
-            halLog("[CONFIG] HAL configuration rejected: status=\(status), error=\(sharedAudio.getConfigErrorCode())")
-            clearPendingHostConfiguration()
+        guard let snapshot = sharedAudio.configurationSnapshot() else { return }
+        if snapshot.requestID != requestID || snapshot.source != 1 {
+            clearPendingHostConfiguration(expectedID: requestID)
             return
         }
-
-        let actualSampleRate = sharedAudio.getActualSampleRate() == 0
-            ? pending.sampleRate
-            : sharedAudio.getActualSampleRate()
-        let actualBufferFrames = sharedAudio.getActualBufferFrames() == 0
-            ? pending.bufferFrames
-            : sharedAudio.getActualBufferFrames()
+        guard snapshot.status != 0 else { return }
+        guard snapshot.status == 1 || snapshot.status == 2 else {
+            halLog("[CONFIG] HAL configuration rejected: status=\(snapshot.status), error=\(snapshot.errorCode)")
+            clearPendingHostConfiguration(expectedID: requestID)
+            return
+        }
+        let actualSampleRate = snapshot.actualSampleRate
+        let actualBufferFrames = snapshot.actualBufferFrames
+        let actualChannelCount = snapshot.actualChannelCount
         guard kSupportedSampleRates.contains(Float64(actualSampleRate)),
-              actualBufferFrames >= 64,
-              actualBufferFrames <= 4096 else {
-            halLog("[CONFIG] HAL configuration acknowledgment contained invalid actual geometry")
-            sharedAudio.setConfigStatus(3)
-            clearPendingHostConfiguration()
+              actualBufferFrames >= 64, actualBufferFrames <= 4096,
+              actualChannelCount >= 1, actualChannelCount <= kMaxChannelCount else {
+            clearPendingHostConfiguration(expectedID: requestID)
             return
         }
-        let negotiated = PendingHostConfig(
-            sampleRate: actualSampleRate,
-            bufferFrames: actualBufferFrames,
-            channelCount: pending.channelCount
-        )
+        let negotiated = PendingHostConfig(sampleRate: actualSampleRate, bufferFrames: actualBufferFrames,
+                                           channelCount: actualChannelCount)
 
         guard sharedAudio.applyActiveConfiguration(
             sampleRate: negotiated.sampleRate,
@@ -702,9 +733,10 @@ final class DriverState {
             // request. The daemon has already observed its acknowledgement;
             // publishing an error here makes the local failure visible to
             // status readers without pretending the new geometry is active.
-            sharedAudio.setConfigStatus(3)
+            _ = publishConfigurationAcknowledgement(sharedAudio: sharedAudio, requestID: requestID, actualSampleRate: UInt32(sampleRate),
+                actualBufferFrames: bufferFrameSize, actualChannelCount: channelCount, status: 3, errorCode: 4)
             halLog("[CONFIG] HAL configuration acknowledged but could not be applied locally")
-            clearPendingHostConfiguration()
+            clearPendingHostConfiguration(expectedID: requestID)
             return
         }
 
@@ -715,7 +747,7 @@ final class DriverState {
                 channelCount: negotiated.channelCount
             )
         )
-        clearPendingHostConfiguration()
+        clearPendingHostConfiguration(expectedID: requestID)
         halLog("[CONFIG] Applied acknowledged HAL configuration: \(negotiated.sampleRate)Hz, \(negotiated.bufferFrames) frames, \(negotiated.channelCount) channels")
         notifyConfigurationPropertiesChanged()
     }
@@ -743,6 +775,7 @@ final class DriverState {
         }
         pendingHostConfig = candidate
         hostConfigRequestSent = false
+        hostConfigRequestID = 0
         configurationLock.unlock()
 
         publishPendingHostConfigurationIfNeeded()
@@ -772,57 +805,90 @@ final class DriverState {
         notifyPropertyChanged(objectID: kOutputStreamObjectID, selector: kSelector_AvailablePhysicalFmts)
     }
 
+    /// Retain a resolved configuration until the bounded shared gate permits publication.
+    @discardableResult
+    func publishConfigurationAcknowledgement(sharedAudio: SharedAudioBuffer, requestID: UInt64,
+        actualSampleRate: UInt32, actualBufferFrames: UInt32, actualChannelCount: UInt32,
+        status: UInt32, errorCode: UInt32) -> Bool {
+        configAckLock.lock()
+        defer { configAckLock.unlock() }
+        let published = sharedAudio.acknowledgeConfigChange(requestID: requestID,
+            actualSampleRate: actualSampleRate, actualBufferFrames: actualBufferFrames,
+            actualChannelCount: actualChannelCount, status: status, errorCode: errorCode)
+        if published {
+            pendingConfigurationAck = nil
+        } else if sharedAudio.configurationSnapshot().map({ $0.requestID == requestID }) ?? true {
+            pendingConfigurationAck = PendingConfigurationAck(requestID: requestID, sampleRate: actualSampleRate,
+                bufferFrames: actualBufferFrames, channelCount: actualChannelCount, status: status, errorCode: errorCode)
+        }
+        return published
+    }
+
+    func flushConfigurationAcknowledgement(sharedAudio: SharedAudioBuffer) {
+        configAckLock.lock()
+        defer { configAckLock.unlock() }
+        guard let pending = pendingConfigurationAck else { return }
+        if sharedAudio.acknowledgeConfigChange(requestID: pending.requestID, actualSampleRate: pending.sampleRate,
+            actualBufferFrames: pending.bufferFrames, actualChannelCount: pending.channelCount,
+            status: pending.status, errorCode: pending.errorCode)
+            || sharedAudio.configurationSnapshot().map({ $0.requestID != pending.requestID }) == true {
+            pendingConfigurationAck = nil
+        }
+    }
+
     private func handleDaemonConfigRequestIfNeeded() {
         let lease = acquireSharedAudioForCallback()
         let sharedAudio = lease.buffer
         defer { finishSharedAudioCallback(slot: lease.slot) }
 
-        guard sharedAudio.configChanged(), sharedAudio.configSource() == 2 else {
-            return
-        }
-
-        let requestedRate = sharedAudio.getRequestedSampleRate()
-        let requestedFrames = sharedAudio.getRequestedBufferFrames()
-        let requestedChannels = sharedAudio.getRequestedChannelCount()
+        guard let snapshot = sharedAudio.configurationSnapshot(), snapshot.pending, snapshot.source == 2 else { return }
+        let requestID = snapshot.requestID
+        let requestedRate = snapshot.sampleRate
+        let requestedFrames = snapshot.bufferFrames
+        let requestedChannels = snapshot.channelCount
 
         guard kSupportedSampleRates.contains(Float64(requestedRate)),
               requestedFrames >= 64 && requestedFrames <= 4096,
               requestedChannels >= 1 && requestedChannels <= kMaxChannelCount else {
             halLog("[CONFIG] Rejected daemon config request: \(requestedRate)Hz, \(requestedFrames) frames, \(requestedChannels) channels")
-            sharedAudio.acknowledgeConfigChange(
+            publishConfigurationAcknowledgement(sharedAudio: sharedAudio,
+                requestID: requestID,
                 actualSampleRate: UInt32(sampleRate),
                 actualBufferFrames: bufferFrameSize,
+                actualChannelCount: channelCount,
                 status: 3,
                 errorCode: 1
             )
             return
         }
 
-        requestDaemonConfigChange(sampleRate: requestedRate, bufferFrames: requestedFrames, channelCount: requestedChannels)
+        requestDaemonConfigChange(requestID: requestID, sampleRate: requestedRate, bufferFrames: requestedFrames, channelCount: requestedChannels)
     }
 
-    private func requestDaemonConfigChange(sampleRate requestedRate: UInt32, bufferFrames requestedFrames: UInt32, channelCount requestedChannels: UInt32) {
+    private func requestDaemonConfigChange(requestID: UInt64, sampleRate requestedRate: UInt32, bufferFrames requestedFrames: UInt32, channelCount requestedChannels: UInt32) {
         let lease = acquireSharedAudioForCallback()
         let sharedAudio = lease.buffer
         defer { finishSharedAudioCallback(slot: lease.slot) }
 
         pendingDaemonConfigLock.lock()
         if let pending = pendingDaemonConfig {
-            let sameRequest = pending.sampleRate == requestedRate && pending.bufferFrames == requestedFrames && pending.channelCount == requestedChannels
+            let sameRequest = pending.requestID == requestID
             pendingDaemonConfigLock.unlock()
             if !sameRequest {
                 halLog("[CONFIG] Ignoring daemon config request while another change is pending: \(requestedRate)Hz, \(requestedFrames) frames, \(requestedChannels) channels")
             }
             return
         }
-        pendingDaemonConfig = PendingDaemonConfig(sampleRate: requestedRate, bufferFrames: requestedFrames, channelCount: requestedChannels)
+        pendingDaemonConfig = PendingDaemonConfig(requestID: requestID, sampleRate: requestedRate, bufferFrames: requestedFrames, channelCount: requestedChannels)
         pendingDaemonConfigLock.unlock()
 
         guard let host = host else {
             clearPendingDaemonConfig()
-            sharedAudio.acknowledgeConfigChange(
+            publishConfigurationAcknowledgement(sharedAudio: sharedAudio,
+                requestID: requestID,
                 actualSampleRate: UInt32(sampleRate),
                 actualBufferFrames: bufferFrameSize,
+                actualChannelCount: channelCount,
                 status: 3,
                 errorCode: 2
             )
@@ -833,14 +899,16 @@ final class DriverState {
         let status = host.pointee.RequestDeviceConfigurationChange(
             host,
             kDeviceObjectID,
-            kDaemonConfigChangeAction,
+            requestID,
             nil
         )
         if status != noErr {
             clearPendingDaemonConfig()
-            sharedAudio.acknowledgeConfigChange(
+            publishConfigurationAcknowledgement(sharedAudio: sharedAudio,
+                requestID: requestID,
                 actualSampleRate: UInt32(sampleRate),
                 actualBufferFrames: bufferFrameSize,
+                actualChannelCount: channelCount,
                 status: 3,
                 errorCode: UInt32(bitPattern: status)
             )
@@ -857,19 +925,20 @@ final class DriverState {
         pendingDaemonConfigLock.unlock()
     }
 
-    func performPendingDaemonConfigChange() -> Bool {
+    func performPendingDaemonConfigChange(requestID: UInt64) -> Bool {
         let lease = acquireSharedAudioForCallback()
         let sharedAudio = lease.buffer
         defer { finishSharedAudioCallback(slot: lease.slot) }
 
         pendingDaemonConfigLock.lock()
-        guard let pending = pendingDaemonConfig else {
+        guard let pending = pendingDaemonConfig, pending.requestID == requestID else {
             pendingDaemonConfigLock.unlock()
             return false
         }
         pendingDaemonConfig = nil
         pendingDaemonConfigLock.unlock()
 
+        guard sharedAudio.configurationSnapshot()?.requestID == requestID else { return false }
         let configuration = ActiveDriverConfiguration(
             sampleRate: Float64(pending.sampleRate),
             bufferFrames: pending.bufferFrames,
@@ -881,9 +950,11 @@ final class DriverState {
             channelCount: pending.channelCount
         ) else {
             let active = activeConfiguration()
-            sharedAudio.acknowledgeConfigChange(
+            publishConfigurationAcknowledgement(sharedAudio: sharedAudio,
+                requestID: requestID,
                 actualSampleRate: UInt32(active.sampleRate),
                 actualBufferFrames: active.bufferFrames,
+                actualChannelCount: active.channelCount,
                 status: 3,
                 errorCode: 4
             )
@@ -892,9 +963,11 @@ final class DriverState {
         }
 
         commitActiveConfiguration(configuration)
-        sharedAudio.acknowledgeConfigChange(
+        publishConfigurationAcknowledgement(sharedAudio: sharedAudio,
+                requestID: requestID,
             actualSampleRate: pending.sampleRate,
             actualBufferFrames: pending.bufferFrames,
+            actualChannelCount: pending.channelCount,
             status: 1,
             errorCode: 0
         )
@@ -970,15 +1043,20 @@ final class DriverState {
         }
     }
 
-    func abortPendingDaemonConfigChange() {
+    func abortPendingDaemonConfigChange(requestID: UInt64) {
         let lease = acquireSharedAudioForCallback()
         let sharedAudio = lease.buffer
         defer { finishSharedAudioCallback(slot: lease.slot) }
 
-        clearPendingDaemonConfig()
-        sharedAudio.acknowledgeConfigChange(
+        pendingDaemonConfigLock.lock()
+        guard pendingDaemonConfig?.requestID == requestID else { pendingDaemonConfigLock.unlock(); return }
+        pendingDaemonConfig = nil
+        pendingDaemonConfigLock.unlock()
+        publishConfigurationAcknowledgement(sharedAudio: sharedAudio,
+            requestID: requestID,
             actualSampleRate: UInt32(sampleRate),
             actualBufferFrames: bufferFrameSize,
+            actualChannelCount: channelCount,
             status: 3,
             errorCode: 3
         )
@@ -1092,7 +1170,7 @@ private func driverInitialize(
     // Initialize shared memory for Rust engine communication
     halLog("Initializing SharedMemory: sampleRate=\(configuration.sampleRate), bufferFrames=\(configuration.bufferFrames), channels=\(configuration.channelCount)")
 
-    let success = state.sharedAudio.initialize(
+    let success = state.initializeSharedAudio(state.sharedAudio,
         sampleRate: UInt32(configuration.sampleRate),
         bufferFrames: configuration.bufferFrames,
         channelCount: configuration.channelCount
@@ -1156,8 +1234,8 @@ private func driverRemoveDeviceClient(_ driver: AudioServerPlugInDriverRef, _ de
 
 private func driverPerformDeviceConfigurationChange(_ driver: AudioServerPlugInDriverRef, _ deviceObjectID: AudioObjectID, _ changeAction: UInt64, _ changeInfo: UnsafeMutableRawPointer?) -> OSStatus {
     halLog("PerformDeviceConfigurationChange: device=\(deviceObjectID) action=\(changeAction)")
-    if changeAction == kDaemonConfigChangeAction {
-        if !DriverState.shared.performPendingDaemonConfigChange() {
+    if deviceObjectID == kDeviceObjectID {
+        if !DriverState.shared.performPendingDaemonConfigChange(requestID: changeAction) {
             halLog("[CONFIG] PerformDeviceConfigurationChange had no pending daemon config")
         }
     }
@@ -1166,8 +1244,8 @@ private func driverPerformDeviceConfigurationChange(_ driver: AudioServerPlugInD
 
 private func driverAbortDeviceConfigurationChange(_ driver: AudioServerPlugInDriverRef, _ deviceObjectID: AudioObjectID, _ changeAction: UInt64, _ changeInfo: UnsafeMutableRawPointer?) -> OSStatus {
     halLog("AbortDeviceConfigurationChange: device=\(deviceObjectID)")
-    if changeAction == kDaemonConfigChangeAction {
-        DriverState.shared.abortPendingDaemonConfigChange()
+    if deviceObjectID == kDeviceObjectID {
+        DriverState.shared.abortPendingDaemonConfigChange(requestID: changeAction)
     }
     return noErr
 }
@@ -2344,3 +2422,41 @@ public func SotFHALDriverFactory(_ allocator: CFAllocator?, _ requestedTypeUUID:
     // Return the stable pointer-to-pointer (not &gDriverInterfacePtr which is temporary!)
     return UnsafeMutableRawPointer(gDriverRef!)
 }
+
+#if SOTF_HAL_TESTING
+// Test-build access to the exact callback entry point; no installed driver needed.
+func testInvokeHALCallback(write: Bool, frames: UInt32, main: UnsafeMutableRawPointer,
+                           secondary: UnsafeMutableRawPointer? = nil) -> OSStatus {
+    var unusedDriver: UnsafeMutablePointer<AudioServerPlugInDriverInterface>? = nil
+    var cycle = AudioServerPlugInIOCycleInfo()
+    return withUnsafeMutablePointer(to: &unusedDriver) { driver in
+        withUnsafePointer(to: &cycle) { info in
+            driverDoIOOperation(driver, kDeviceObjectID,
+                write ? kOutputStreamObjectID : kInputStreamObjectID, 1,
+                write ? kIOOperation_WriteMix : kIOOperation_ReadInput,
+                frames, info, main, secondary)
+        }
+    }
+}
+
+func testHALZeroTimestampPeriod() -> UInt32 { kZeroTimeStampPeriod }
+
+func testInvokeHALTimestamp() -> (status: OSStatus, sample: Float64, host: UInt64, seed: UInt64) {
+    var unusedDriver: UnsafeMutablePointer<AudioServerPlugInDriverInterface>? = nil
+    var sample: Float64 = 0
+    var host: UInt64 = 0
+    var seed: UInt64 = 0
+    let status = withUnsafeMutablePointer(to: &unusedDriver) { driver in
+        driverGetZeroTimeStamp(driver, kDeviceObjectID, 1, &sample, &host, &seed)
+    }
+    return (status, sample, host, seed)
+}
+
+extension DriverState {
+    func testPrepareHALCallbackGeometry(sampleRate: UInt32, frames: UInt32, channels: UInt32) {
+        commitActiveConfiguration(ActiveDriverConfiguration(sampleRate: Float64(sampleRate),
+            bufferFrames: frames, channelCount: channels))
+        sotf_atomic_store_u32(&callbackSessionEnabled, 1)
+    }
+}
+#endif

@@ -55,6 +55,36 @@ use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 
 #[test]
+fn debounce_retains_latest_request_identity_even_when_geometry_matches() {
+    let start = std::time::Instant::now();
+    let config = DriverConfig::new(48_000, 512, 2);
+    let first = driver_common::DriverConfigRequest {
+        request_id: 10,
+        config,
+    };
+    let latest = driver_common::DriverConfigRequest {
+        request_id: 11,
+        config,
+    };
+    let mut debouncer = ConfigChangeDebouncer::new();
+    assert_eq!(debouncer.observe_request(start, Some(first), 1), None);
+    let replacement = start + ConfigChangeDebouncer::DEBOUNCE;
+    assert_eq!(
+        debouncer.observe_request(replacement, Some(latest), 1),
+        None
+    );
+    assert_eq!(
+        debouncer.observe_request(replacement + ConfigChangeDebouncer::DEBOUNCE, None, 1),
+        Some(latest)
+    );
+    assert_eq!(debouncer.observe_request(start, Some(first), 2), None);
+    assert_eq!(
+        debouncer.observe_request(start + ConfigChangeDebouncer::DEBOUNCE, None, 3),
+        None
+    );
+}
+
+#[test]
 fn progress_tracks_stages_and_distinguishes_stall_from_delayed_observation() {
     let started = std::time::Instant::now();
     let mut progress = PlaybackProgress::default();
@@ -67,20 +97,59 @@ fn progress_tracks_stages_and_distinguishes_stall_from_delayed_observation() {
     progress.observe(flowing, 1, true, &engine);
     for stage in 0..3 {
         assert_eq!(
-            progress.status(flowing, 1, engine.playback_epoch, stage),
+            progress.status(
+                flowing,
+                1,
+                engine.playback_epoch,
+                engine.playback_output_generation,
+                stage
+            ),
             "fresh"
         );
     }
     let later = started + std::time::Duration::from_secs(8);
     assert_eq!(
-        progress.status(later, 1, engine.playback_epoch, 1),
+        progress.status(
+            later,
+            1,
+            engine.playback_epoch,
+            engine.playback_output_generation,
+            1
+        ),
         "observation_delayed"
     );
     engine.playback_callback_count += 1;
     progress.observe(later, 1, true, &engine);
-    assert_eq!(progress.status(later, 1, engine.playback_epoch, 0), "stale");
-    assert_eq!(progress.status(later, 1, engine.playback_epoch, 1), "fresh");
-    assert_eq!(progress.status(later, 1, engine.playback_epoch, 2), "stale");
+    assert_eq!(
+        progress.status(
+            later,
+            1,
+            engine.playback_epoch,
+            engine.playback_output_generation,
+            0
+        ),
+        "stale"
+    );
+    assert_eq!(
+        progress.status(
+            later,
+            1,
+            engine.playback_epoch,
+            engine.playback_output_generation,
+            1
+        ),
+        "fresh"
+    );
+    assert_eq!(
+        progress.status(
+            later,
+            1,
+            engine.playback_epoch,
+            engine.playback_output_generation,
+            2
+        ),
+        "stale"
+    );
 }
 
 #[test]
@@ -91,31 +160,107 @@ fn progress_cannot_reuse_prior_pause_generation_or_stream_epoch_activity() {
     progress.observe(now, 1, true, &engine);
     engine.playback_callback_count = 10;
     progress.observe(now, 1, true, &engine);
-    assert_eq!(progress.status(now, 1, engine.playback_epoch, 1), "fresh");
+    assert_eq!(
+        progress.status(
+            now,
+            1,
+            engine.playback_epoch,
+            engine.playback_output_generation,
+            1
+        ),
+        "fresh"
+    );
     progress.observe(now, 1, false, &engine);
     progress.observe(now, 1, true, &engine);
     assert_eq!(
-        progress.status(now, 1, engine.playback_epoch, 1),
+        progress.status(
+            now,
+            1,
+            engine.playback_epoch,
+            engine.playback_output_generation,
+            1
+        ),
         "awaiting_progress"
     );
     progress.observe(now, 2, true, &engine);
     assert_eq!(
-        progress.status(now, 1, engine.playback_epoch, 1),
+        progress.status(
+            now,
+            1,
+            engine.playback_epoch,
+            engine.playback_output_generation,
+            1
+        ),
         "unobserved_generation"
     );
     assert_eq!(
-        progress.status(now, 2, engine.playback_epoch, 1),
+        progress.status(
+            now,
+            2,
+            engine.playback_epoch,
+            engine.playback_output_generation,
+            1
+        ),
         "awaiting_progress"
     );
     engine.playback_epoch += 1;
     progress.observe(now, 2, true, &engine);
     assert_eq!(
-        progress.status(now, 2, engine.playback_epoch, 1),
+        progress.status(
+            now,
+            2,
+            engine.playback_epoch,
+            engine.playback_output_generation,
+            1
+        ),
         "awaiting_progress"
     );
     engine.playback_callback_count += 1;
     progress.observe(now, 2, true, &engine);
-    assert_eq!(progress.status(now, 2, engine.playback_epoch, 1), "fresh");
+    assert_eq!(
+        progress.status(
+            now,
+            2,
+            engine.playback_epoch,
+            engine.playback_output_generation,
+            1
+        ),
+        "fresh"
+    );
+}
+
+#[test]
+fn output_stream_replacement_requires_new_progress_even_if_counters_increase() {
+    let now = std::time::Instant::now();
+    let mut progress = PlaybackProgress::default();
+    let mut engine = sotf_audio::AudioEngineState {
+        playback_output_generation: 10,
+        ..Default::default()
+    };
+    progress.observe(now, 1, true, &engine);
+    engine.playback_callback_count = 10;
+    progress.observe(now, 1, true, &engine);
+    assert_eq!(
+        progress.status(now, 1, engine.playback_epoch, 10, 1),
+        "fresh"
+    );
+    engine.playback_output_generation = 11;
+    engine.playback_callback_count = 100;
+    assert_eq!(
+        progress.status(now, 1, engine.playback_epoch, 11, 1),
+        "unobserved_generation"
+    );
+    progress.observe(now, 1, true, &engine);
+    assert_eq!(
+        progress.status(now, 1, engine.playback_epoch, 11, 1),
+        "awaiting_progress"
+    );
+    engine.playback_callback_count += 1;
+    progress.observe(now, 1, true, &engine);
+    assert_eq!(
+        progress.status(now, 1, engine.playback_epoch, 11, 1),
+        "fresh"
+    );
 }
 
 fn test_plugin(plugin_type: &str) -> PluginConfig {
@@ -1139,6 +1284,7 @@ mod ipc_safety_tests {
             runtime_telemetry: Arc::new(RuntimeTelemetry::default()),
             playback_progress: Arc::new(Mutex::new(PlaybackProgress::default())),
             snapshot_cache: Arc::new(Mutex::new(None)),
+            metering_cache: Arc::new(Mutex::new(None)),
             device_registry: Arc::new(Mutex::new(DeviceRegistry::default())),
             output_profiles: Arc::new(Mutex::new(
                 crate::output_profiles::OutputProfileStore::default(),
@@ -1434,6 +1580,42 @@ mod ipc_safety_tests {
     }
 
     #[test]
+    fn typed_output_incident_blocks_readiness_until_explicit_resolution() {
+        let mut state = sotf_audio::AudioEngineState {
+            playback_callback_count: 50,
+            playback_output_generation: 42,
+            playback_incident: Some(sotf_audio::PlaybackIncident {
+                id: 100,
+                stream_generation: 41,
+                kind: sotf_audio::PlaybackIncidentKind::StreamError,
+                message: "arbitrary localized diagnostic".into(),
+                resolution: None,
+            }),
+            ..Default::default()
+        };
+        assert!(AudioDaemon::playback_startup_observation(&state).is_err());
+        let (transport, faults) =
+            transport_snapshot_and_faults("Playing", &healthy_driver_status(), &state);
+        assert_eq!(transport["output_status"], "output_recovering");
+        assert!(fault_codes(&faults).contains(&"output_stream_incident"));
+        assert_eq!(transport["output"]["incident"]["kind"], "stream_error");
+        state.playback_incident.as_mut().unwrap().resolution =
+            Some(sotf_audio::PlaybackIncidentResolution {
+                output_generation: 42,
+                callback_count: 50,
+            });
+        assert_eq!(AudioDaemon::playback_startup_observation(&state), Ok(true));
+        let (_, faults) =
+            transport_snapshot_and_faults("Playing", &healthy_driver_status(), &state);
+        assert!(!fault_codes(&faults).contains(&"output_stream_incident"));
+        state.playback_output_generation = 43;
+        state.playback_callback_count = 0;
+        assert_eq!(AudioDaemon::playback_startup_observation(&state), Ok(false));
+        state.last_error = Some("decoder failure".into());
+        assert!(AudioDaemon::playback_startup_observation(&state).is_err());
+    }
+
+    #[test]
     fn metering_faults_only_apply_to_playing_fallback_sources() {
         let metering = serde_json::json!({
             "sources": {
@@ -1515,6 +1697,113 @@ mod ipc_safety_tests {
             daemon.snapshot_json()["observation"]["transition_in_progress"],
             false
         );
+    }
+
+    #[test]
+    fn metering_returns_cached_generation_without_waiting_for_transition_owned_locks() {
+        let daemon = test_daemon_with_driver(fake_driver_state());
+        let before = daemon.snapshot_json();
+        let mutation = daemon.pipeline_mutation.lock();
+        let manager = daemon.manager.lock();
+        let mut pipeline = daemon.system_state.lock();
+        let next = pipeline.prepare_plan(Vec::new(), 6, 8, 6).unwrap();
+        pipeline.commit_applied(&next);
+        assert_ne!(
+            serde_json::json!(pipeline.generation()),
+            before["generation"]
+        );
+        let reader = daemon.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || tx.send(reader.handle_get_metering()).unwrap());
+        // Release every held lock before asserting, including on a timeout.
+        let response = rx.recv_timeout(std::time::Duration::from_millis(200));
+        drop(pipeline);
+        drop(manager);
+        drop(mutation);
+        worker.join().unwrap();
+        let metering = response
+            .expect("metering must not wait for transition locks")
+            .data
+            .unwrap();
+        assert_eq!(metering["generation"], before["generation"]);
+        assert_eq!(metering["input"], before["observed"]["metering"]["input"]);
+        assert_eq!(metering["output"], before["observed"]["metering"]["output"]);
+        assert_eq!(
+            metering["sources"],
+            before["observed"]["metering"]["sources"]
+        );
+        assert_eq!(metering["observation"]["transition_in_progress"], true);
+        assert_eq!(metering["observation"]["available"], true);
+        assert!(metering["observation"]["age_ms"].is_u64());
+        let fresh = daemon.handle_get_metering().data.unwrap();
+        assert_eq!(fresh["observation"]["transition_in_progress"], false);
+        assert_eq!(fresh["observation"]["available"], true);
+    }
+
+    #[test]
+    fn metering_uses_its_own_recent_observation_instead_of_an_older_full_snapshot() {
+        let daemon = test_daemon_with_driver(fake_driver_state());
+        let older = daemon.snapshot_json();
+        {
+            let mut pipeline = daemon.system_state.lock();
+            let next = pipeline.prepare_plan(Vec::new(), 6, 8, 6).unwrap();
+            pipeline.commit_applied(&next);
+        }
+        let recent = daemon.handle_get_metering().data.unwrap();
+        assert_ne!(recent["generation"], older["generation"]);
+        assert_eq!(
+            recent["input"]["channel_peaks"].as_array().unwrap().len(),
+            6
+        );
+        let mutation = daemon.pipeline_mutation.lock();
+        let manager = daemon.manager.lock();
+        let pipeline = daemon.system_state.lock();
+        let reader = daemon.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || tx.send(reader.handle_get_metering()).unwrap());
+        let response = rx.recv_timeout(std::time::Duration::from_millis(200));
+        drop(pipeline);
+        drop(manager);
+        drop(mutation);
+        worker.join().unwrap();
+        let cached = response
+            .expect("meter-only clients must retain their own observation")
+            .data
+            .unwrap();
+        assert_eq!(cached["generation"], recent["generation"]);
+        assert_eq!(cached["input"], recent["input"]);
+        assert_eq!(cached["output"], recent["output"]);
+        assert_eq!(cached["observation"]["transition_in_progress"], true);
+        assert_eq!(cached["observation"]["available"], true);
+    }
+
+    #[test]
+    fn metering_without_a_prior_observation_is_explicitly_unavailable_during_transition() {
+        let daemon = test_daemon_with_driver(fake_driver_state());
+        let mutation = daemon.pipeline_mutation.lock();
+        let manager = daemon.manager.lock();
+        let pipeline = daemon.system_state.lock();
+        let reader = daemon.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || tx.send(reader.handle_get_metering()).unwrap());
+        let response = rx.recv_timeout(std::time::Duration::from_millis(200));
+        drop(pipeline);
+        drop(manager);
+        drop(mutation);
+        worker.join().unwrap();
+        let metering = response
+            .expect("unavailable metering must remain responsive")
+            .data
+            .unwrap();
+        assert!(metering["generation"].is_null());
+        assert_eq!(metering["observation"]["transition_in_progress"], true);
+        assert_eq!(metering["observation"]["available"], false);
+        assert!(metering["observation"]["age_ms"].is_null());
+        assert_eq!(
+            metering["input"]["channel_peaks"],
+            serde_json::json!([0.0, 0.0])
+        );
+        assert_eq!(metering["output"]["measurement_valid"], false);
     }
 
     #[test]
@@ -2566,6 +2855,7 @@ mod ipc_safety_tests {
             &daemon.driver_manager,
             &daemon.system_state,
             active_config,
+            0,
             Err("Playback did not reach hardware callback".into()),
         )
         .expect_err("a missing callback must not publish readiness");
@@ -2587,6 +2877,7 @@ mod ipc_safety_tests {
             &daemon.driver_manager,
             &daemon.system_state,
             active_config,
+            0,
             Ok(()),
         )
         .expect("a callback observation should publish readiness");
@@ -2961,6 +3252,185 @@ mod ipc_safety_tests {
 
     #[test]
     #[serial_test::serial]
+    fn named_output_profile_fallback_and_restoration_preserve_actual_pcm() {
+        use super::super::audio_daemon::PipelineApplyIntent;
+        use super::super::misc::{EffectiveOutputDevice, OutputDeviceFallback};
+        use crate::output_profiles::{OutputProfile, OutputProfileStore};
+        use sotf_audio::lab_pcm::TestOutput;
+
+        for (graph_a, graph_b) in [(false, false), (false, true), (true, false), (true, true)] {
+            let daemon = test_daemon_with_driver(fake_driver_state());
+            let directory = tempfile::tempdir().unwrap();
+            let profile_path = directory.path().join("output-profiles.json");
+            *daemon.output_profiles.lock() =
+                OutputProfileStore::load_test_path(profile_path.clone());
+            let output_a = TestOutput::new("Audit Speakers A");
+            let output_b = TestOutput::new("Audit Speakers B");
+            for (output, id, gain, graph) in [
+                (&output_a, "profile-a", -3.0, graph_a),
+                (&output_b, "profile-b", -9.0, graph_b),
+            ] {
+                let profile: OutputProfile = serde_json::from_value(serde_json::json!({
+                    "id": id, "name": id, "topology": if graph { "graph" } else { "rack" },
+                    "plugins": if graph { serde_json::json!([]) } else {
+                        serde_json::json!([{"plugin_type":"gain","parameters":{"gain_db":gain}}])
+                    },
+                    "graph": if graph { serde_json::json!({
+                        "nodes":[{"id":7,"plugin_type":"gain","parameters":{"gain_db":gain},"input_channels":2}],
+                        "edges":[]
+                    }) } else { Value::Null },
+                    "input_channels":2, "output_channels":2, "updated_at_unix_ms":0
+                })).unwrap();
+                assert!(daemon.handle_set_output_profile(profile).success);
+                assert!(
+                    daemon
+                        .handle_assign_output_profile(None, output.name(), id)
+                        .success
+                );
+            }
+            let saved = |store: &OutputProfileStore, name: &str| {
+                serde_json::to_value(store.assigned_profile_for_name(name).unwrap()).unwrap()
+            };
+            let original_a = saved(&daemon.output_profiles.lock(), output_a.name());
+            let original_b = saved(&daemon.output_profiles.lock(), output_b.name());
+            daemon
+                .output_profiles
+                .lock()
+                .record_route(None, output_a.name(), "profile-a")
+                .unwrap();
+            daemon
+                .system_state
+                .lock()
+                .set_desired_output_device(Some(output_a.name().to_owned()))
+                .unwrap();
+            daemon.manager.lock().set_volume(0.5).unwrap();
+
+            let mut observations = Vec::new();
+            for (index, output, gain, profile_id) in [
+                (0, &output_a, -3.0f32, "profile-a"),
+                (1, &output_b, -9.0f32, "profile-b"),
+                (2, &output_a, -3.0f32, "profile-a"),
+            ] {
+                daemon.driver_manager.lock().set_test_output(output.clone());
+                // Supply the resolved device decision and its capabilities.
+                // Actual engine creation, profile recall, DSP and PCM remain real.
+                daemon.device_registry.lock().seed_negotiated_sample_rate(
+                    output.name(),
+                    48_000,
+                    48_000,
+                );
+                let plan = {
+                    let state = daemon.system_state.lock();
+                    if index == 0 {
+                        let profile = daemon
+                            .output_profiles
+                            .lock()
+                            .assigned_profile_for_name(output_a.name())
+                            .unwrap();
+                        AudioDaemon::prepare_profile_plan(
+                            &state,
+                            state.desired_spec(),
+                            &profile,
+                            None,
+                        )
+                        .unwrap()
+                    } else {
+                        state.prepare_from_spec(state.desired_spec(), 2).unwrap()
+                    }
+                };
+                let probe = output.probe();
+                probe.arm();
+                let response = daemon.apply_pipeline_plan_for_output(
+                    plan,
+                    48_000,
+                    512,
+                    if index == 0 {
+                        PipelineApplyIntent::SelectRoute
+                    } else {
+                        PipelineApplyIntent::RebuildOutput
+                    },
+                    EffectiveOutputDevice {
+                        device: Some(output.name().to_owned()),
+                        fallback: (index == 1).then(|| OutputDeviceFallback {
+                            desired: output_a.name().to_owned(),
+                            applied: output_b.name().to_owned(),
+                        }),
+                    },
+                );
+                assert!(response.success, "{response:?}");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while probe.snapshot().unwrap().signal_frames < 6144 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "route {index} produced no signal"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let window = probe.disarm().unwrap();
+                let expected =
+                    [0.03125, 0.0625].map(|sample| sample * 10.0f32.powf(gain / 20.0) * 0.5);
+                assert_eq!(window.channels, 2);
+                assert_eq!(window.invalid, 0);
+                assert_eq!(
+                    window.silent_after_signal_frames, 0,
+                    "silence after signal: {window:?}"
+                );
+                for channel in 0..2 {
+                    assert_eq!(
+                        window.nonzero_samples[channel], window.signal_frames,
+                        "missing channel: {window:?}"
+                    );
+                    assert!(
+                        (window.nonzero_minimum[channel] - expected[channel]).abs() < 0.00001
+                            && (window.maximum[channel] - expected[channel]).abs() < 0.00001,
+                        "wrong PCM on route {index}, graph A={graph_a} B={graph_b}: {window:?}; expected {expected:?}"
+                    );
+                }
+                let state = daemon.system_state.lock();
+                assert_eq!(
+                    state.applied_output_device().as_deref(),
+                    Some(output.name())
+                );
+                assert_eq!(
+                    state.selected_output_device().as_deref(),
+                    Some(output_a.name())
+                );
+                drop(state);
+                assert_eq!(
+                    daemon.output_profiles.lock().current().0.as_deref(),
+                    Some(profile_id)
+                );
+                let engine = daemon.manager.lock().get_engine_state();
+                assert_eq!(
+                    engine.playback_output_device.as_deref(),
+                    Some(output.name())
+                );
+                assert_eq!(engine.playback_output_generation, window.last_generation);
+                assert_eq!(window.first_generation, window.last_generation);
+                assert!(Arc::ptr_eq(&probe, engine.lab_pcm_probe.as_ref().unwrap()));
+                observations.push(serde_json::json!({
+                    "route": output.name(), "profile": profile_id, "expected":expected,
+                    "nonzero_minimum": &window.nonzero_minimum[..2], "maximum": &window.maximum[..2],
+                    "leading_silent_frames": window.leading_silent_frames,
+                    "silent_after_signal_frames": window.silent_after_signal_frames,
+                    "signal_frames": window.signal_frames, "output_generation":window.last_generation,
+                }));
+            }
+            daemon.manager.lock().stop().unwrap();
+            let reloaded = OutputProfileStore::load_test_path(profile_path);
+            assert_eq!(saved(&reloaded, output_a.name()), original_a);
+            assert_eq!(saved(&reloaded, output_b.name()), original_b);
+            println!(
+                "PCM_PROFILE_EVIDENCE {}",
+                serde_json::json!({
+                    "graph_a":graph_a,"graph_b":graph_b,"observations":observations,"persisted_profiles_unchanged":true,
+                })
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn apply_configuration_binds_incoming_profile_before_saving_live_chain() {
         let daemon = test_daemon_with_driver(fake_driver_state());
         for (id, gain) in [("outgoing", -3.0), ("incoming", -9.0)] {
@@ -3027,7 +3497,7 @@ mod ipc_safety_tests {
     #[test]
     #[serial_test::serial]
     fn explicit_capture_samples_reach_both_monitors_through_gain_processing() {
-        for native_rate in [48_000, 32_000] {
+        for native_rate in [8_000, 32_000, 44_100, 48_000, 96_000, 192_000] {
             let state = fake_driver_state();
             state.lock().status.sample_rate = native_rate;
             let daemon = test_daemon_with_driver(state);
@@ -3078,6 +3548,129 @@ mod ipc_safety_tests {
             );
             daemon.manager.lock().stop().unwrap();
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn healthy_pipeline_reapply_preserves_every_output_sample_without_mute_commands() {
+        let driver = fake_driver_state();
+        let daemon = test_daemon_with_driver(Arc::clone(&driver));
+        let loaded = daemon.handle_command(Command::LoadPlugins {
+            plugins: vec![PluginConfig::new(
+                "gain",
+                serde_json::json!({"gain_db": -6.0}),
+            )],
+            input_channels: 2,
+            output_channels: 2,
+        });
+        assert!(loaded.success, "{loaded:?}");
+        daemon.manager.lock().set_volume(0.5).unwrap();
+        let probe = daemon
+            .manager
+            .lock()
+            .get_engine_state()
+            .lab_pcm_probe
+            .unwrap();
+        let expected = [0.03125, 0.0625].map(|sample| sample * 10.0f32.powf(-6.0 / 20.0) * 0.5);
+        let matches = |window: &sotf_audio::lab_pcm::LabPcmSnapshot| {
+            window.channels == 2
+                && window.invalid == 0
+                && (0..2).all(|channel| {
+                    (window.minimum[channel] - expected[channel]).abs() < 0.00001
+                        && (window.maximum[channel] - expected[channel]).abs() < 0.00001
+                })
+        };
+        // Startup prefill and the deliberate startup volume ramp are outside the
+        // healthy reapply interval. Require a complete stable window first.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            probe.arm();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let window = probe.snapshot().unwrap();
+            let _ = daemon.handle_command(Command::Status);
+            let observed = daemon.manager.lock().get_engine_state();
+            if window.blocks >= 4
+                && matches(&window)
+                && observed.playback_callback_count > 0
+                && observed.playback_frames_received > 0
+                && observed.playback_frames_written > 0
+                && daemon.driver_manager.lock().readiness_is_current()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "output never became stable: {window:?}"
+            );
+        }
+        let before = daemon.manager.lock().get_engine_state();
+        let generation = daemon.system_state.lock().generation();
+        let plan = {
+            let state = daemon.system_state.lock();
+            state
+                .prepare_from_spec(state.applied_spec().unwrap(), 2)
+                .unwrap()
+        };
+        let requests = driver.lock().requested_configs.len();
+        let mute_requests = probe.mute_requests();
+        probe.arm();
+        // Call the transaction entry point so the test exercises its early
+        // return before ReconfigurationMuteGuard, not the plugin hot-update path.
+        for _ in 0..8 {
+            let status = driver.lock().status.clone();
+            let response = daemon.apply_pipeline_plan(plan.clone(), status, 48_000, 512);
+            assert!(response.success, "{response:?}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while probe.snapshot().unwrap().blocks < 12 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "output stopped during reapply"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let window = probe.disarm().unwrap();
+        let after = daemon.manager.lock().get_engine_state();
+        let mute_requests_after = probe.mute_requests();
+        daemon.manager.lock().stop().unwrap();
+        assert_eq!(
+            mute_requests_after, mute_requests,
+            "a healthy no-op emitted a mute command"
+        );
+        assert!(
+            matches(&window),
+            "reapply changed or interrupted post-volume PCM: {window:?}"
+        );
+        assert!(window.frames >= 12 * 512);
+        assert_eq!(window.first_generation, before.playback_output_generation);
+        assert_eq!(window.last_generation, before.playback_output_generation);
+        assert_eq!(
+            after.playback_output_generation,
+            before.playback_output_generation
+        );
+        assert_eq!(after.playback_epoch, before.playback_epoch);
+        assert_eq!(daemon.system_state.lock().generation(), generation);
+        assert_eq!(driver.lock().requested_configs.len(), requests);
+        assert!(Arc::ptr_eq(&probe, after.lab_pcm_probe.as_ref().unwrap()));
+        println!(
+            "PCM_NOOP_EVIDENCE {}",
+            serde_json::json!({
+                "reapply_count": 8,
+                "channels": window.channels,
+                "frames": window.frames,
+                "blocks": window.blocks,
+                "minimum": &window.minimum[..window.channels],
+                "maximum": &window.maximum[..window.channels],
+                "expected": expected,
+                "invalid": window.invalid,
+                "mute_requests_before": mute_requests,
+                "mute_requests_after": mute_requests_after,
+                "output_generation": window.first_generation,
+                "pipeline_generation": generation,
+                "same_engine": Arc::ptr_eq(&probe, after.lab_pcm_probe.as_ref().unwrap()),
+            })
+        );
     }
 
     #[test]
@@ -4704,6 +5297,7 @@ mod command_roundtrip_tests {
             runtime_telemetry: Arc::new(RuntimeTelemetry::default()),
             playback_progress: Arc::new(Mutex::new(PlaybackProgress::default())),
             snapshot_cache: Arc::new(Mutex::new(None)),
+            metering_cache: Arc::new(Mutex::new(None)),
             device_registry: Arc::new(Mutex::new(DeviceRegistry::default())),
             output_profiles: Arc::new(Mutex::new(
                 crate::output_profiles::OutputProfileStore::default(),

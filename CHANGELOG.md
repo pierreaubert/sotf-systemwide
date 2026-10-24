@@ -6,6 +6,70 @@ release is recorded here.
 
 ## Unreleased
 
+- Apply owner-only Windows security descriptors when creating runtime directories
+  and both IPC rendezvous files. Validate port files before connecting, bound
+  reads, and preserve planted staging entries on exclusive-creation failure.
+- Add a native Windows lab component gate and a portable capture measurement
+  runner with complete-matrix, observer and source-provenance validation.
+
+- Preserve the HAL sequence fixture's synthetic consumer-clock phase across
+  scheduler oversleep. Retain partial read/verification/wait diagnostics on
+  timeout, with the existing sample workload and liveness bounds unchanged.
+
+- Remove duplicate decoder pacing for explicit capture sources. Add a release
+  source-to-sink latency benchmark with exact sample/channel verification and
+  raw monotonic timestamps. Preserve the simulated output sample clock when
+  its feeder wakes late, with bounded catch-up work.
+
+- Keep the HAL callback benchmark's simulated daemon heartbeat fresh outside
+  measured callbacks. Verify that missing/expired heartbeats suppress capture
+  and a fresh heartbeat restores it without reopening the mapping.
+
+- Expand Swift/Rust sequence verification to 108 rate/block/channel/encryption
+  and load cases, checking every accepted sample across 32 ring lengths per
+  case. Require acknowledged control churn and complete geometry reports.
+
+- Keep meter polling responsive during reconfiguration and volume changes by
+  returning complete, generation-tagged cached observations with explicit age
+  and availability. Add release IPC latency/load measurements to native gates.
+
+- Install the selected driver graph before capture starts. This prevents a
+  monitor-only bootstrap/crossfade from briefly leaking the wrong gain during
+  graph-profile fallback or restoration. Verify distinct A/B outputs against
+  startup PCM and persisted rack/graph profiles through the lab backend.
+  Commit driver-source activation before reporting `Playing` to direct callers.
+
+- Verify healthy pipeline reapply against every post-volume lab output sample
+  and mute-command count, using a shared-engine observer gated by `test-util`.
+
+- Remove CPAL callback-thread lock-tracking allocations with a control-initialized
+  capture mutex. Preserve bounded frame handling and discard poisoned partial
+  frames. Add native cold-thread allocation measurements to macOS/Linux gates.
+
+- Extend the release HAL gate to actual audio/timestamp callback allocation,
+  free and wall/thread-CPU observations across rates/channel widths. Keep probe
+  code out of production bundles and report host deadline outliers explicitly.
+
+- Add reproducible release transport allocation/timing measurements with source
+  hashes and concurrent volume/configuration-error churn (`just bench-hal-transport`).
+
+- Reconcile output recovery through typed incidents and explicit callback-proven
+  resolution. Reject retired-stream metadata/statistics and withdraw readiness
+  while an output incident is active, preserving unrelated fatal failures.
+- Coordinated HAL protocol v8 across Rust and Swift: identified request/ACK
+  publication, actual negotiated channels, retained ACK retries, and one atomic
+  volume/mute tuple with independent control patches. HAL and daemon require a
+  matching protocol update.
+- Replace file-backed audio mappings with immutable Darwin shared-memory
+  objects and authenticated descriptor handoff. Truncating `audio.shm` now
+  invalidates its rendezvous without revoking mapped audio pages. Preserve HAL
+  cached volume across daemon replacement before readiness is published.
+- Fence staged decrypted samples with a ring identity across same-format resets,
+  geometry A→B→A and encryption changes. Publish encryption and optional queue
+  flush together under the existing IO barrier.
+- Fixed live capture resampling to emit DSP blocks within the negotiated frame
+  limit. Added shipping-direction Swift/Rust sequence stress for plaintext and
+  encrypted audio, and corrected cross-workspace worker paths in the Swift gate.
 - Hardened Swift HAL mapping validation, full-ring ownership, cipher
   publication, and timestamp snapshots. Added malformed-mapping, held-reader,
   concurrent key-rotation, and clock-update regressions, including TSan runs.

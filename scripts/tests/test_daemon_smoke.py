@@ -62,6 +62,35 @@ def _status(
 
 
 class ClassifyTests(unittest.TestCase):
+    def test_active_output_incident_cannot_pass_from_an_applied_route(self) -> None:
+        status = _status(applied="Mac mini Speakers", state="Playing")
+        status["playback_incident"] = {
+            "id": 100,
+            "stream_generation": 41,
+            "kind": "stream_error",
+            "message": "arbitrary localized diagnostic",
+            "resolution": None,
+        }
+        class_, detail = daemon_smoke.classify(status, None)
+        self.assertEqual(class_, "settling")
+        self.assertIn("stream_error", detail)
+
+    def test_resolved_output_incident_is_history_and_does_not_hide_fatal_error(self) -> None:
+        status = _status(applied="Mac mini Speakers", state="Playing")
+        status["playback_incident"] = {
+            "id": 100,
+            "stream_generation": 41,
+            "kind": "stream_error",
+            "message": "arbitrary localized diagnostic",
+            "resolution": {"output_generation": 42, "callback_count": 9},
+        }
+        class_, _ = daemon_smoke.classify(status, None)
+        self.assertEqual(class_, "healthy")
+        status["last_error"] = "decoder failed"
+        class_, detail = daemon_smoke.classify(status, None)
+        self.assertEqual(class_, "fault")
+        self.assertIn("decoder failed", detail)
+
     def test_healthy_when_applied_with_no_latch(self) -> None:
         class_, detail = daemon_smoke.classify(
             _status(applied="Mac mini Speakers"), {"Mac mini Speakers"}

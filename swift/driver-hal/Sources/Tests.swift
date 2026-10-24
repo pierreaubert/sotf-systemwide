@@ -71,8 +71,12 @@ final class HALDriverTests {
             ("testRingBufferConcurrentSPSC", testRingBufferConcurrentSPSC),
             ("testSharedAudioHeaderLayout", testSharedAudioHeaderLayout),
             ("testVolumeConversionAndSharedRoundTrip", testVolumeConversionAndSharedRoundTrip),
+            ("testHALCallbackHonorsDaemonHeartbeat", testHALCallbackHonorsDaemonHeartbeat),
             ("testSampleRateRequestRemainsTransactional", testSampleRateRequestRemainsTransactional),
             ("testCrossProcessReconfigurationProtocol", testCrossProcessReconfigurationProtocol),
+            ("testSwiftProducerRustConsumerSequence", testSwiftProducerRustConsumerSequence),
+            ("testCrossProcessControlPublication", testCrossProcessControlPublication),
+            ("testImmutableDescriptorHandoff", testImmutableDescriptorHandoff),
             ("testGeometryCacheSurvivesDaemonRestart", testGeometryCacheSurvivesDaemonRestart),
             ("testMappingValidationAndReaderOwnership", testMappingValidationAndReaderOwnership),
             ("testEncryptionRoundTrip", testEncryptionRoundTrip),
@@ -86,19 +90,775 @@ final class HALDriverTests {
             ("testConsoleSessionRetiresMappingKeyAndLoopback", testConsoleSessionRetiresMappingKeyAndLoopback),
             ("testSharedMemoryEncryptedRealtimeRoundTrips", testSharedMemoryEncryptedRealtimeRoundTrips),
         ]
+        #if SOTF_HAL_ALLOCATION_PROBE
+        let selectedTests = [("testHALCallbackAllocationAndTiming", testHALCallbackAllocationAndTiming)] + tests
+        #else
+        let selectedTests = tests
+        #endif
         var failed = 0
-        for (name, test) in tests {
+        for (name, test) in selectedTests {
             let passed = test()
             print("\(passed ? "PASS" : "FAIL"): \(name)")
             if !passed { failed += 1 }
         }
-        print("HAL tests: \(tests.count - failed) passed, \(failed) failed, \(tests.count) total")
+        print("HAL tests: \(selectedTests.count - failed) passed, \(failed) failed, \(selectedTests.count) total")
         return failed == 0
+    }
+
+    #if SOTF_HAL_ALLOCATION_PROBE
+    private final class CallbackAllocationCanary { let value: UInt64 = 123 }
+
+    /// Measure the actual WriteMix/ReadInput entry points, including lease and loopback work.
+    static func testHALCallbackAllocationAndTiming() -> Bool {
+        guard let metricsDirectory = ProcessInfo.processInfo.environment["SOTF_HAL_METRICS_DIR"] else { return false }
+        let clockCanary = sotf_test_thread_cpu_ns()
+        guard clockCanary != UInt64.max else { print("thread CPU clock unavailable"); return false }
+        // Test the interposer through Swift's native allocator before accepting zero counts.
+        sotf_test_allocation_begin()
+        let canary = UnsafeMutableRawPointer.allocate(byteCount: 4096, alignment: 64)
+        canary.storeBytes(of: UInt64(123), as: UInt64.self)
+        sotf_test_escape_pointer(canary)
+        let object = Unmanaged.passRetained(CallbackAllocationCanary())
+        sotf_test_escape_pointer(object.toOpaque())
+        object.release()
+        canary.deallocate()
+        let canaryCounts = sotf_test_allocation_end()
+        guard canaryCounts.allocations >= 2, canaryCounts.deallocations >= 2 else {
+            print("FAIL: Swift allocation observer did not observe the canary")
+            return false
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("callback-\(UUID())")
+        let path = root.appendingPathComponent("audio.shm")
+        let keyPath = root.appendingPathComponent("session.key")
+        let keys = ["SOTF_HAL_SHARED_MEMORY_PATH", "SOTF_HAL_SESSION_KEY_PATH"]
+        let previous = keys.map { ProcessInfo.processInfo.environment[$0] }
+        let state = DriverState.shared
+        state.host = nil
+        let controlStorm = ProcessInfo.processInfo.environment["SOTF_HAL_MEASUREMENT_STORM"] != nil
+        defer {
+            state.sharedAudio.closeSharedMemory()
+            state.clock.stop()
+            state.testPrepareHALCallbackGeometry(sampleRate: 48_000, frames: 512, channels: 2)
+            for (key, value) in zip(keys, previous) {
+                if let value { setenv(key, value, 1) } else { unsetenv(key) }
+            }
+            EncryptionKeyManager.shared.reloadFromCurrentEnvironment()
+            try? FileManager.default.removeItem(at: root)
+        }
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
+                                                   attributes: [.posixPermissions: 0o700])
+            let key = (0..<32).map { UInt8($0) }
+            try Data(key).write(to: keyPath)
+            chmod(keyPath.path, 0o600)
+            setenv(keys[0], path.path, 1)
+            setenv(keys[1], keyPath.path, 1)
+            EncryptionKeyManager.shared.reloadFromCurrentEnvironment()
+            var reports = [[String: Any]]()
+            let count = 2_000
+            for rate: UInt32 in [48_000, 192_000] {
+                for channels in [1, 2, 6, 8, 16, 32] {
+                    for frames in [64, 512] {
+                        for encrypted in [false, true] {
+                            for useSecondary in [false, true] {
+                                for ready in [false, true] {
+                                    state.sharedAudio.closeSharedMemory()
+                                    var header = transportFixtureHeader()
+                                    header.sampleRate = rate
+                                    header.bufferFrames = UInt32(frames)
+                                    header.channelCount = UInt32(channels)
+                                    header.engineReady = ready ? 1 : 0
+                                    header.daemonHeartbeatMs = UInt64(Date().timeIntervalSince1970 * 1000)
+                                    header.encrypted = encrypted ? 1 : 0
+                                    header.keyFingerprint = AudioCipher(keyBytes: key).getFingerprint().reduce(0) {
+                                        ($0 << 8) | UInt64($1)
+                                    }
+                                    let aligned = (MemoryLayout<SharedAudioHeader>.size + 63) & ~63
+                                    var bytes = Data(count: aligned + frames * channels * 32 * MemoryLayout<Float32>.size)
+                                    withUnsafeBytes(of: &header) { bytes.replaceSubrange(0..<$0.count, with: $0) }
+                                    try bytes.write(to: path)
+                                    chmod(path.path, 0o600)
+                                    state.testPrepareHALCallbackGeometry(sampleRate: rate,
+                                        frames: UInt32(frames), channels: UInt32(channels))
+                                    guard state.initializeSharedAudio(state.sharedAudio, sampleRate: rate,
+                                        bufferFrames: UInt32(frames), channelCount: UInt32(channels)) else { print("callback attach failed"); return false }
+                                    state.clock.start(sampleRate: Float64(rate))
+                                    state.loopbackEnabled = true
+                                    let stop = UnsafeMutablePointer<UInt32>.allocate(capacity: 1)
+                                    let stormUpdates = UnsafeMutablePointer<UInt64>.allocate(capacity: 1)
+                                    stop.initialize(to: 0); stormUpdates.initialize(to: 0)
+                                    let controlGroup = DispatchGroup()
+                                    defer {
+                                        sotf_atomic_store_u32(stop, 1)
+                                        controlGroup.wait()
+                                        stop.deallocate(); stormUpdates.deallocate()
+                                    }
+                                    if controlStorm {
+                                        DispatchQueue.global().async(group: controlGroup) {
+                                            while sotf_atomic_load_u32(stop) == 0 {
+                                                state.clock.setSampleRate(sotf_atomic_load_u64(stormUpdates) % 2 == 0 ? 48_000 : 192_000)
+                                                state.commitOutputVolume(scalar: 0.375, muted: true)
+                                                if let id = state.sharedAudio.requestConfigChangeWithID(sampleRate: rate,
+                                                    bufferFrames: UInt32(frames), channelCount: UInt32(channels)) {
+                                                    _ = state.sharedAudio.acknowledgeConfigChange(requestID: id,
+                                                        actualSampleRate: rate, actualBufferFrames: UInt32(frames),
+                                                        actualChannelCount: UInt32(channels), status: 3, errorCode: 1)
+                                                }
+                                                _ = sotf_atomic_fetch_add_u64_previous(stormUpdates, 1)
+                                                usleep(50)
+                                            }
+                                        }
+                                        let deadline = Date().addingTimeInterval(2)
+                                        while sotf_atomic_load_u64(stormUpdates) == 0 && Date() < deadline { usleep(50) }
+                                        guard sotf_atomic_load_u64(stormUpdates) > 0 else { return false }
+                                    }
+                                    let samples = frames * channels
+                                    let main = UnsafeMutablePointer<Float32>.allocate(capacity: samples)
+                                    let secondary = UnsafeMutablePointer<Float32>.allocate(capacity: samples)
+                                    let output = UnsafeMutablePointer<Float32>.allocate(capacity: samples)
+                                    defer { main.deallocate(); secondary.deallocate(); output.deallocate() }
+                                    main.initialize(repeating: useSecondary ? 0 : 0.25, count: samples)
+                                    secondary.initialize(repeating: 0.25, count: samples)
+                                    output.initialize(repeating: 0, count: samples)
+                                    var writeTimes = [UInt64](), readTimes = [UInt64](), timestampTimes = [UInt64]()
+                                    writeTimes.reserveCapacity(count); readTimes.reserveCapacity(count); timestampTimes.reserveCapacity(count)
+                                    var writeCPU = [UInt64](), readCPU = [UInt64](), timestampCPU = [UInt64]()
+                                    writeCPU.reserveCapacity(count); readCPU.reserveCapacity(count); timestampCPU.reserveCapacity(count)
+                                    var allocations: UInt64 = 0, deallocations: UInt64 = 0
+                                    for iteration in 0..<(count + 32) {
+                                        // This fixture has no daemon worker. Keep its
+                                        // liveness premise fresh outside measured IO;
+                                        // a stale heartbeat must still suppress IO.
+                                        state.sharedAudio.testSetDaemonHeartbeat(
+                                            clock_gettime_nsec_np(CLOCK_REALTIME) / 1_000_000)
+                                        let writeCPUStart = sotf_test_thread_cpu_ns()
+                                        let writeStart = DispatchTime.now().uptimeNanoseconds
+                                        sotf_test_allocation_begin()
+                                        let writeStatus = testInvokeHALCallback(write: true, frames: UInt32(frames),
+                                            main: UnsafeMutableRawPointer(main),
+                                            secondary: useSecondary ? UnsafeMutableRawPointer(secondary) : nil)
+                                        let writeCounts = sotf_test_allocation_end()
+                                        let writeElapsed = DispatchTime.now().uptimeNanoseconds - writeStart
+                                        let writeCPUEnd = sotf_test_thread_cpu_ns()
+                                        let readCPUStart = sotf_test_thread_cpu_ns()
+                                        let readStart = DispatchTime.now().uptimeNanoseconds
+                                        sotf_test_allocation_begin()
+                                        let readStatus = testInvokeHALCallback(write: false, frames: UInt32(frames),
+                                            main: UnsafeMutableRawPointer(output))
+                                        let readCounts = sotf_test_allocation_end()
+                                        let readElapsed = DispatchTime.now().uptimeNanoseconds - readStart
+                                        let readCPUEnd = sotf_test_thread_cpu_ns()
+                                        let timestampCPUStart = sotf_test_thread_cpu_ns()
+                                        let timestampStart = DispatchTime.now().uptimeNanoseconds
+                                        sotf_test_allocation_begin()
+                                        let stamp = testInvokeHALTimestamp()
+                                        let timestampCounts = sotf_test_allocation_end()
+                                        let timestampElapsed = DispatchTime.now().uptimeNanoseconds - timestampStart
+                                        let timestampCPUEnd = sotf_test_thread_cpu_ns()
+                                        guard writeCPUStart != UInt64.max, writeCPUEnd != UInt64.max,
+                                              readCPUStart != UInt64.max, readCPUEnd != UInt64.max,
+                                              timestampCPUStart != UInt64.max, timestampCPUEnd != UInt64.max else {
+                                            print("thread CPU clock failed during measurement")
+                                            return false
+                                        }
+                                        guard stamp.status == noErr, stamp.sample.isFinite, stamp.host > 0, stamp.seed > 0 else {
+                                            print("timestamp callback returned \(stamp)")
+                                            return false
+                                        }
+                                        guard writeStatus == noErr, readStatus == noErr else { print("callback status \(writeStatus)/\(readStatus)"); return false }
+                                        // Include first-call allocations in the verdict; warmup is excluded only from timing.
+                                        allocations += writeCounts.allocations + readCounts.allocations + timestampCounts.allocations
+                                        deallocations += writeCounts.deallocations + readCounts.deallocations + timestampCounts.deallocations
+                                        for index in 0..<samples where output[index] != 0.25 { print("loopback mismatch at \(iteration): \(output[index])"); return false }
+                                        let received = state.sharedAudio.readAudio(output,
+                                            frameCount: frames, channelCount: channels)
+                                        guard received == (ready ? frames : 0) else {
+                                            print("transport count mismatch at \(iteration): \(received), \(rate)Hz/\(frames)/\(channels)ch encrypted=\(encrypted) secondary=\(useSecondary) ready=\(ready) storm=\(controlStorm): \(state.sharedAudio.connectionStateDebug)")
+                                            return false
+                                        }
+                                        if ready {
+                                            for index in 0..<samples where output[index] != 0.25 { print("transport sample mismatch"); return false }
+                                        }
+                                        if iteration >= 32 {
+                                            writeTimes.append(writeElapsed); readTimes.append(readElapsed); timestampTimes.append(timestampElapsed)
+                                            writeCPU.append(writeCPUEnd - writeCPUStart)
+                                            readCPU.append(readCPUEnd - readCPUStart)
+                                            timestampCPU.append(timestampCPUEnd - timestampCPUStart)
+                                        }
+                                    }
+                                    sotf_atomic_store_u32(stop, 1)
+                                    controlGroup.wait()
+                                    guard allocations == 0, deallocations == 0 else {
+                                        print("FAIL: callback \(channels)ch/\(frames) encrypted=\(encrypted) secondary=\(useSecondary) ready=\(ready): \(allocations) allocations, \(deallocations) frees")
+                                        return false
+                                    }
+                                    for (operation, timings, cpuTimings) in [("WriteMix", writeTimes, writeCPU),
+                                        ("ReadInput", readTimes, readCPU), ("GetZeroTimeStamp", timestampTimes, timestampCPU)] {
+                                        let sorted = timings.sorted()
+                                        let sortedCPU = cpuTimings.sorted()
+                                        let period = operation == "GetZeroTimeStamp" ? Int(testHALZeroTimestampPeriod()) : frames
+                                        reports.append(["operation": operation, "sample_rate": rate, "channels": channels, "frames": frames,
+                                            "encrypted": encrypted, "secondary": useSecondary, "engine_ready": ready,
+                                            "calls": sorted.count, "warmup_calls": 32,
+                                            "control_storm_updates": sotf_atomic_load_u64(stormUpdates),
+                                            "observed_calls_over_buffer_period": sorted.filter {
+                                                $0 > UInt64(period) * 1_000_000_000 / UInt64(rate)
+                                            }.count,
+                                            "allocation_calls_including_warmup": allocations,
+                                            "deallocation_calls_including_warmup": deallocations,
+                                            "p50_ns": sorted[(sorted.count + 1) / 2 - 1],
+                                            "p95_ns": sorted[(sorted.count * 95 + 99) / 100 - 1],
+                                            "p99_ns": sorted[(sorted.count * 99 + 99) / 100 - 1],
+                                            "max_ns": sorted.last!,
+                                            "thread_cpu_p50_ns": sortedCPU[(sortedCPU.count + 1) / 2 - 1],
+                                            "thread_cpu_p95_ns": sortedCPU[(sortedCPU.count * 95 + 99) / 100 - 1],
+                                            "thread_cpu_p99_ns": sortedCPU[(sortedCPU.count * 99 + 99) / 100 - 1],
+                                            "thread_cpu_max_ns": sortedCPU.last!,
+                                            "observed_cpu_intervals_over_period": sortedCPU.filter {
+                                                $0 > UInt64(period) * 1_000_000_000 / UInt64(rate)
+                                            }.count,
+                                            "comparison_period_frames": period,
+                                            "comparison_period_ns": UInt64(period) * 1_000_000_000 / UInt64(rate)])
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let report: [String: Any] = ["scope": "actual driverDoIOOperation/driverGetZeroTimeStamp, host fixture, malloc-family interposer",
+                "thread_cpu_clock": "CLOCK_THREAD_CPUTIME_ID; interval includes observer/timer/clock overhead",
+                "observer_canary_allocations": canaryCounts.allocations,
+                "observer_canary_deallocations": canaryCounts.deallocations, "cases": reports]
+            let data = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys, .prettyPrinted])
+            try data.write(to: URL(fileURLWithPath: metricsDirectory).appendingPathComponent("swift-hal-callbacks.json"))
+            print("HAL callback allocation/timing: \(reports.count) cases, no allocations or frees")
+            return true
+        } catch { print("Callback fixture failed: \(error)"); return false }
+    }
+    #endif
+
+    /// A live mapping alone must not admit audio from an expired daemon session.
+    static func testHALCallbackHonorsDaemonHeartbeat() -> Bool {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("heartbeat-\(UUID())")
+        let path = root.appendingPathComponent("audio.shm")
+        let oldPath = ProcessInfo.processInfo.environment["SOTF_HAL_SHARED_MEMORY_PATH"]
+        let state = DriverState.shared
+        let oldLoopback = state.loopbackEnabled
+        state.host = nil
+        defer {
+            state.sharedAudio.closeSharedMemory()
+            state.clock.stop()
+            state.loopbackEnabled = oldLoopback
+            state.testPrepareHALCallbackGeometry(sampleRate: 48_000, frames: 512, channels: 2)
+            if let oldPath { setenv("SOTF_HAL_SHARED_MEMORY_PATH", oldPath, 1) }
+            else { unsetenv("SOTF_HAL_SHARED_MEMORY_PATH") }
+            try? FileManager.default.removeItem(at: root)
+        }
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            var header = transportFixtureHeader()
+            let aligned = (MemoryLayout<SharedAudioHeader>.size + 63) & ~63
+            var bytes = Data(count: aligned + 64 * 2 * 8 * MemoryLayout<Float>.size)
+            withUnsafeBytes(of: &header) { bytes.replaceSubrange(0..<$0.count, with: $0) }
+            try bytes.write(to: path)
+            chmod(path.path, 0o600)
+            setenv("SOTF_HAL_SHARED_MEMORY_PATH", path.path, 1)
+            state.testPrepareHALCallbackGeometry(sampleRate: 48_000, frames: 64, channels: 2)
+            guard state.initializeSharedAudio(state.sharedAudio, sampleRate: 48_000,
+                bufferFrames: 64, channelCount: 2) else { return false }
+            var input = [Float32](repeating: 0.25, count: 128)
+            var output = [Float32](repeating: 0, count: 128)
+            // Repeat expiry and recovery without changing the mapping, geometry
+            // or engineReady flag. Timestamps avoid slow or timing-sensitive sleeps.
+            for heartbeatAge in [UInt64.max, 4_000, 0, 4_000, 0] {
+                let now = clock_gettime_nsec_np(CLOCK_REALTIME) / 1_000_000
+                state.sharedAudio.testSetDaemonHeartbeat(heartbeatAge == UInt64.max ? 0 : now - heartbeatAge)
+                let live = heartbeatAge == 0
+                guard state.sharedAudio.isConnected, state.sharedAudio.engineReady == live else {
+                    print("heartbeat readiness mismatch: \(state.sharedAudio.connectionStateDebug)")
+                    return false
+                }
+                let status = input.withUnsafeMutableBytes {
+                    testInvokeHALCallback(write: true, frames: 64, main: $0.baseAddress!)
+                }
+                let received = output.withUnsafeMutableBufferPointer {
+                    state.sharedAudio.readAudio($0.baseAddress!, frameCount: 64, channelCount: 2)
+                }
+                guard status == noErr, received == (live ? 64 : 0),
+                      !live || output.allSatisfy({ $0 == 0.25 }) else {
+                    print("heartbeat audio admission mismatch: live=\(live), received=\(received)")
+                    return false
+                }
+            }
+            return true
+        } catch {
+            print("heartbeat fixture failed: \(error)")
+            return false
+        }
+    }
+
+    /// Exercise the production capture direction, including a full ring before
+    /// the Rust consumer starts. Every accepted sample must arrive exactly once.
+    static func testSwiftProducerRustConsumerSequence() -> Bool {
+        guard let worker = ProcessInfo.processInfo.environment["SOTF_RUST_HAL_CAPTURE_WORKER"],
+              FileManager.default.isExecutableFile(atPath: worker) else {
+            halLog("    FAIL: SOTF_RUST_HAL_CAPTURE_WORKER is not executable")
+            return false
+        }
+        for channels in [2, 8, 32] {
+            for rate in [48_000, 96_000, 192_000] {
+                for blockFrames in [64, 128, 512] {
+                    for encrypted in [false, true] {
+                        guard runCaptureSequence(worker: worker, channels: channels,
+                            rate: rate, blockFrames: blockFrames, encrypted: encrypted) else {
+                            return false
+                        }
+                    }
+                }
+            }
+        }
+        return true
+    }
+
+    private static func runCaptureSequence(worker: String, channels: Int, rate: Int,
+                                           blockFrames: Int, encrypted: Bool) -> Bool {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("sotf-capture-\(UUID())")
+        let path = root.appendingPathComponent("audio.shm")
+        let keyPath = root.appendingPathComponent("session.key")
+        let oldEnvironment = ProcessInfo.processInfo.environment
+        let environmentKeys = ["SOTF_HAL_SHARED_MEMORY_PATH", "SOTF_HAL_SESSION_KEY_PATH"]
+        defer {
+            for key in environmentKeys {
+                if let value = oldEnvironment[key] { setenv(key, value, 1) }
+                else { unsetenv(key) }
+            }
+            EncryptionKeyManager.shared.reloadFromCurrentEnvironment()
+            try? FileManager.default.removeItem(at: root)
+        }
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            let key = (0..<32).map { UInt8($0) }
+            try Data(key).write(to: keyPath)
+            chmod(keyPath.path, 0o600)
+            var header = transportFixtureHeader()
+            header.sampleRate = UInt32(rate)
+            header.requestedSampleRate = UInt32(rate)
+            header.actualSampleRate = UInt32(rate)
+            header.bufferFrames = UInt32(blockFrames)
+            header.requestedBufferFrames = UInt32(blockFrames)
+            header.actualBufferFrames = UInt32(blockFrames)
+            header.channelCount = UInt32(channels)
+            header.requestedChannelCount = UInt32(channels)
+            header.encrypted = encrypted ? 1 : 0
+            header.keyFingerprint = AudioCipher(keyBytes: key).getFingerprint().reduce(0) {
+                ($0 << 8) | UInt64($1)
+            }
+            let aligned = (MemoryLayout<SharedAudioHeader>.size + 63) & ~63
+            let ringFrames = blockFrames * 8 * max(1, (rate + 47_999) / 48_000)
+            var bytes = Data(count: aligned + ringFrames * channels * MemoryLayout<Float>.size)
+            withUnsafeBytes(of: &header) { bytes.replaceSubrange(0..<$0.count, with: $0) }
+            try bytes.write(to: path)
+            chmod(path.path, 0o600)
+            setenv(environmentKeys[0], path.path, 1)
+            setenv(environmentKeys[1], keyPath.path, 1)
+            EncryptionKeyManager.shared.reloadFromCurrentEnvironment()
+            let transport = SharedAudioBuffer()
+            guard transport.initialize(sampleRate: UInt32(rate), bufferFrames: UInt32(blockFrames),
+                                       channelCount: UInt32(channels)) else { return false }
+            defer { transport.closeSharedMemory() }
+
+            // Exercise 32 complete ring lengths even when the rate scales ring depth.
+            // The largest final marker is 2^24, exactly representable in Float.
+            let totalFrames = ringFrames * 32
+            guard totalFrames * channels <= 16_777_216 else { return false }
+            let metricsDirectory = ProcessInfo.processInfo.environment["SOTF_HAL_METRICS_DIR"]
+            var writeDurations = [UInt64]()
+            if metricsDirectory != nil { writeDurations.reserveCapacity(totalFrames) }
+            var sent = 0
+            var rejected = 0
+            var attempt = 0
+            func produce() -> Int {
+                // Incommensurate block sizes also wrap encrypted record headers.
+                let frames = min(attempt % 2 == 0 ? 31 : 63, totalFrames - sent)
+                attempt += 1
+                let samples = (0..<(frames * channels)).map { Float(sent * channels + $0 + 1) }
+                let start = metricsDirectory != nil ? DispatchTime.now().uptimeNanoseconds : 0
+                let written = samples.withUnsafeBufferPointer {
+                    transport.writeAudio($0.baseAddress!, frameCount: frames, channelCount: channels)
+                }
+                if metricsDirectory != nil && written > 0 && writeDurations.count < totalFrames {
+                    writeDurations.append(DispatchTime.now().uptimeNanoseconds - start)
+                }
+                return written
+            }
+            // Force overflow with no reader. Drop-oldest would destroy the
+            // initial sequence and fail the Rust verifier at its first read.
+            for _ in 0..<(ringFrames / 31 + 4) {
+                let written = produce()
+                sent += written
+                if written == 0 { rejected += 1 }
+            }
+            guard rejected > 0, sent > 0, sent < totalFrames else {
+                print("    FAIL: sequence fixture did not fill the ring")
+                return false
+            }
+
+            let process = Process()
+            // A regular file preserves diagnostics even if a failed worker
+            // emits more output than an undrained pipe can hold.
+            let diagnosticsPath = root.appendingPathComponent("worker.log")
+            guard FileManager.default.createFile(atPath: diagnosticsPath.path, contents: nil) else {
+                return false
+            }
+            let diagnostics = try FileHandle(forWritingTo: diagnosticsPath)
+            defer { try? diagnostics.close() }
+            process.executableURL = URL(fileURLWithPath: worker)
+            process.arguments = [String(channels), String(totalFrames), String(rate), String(blockFrames)]
+            var workerEnvironment = ProcessInfo.processInfo.environment
+            workerEnvironment["SOTF_HAL_SEQUENCE_ENCRYPTED"] = encrypted ? "1" : "0"
+            process.environment = workerEnvironment
+            process.standardOutput = diagnostics
+            process.standardError = diagnostics
+            try process.run()
+            defer {
+                if process.isRunning { process.terminate(); process.waitUntilExit() }
+            }
+            // Wall-clock adjustments must not shorten the worker's monotonic deadline.
+            let sequenceStart = DispatchTime.now().uptimeNanoseconds
+            // Sanitizers instrument the Swift producer, including every cipher
+            // operation. Keep release timing/liveness bounds unchanged.
+            let sanitizer = ProcessInfo.processInfo.environment["SOTF_HAL_SANITIZER"] ?? ""
+            let timeoutSeconds: UInt64 = ["thread", "address"].contains(sanitizer) ? 60 : 20
+            let deadline = sequenceStart + timeoutSeconds * 1_000_000_000
+            while sent < totalFrames && process.isRunning && DispatchTime.now().uptimeNanoseconds < deadline {
+                let written = produce()
+                sent += written
+                if written == 0 { rejected += 1; usleep(50) }
+            }
+            while process.isRunning && DispatchTime.now().uptimeNanoseconds < deadline { usleep(100) }
+            guard !process.isRunning else {
+                process.terminate()
+                process.waitUntilExit()
+                let output = try Data(contentsOf: diagnosticsPath)
+                print("    FAIL: sequence \(channels)ch \(rate)Hz/\(blockFrames) encrypted=\(encrypted) timed out after sending \(sent)/\(totalFrames): "
+                    + (String(data: output, encoding: .utf8) ?? "invalid worker output"))
+                return false
+            }
+            process.waitUntilExit()
+            let output = try Data(contentsOf: diagnosticsPath)
+            guard sent == totalFrames, process.terminationStatus == 0 else {
+                print("    FAIL: sequence \(channels)ch encrypted=\(encrypted): "
+                    + (String(data: output, encoding: .utf8) ?? "invalid worker output"))
+                return false
+            }
+            if let metricsDirectory, !writeDurations.isEmpty {
+                writeDurations.sort()
+                func quantile(_ percent: Int) -> UInt64 {
+                    writeDurations[max(0, (writeDurations.count * percent + 99) / 100 - 1)]
+                }
+                let label = "swift-writer-\(channels)ch-\(rate)hz-\(blockFrames)frames-\(encrypted ? "encrypted" : "plaintext")"
+                let report: [String: Any] = ["case": label,
+                    "scope": "SharedAudioBuffer.writeAudio, instrumented host fixture",
+                    "channels": channels, "sample_rate": rate, "buffer_frames": blockFrames,
+                    "verified_frames": totalFrames, "ring_lengths": 32,
+                    "writes": writeDurations.count, "rejected_writes": rejected,
+                    "p95_ns": quantile(95), "p99_ns": quantile(99), "max_ns": writeDurations.last!]
+                let data = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+                try data.write(to: URL(fileURLWithPath: metricsDirectory).appendingPathComponent(label + ".json"))
+                print(String(data: data, encoding: .utf8)!)
+                print(String(data: output, encoding: .utf8) ?? "invalid worker metrics")
+            }
+            print("    Capture sequence: \(sent) frames, \(channels)ch, \(rate)Hz/\(blockFrames), encrypted=\(encrypted), \(rejected) rejected writes")
+            return true
+        } catch {
+            print("    FAIL: capture sequence fixture: \(error)")
+            return false
+        }
+    }
+
+    /// Production Swift and Rust share an immutable object, even after marker truncation.
+    static func testImmutableDescriptorHandoff() -> Bool {
+        [false, true].allSatisfy { encrypted in
+            guard let worker = ProcessInfo.processInfo.environment["SOTF_RUST_HAL_CAPTURE_WORKER"],
+                  let probe = ProcessInfo.processInfo.environment["SOTF_SWIFT_HAL_ATTACHMENT_PROBE"] else { return false }
+            // Keep the endpoint below Darwin's 104-byte sockaddr_un path limit.
+            var template = Array((NSTemporaryDirectory() + "fd-XXXXXX").utf8CString)
+            guard let created = mkdtemp(&template) else { return false }
+            let root = URL(fileURLWithPath: String(cString: created), isDirectory: true)
+            let path = root.appendingPathComponent("audio.shm")
+            let keyPath = root.appendingPathComponent("session.key")
+            let keys = ["SOTF_HAL_SHARED_MEMORY_PATH", "SOTF_HAL_SESSION_KEY_PATH"]
+            let previous = keys.map { ProcessInfo.processInfo.environment[$0] }
+            defer {
+                for (key, value) in zip(keys, previous) {
+                    if let value { setenv(key, value, 1) } else { unsetenv(key) }
+                }
+                EncryptionKeyManager.shared.reloadFromCurrentEnvironment()
+                try? FileManager.default.removeItem(at: root)
+            }
+            do {
+                try Data((0..<32).map { UInt8($0) }).write(to: keyPath)
+                chmod(keyPath.path, 0o600)
+                setenv(keys[0], path.path, 1)
+                setenv(keys[1], keyPath.path, 1)
+                EncryptionKeyManager.shared.reloadFromCurrentEnvironment()
+                let child = Process()
+                let input = Pipe(), output = Pipe()
+                child.executableURL = URL(fileURLWithPath: worker)
+                child.arguments = [encrypted ? "broker-encrypted" : "broker"]
+                child.standardInput = input
+                child.standardOutput = output
+                child.standardError = FileHandle.standardError
+                try child.run()
+                defer { if child.isRunning { child.terminate(); child.waitUntilExit() } }
+                func send(_ command: String) { input.fileHandleForWriting.write(Data((command + "\n").utf8)) }
+                func reply() -> String? {
+                    var bytes = Data()
+                    let deadline = Date().addingTimeInterval(5)
+                    while bytes.count < 4096 && Date() < deadline {
+                        var ready = pollfd(fd: output.fileHandleForReading.fileDescriptor,
+                                           events: Int16(POLLIN), revents: 0)
+                        guard Darwin.poll(&ready, 1, 100) >= 0 else { return nil }
+                        if ready.revents & Int16(POLLIN | POLLHUP) == 0 { continue }
+                        let byte = output.fileHandleForReading.readData(ofLength: 1)
+                        guard !byte.isEmpty else { return nil }
+                        if byte[0] == 10 { return String(data: bytes, encoding: .utf8) }
+                        bytes.append(byte)
+                    }
+                    return nil
+                }
+                guard reply() == "ready" else { return false }
+                let state = DriverState()
+                state.commitOutputVolume(scalar: 0.375, muted: true)
+                guard state.initializeSharedAudio(state.sharedAudio, sampleRate: 48_000,
+                    bufferFrames: 64, channelCount: 2) else { return false }
+                defer { state.sharedAudio.closeSharedMemory() }
+                send("getvolume")
+                guard reply() == "volume \(Float32(0.375).bitPattern) true 1" else { return false }
+
+                // The separately compiled probe has no legacy-fixture conditional.
+                func productionAttachmentSucceeds() throws -> Bool {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: probe)
+                    try process.run()
+                    let deadline = Date().addingTimeInterval(5)
+                    while process.isRunning && Date() < deadline { usleep(1000) }
+                    if process.isRunning { process.terminate(); process.waitUntilExit(); return false }
+                    process.waitUntilExit()
+                    return process.terminationStatus == 0
+                }
+                guard try productionAttachmentSucceeds() else { return false }
+                guard state.initializeSharedAudio(state.sharedAudio, sampleRate: 48_000,
+                    bufferFrames: 64, channelCount: 2) else { return false }
+                let record = Array(try Data(contentsOf: path))
+                guard record.count == 32 else { return false }
+                let suffix = record[16..<24].map { String(format: "%02x", $0) }.joined()
+                let endpoint = root.appendingPathComponent(".fd-\(suffix)").path
+                var length: UInt64 = 0
+                for index in 0..<8 { length |= UInt64(record[8 + index]) << (8 * index) }
+                func receive(_ request: [UInt8], owner: uid_t = getuid()) -> Int32 {
+                    request.withUnsafeBufferPointer { bytes in
+                        endpoint.withCString { sotf_receive_memory_descriptor($0, owner, bytes.baseAddress, bytes.count) }
+                    }
+                }
+                let fd = receive(record)
+                guard fd >= 0 else { return false }
+                defer { Darwin.close(fd) }
+                for requested in [UInt64(0), 1, length, length + 16_384] {
+                    guard ftruncate(fd, off_t(requested)) == -1, errno == EINVAL else { return false }
+                }
+                var wrongNonce = record
+                wrongNonce[31] ^= 1
+                guard receive(wrongNonce) == -1, receive(record, owner: getuid() + 1) == -1 else { return false }
+                func verifyAudio() -> Bool {
+                    let samples = [Float32](repeating: 0.25, count: 32)
+                    let written = samples.withUnsafeBufferPointer {
+                        state.sharedAudio.writeAudio($0.baseAddress!, frameCount: 16, channelCount: 2)
+                    }
+                    guard written == 16 else { return false }
+                    send("verify 16 \(Float32(0.25).bitPattern)")
+                    return reply() == "verified 16"
+                }
+                guard verifyAudio() else { return false }
+                // Leave a decrypted suffix in the shipping Rust reader, then
+                // change away and back without allowing an intermediate read.
+                for sameFormat in [false, true] {
+                    let oldSamples = [Float32](repeating: 0.125, count: 32)
+                    guard oldSamples.withUnsafeBufferPointer({
+                        state.sharedAudio.writeAudio($0.baseAddress!, frameCount: 16, channelCount: 2)
+                    }) == 16 else { return false }
+                    send("verify 1 \(Float32(0.125).bitPattern)")
+                    guard reply() == "verified 1" else { return false }
+                    if !sameFormat {
+                        guard state.sharedAudio.applyActiveConfiguration(sampleRate: 96_000,
+                            bufferFrames: 128, channelCount: 8) else { return false }
+                    }
+                    guard state.sharedAudio.applyActiveConfiguration(sampleRate: 48_000,
+                        bufferFrames: 64, channelCount: 2), verifyAudio() else { return false }
+                }
+                let marker = Darwin.open(path.path, O_RDWR | O_NOFOLLOW)
+                guard marker >= 0 else { return false }
+                defer { Darwin.close(marker) }
+                guard sotf_validate_memory_descriptor(marker, getuid(), length) == -1,
+                      ftruncate(marker, 0) == 0,
+                      !state.sharedAudio.backingFileIsCurrent(), verifyAudio() else { return false }
+
+                // A well-formed legacy mapping must still fail the production policy.
+                var header = transportFixtureHeader()
+                let aligned = (MemoryLayout<SharedAudioHeader>.size + 63) & ~63
+                var raw = Data(count: aligned + 64 * 8 * 16 * MemoryLayout<Float>.size)
+                withUnsafeBytes(of: &header) { raw.replaceSubrange(0..<$0.count, with: $0) }
+                try raw.write(to: path)
+                chmod(path.path, 0o600)
+                guard try !productionAttachmentSucceeds() else { return false }
+                send("quit")
+                return true
+            } catch {
+                halLog("    FAIL: immutable descriptor fixture: \(error)")
+                return false
+            }
+        }
+    }
+
+    /// Deterministic stale-ACK boundaries and concurrent cross-language writers.
+    static func testCrossProcessControlPublication() -> Bool {
+        guard let worker = ProcessInfo.processInfo.environment["SOTF_RUST_HAL_CAPTURE_WORKER"] else { return false }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("sotf-control-\(UUID())")
+        let path = root.appendingPathComponent("audio.shm")
+        let oldPath = ProcessInfo.processInfo.environment["SOTF_HAL_SHARED_MEMORY_PATH"]
+        defer {
+            if let oldPath { setenv("SOTF_HAL_SHARED_MEMORY_PATH", oldPath, 1) }
+            else { unsetenv("SOTF_HAL_SHARED_MEMORY_PATH") }
+            try? FileManager.default.removeItem(at: root)
+        }
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            var header = transportFixtureHeader()
+            let aligned = (MemoryLayout<SharedAudioHeader>.size + 63) & ~63
+            var bytes = Data(count: aligned + 64 * 8 * 16 * MemoryLayout<Float>.size)
+            withUnsafeBytes(of: &header) { bytes.replaceSubrange(0..<$0.count, with: $0) }
+            try bytes.write(to: path)
+            chmod(path.path, 0o600)
+            setenv("SOTF_HAL_SHARED_MEMORY_PATH", path.path, 1)
+            let transport = SharedAudioBuffer()
+            guard transport.initialize(sampleRate: 48_000, bufferFrames: 64, channelCount: 2) else { return false }
+            defer { transport.closeSharedMemory() }
+
+            let child = Process()
+            let input = Pipe()
+            let output = Pipe()
+            child.executableURL = URL(fileURLWithPath: worker)
+            child.arguments = ["control"]
+            child.standardInput = input
+            child.standardOutput = output
+            child.standardError = FileHandle.standardError
+            try child.run()
+            defer { if child.isRunning { child.terminate(); child.waitUntilExit() } }
+            func send(_ command: String) { input.fileHandleForWriting.write(Data((command + "\n").utf8)) }
+            func reply() -> String? {
+                var line = Data()
+                let deadline = Date().addingTimeInterval(5)
+                while line.count < 4096 && Date() < deadline {
+                    var fd = pollfd(fd: output.fileHandleForReading.fileDescriptor, events: Int16(POLLIN), revents: 0)
+                    guard Darwin.poll(&fd, 1, 100) >= 0 else { return nil }
+                    if fd.revents & Int16(POLLIN | POLLHUP) == 0 { continue }
+                    let byte = output.fileHandleForReading.readData(ofLength: 1)
+                    guard !byte.isEmpty else { return nil }
+                    if byte[0] == 10 { return String(data: line, encoding: .utf8) }
+                    line.append(byte)
+                }
+                return nil
+            }
+            let first = transport.requestConfigChangeWithID(sampleRate: 96_000, bufferFrames: 64, channelCount: 8)!
+            let second = transport.requestConfigChangeWithID(sampleRate: 48_000, bufferFrames: 64, channelCount: 2)!
+            // A delayed geometry apply must not overwrite the newer mailbox.
+            guard transport.applyActiveConfiguration(sampleRate: 96_000, bufferFrames: 64, channelCount: 8),
+                  let unchanged = transport.configurationSnapshot(), unchanged.requestID == second,
+                  unchanged.sampleRate == 48_000, unchanged.channelCount == 2 else { return false }
+            send("ack \(first) 96000 64 8 1")
+            guard reply() == "ack false", let pending = transport.configurationSnapshot(),
+                  pending.requestID == second, pending.pending, pending.status == 0 else { return false }
+            send("ack \(second) 44100 128 4 2")
+            guard reply() == "ack true", let negotiated = transport.configurationSnapshot(),
+                  negotiated.requestID == second, negotiated.status == 2,
+                  negotiated.actualChannelCount == 4, negotiated.actualSampleRate == 44_100,
+                  negotiated.actualBufferFrames == 128, !negotiated.pending else { return false }
+
+            send("request 96000 256 8")
+            guard let announced = reply(), let third = UInt64(announced.split(separator: " ").last ?? ""),
+                  third != second, let request = transport.configurationSnapshot(),
+                  request.requestID == third, request.pending, request.channelCount == 8 else { return false }
+            guard !transport.acknowledgeConfigChange(requestID: second, actualSampleRate: 48_000,
+                actualBufferFrames: 64, actualChannelCount: 2, status: 1, errorCode: 0),
+                  transport.configurationSnapshot()?.pending == true else { return false }
+            guard transport.acknowledgeConfigChange(requestID: third, actualSampleRate: 48_000,
+                actualBufferFrames: 64, actualChannelCount: 2, status: 2, errorCode: 0) else { return false }
+            send("snapshot")
+            guard reply() == "snapshot \(third) 96000 256 8 2 2 false" else { return false }
+
+            // A resolved CoreAudio callback must survive a temporarily held
+            // publication gate and publish its retained ID on maintenance retry.
+            send("request 48000 64 2")
+            guard let announcedRetry = reply(),
+                  let retryID = UInt64(announcedRetry.split(separator: " ").last ?? "") else { return false }
+            let state = DriverState()
+            guard state.sharedAudio.initialize(sampleRate: 96_000, bufferFrames: 64, channelCount: 8) else { return false }
+            defer { state.sharedAudio.closeSharedMemory() }
+            let descriptor = Darwin.open(path.path, O_RDWR)
+            guard descriptor >= 0 else { return false }
+            defer { Darwin.close(descriptor) }
+            func holdControlGate(_ value: UInt32) -> Bool {
+                var word = value
+                return withUnsafeBytes(of: &word) {
+                    let offset = MemoryLayout<SharedAudioHeader>.offset(of: \.controlLock)!
+                    return Darwin.pwrite(descriptor, $0.baseAddress, $0.count, off_t(offset)) == $0.count
+                }
+            }
+            guard holdControlGate(1) else { return false }
+            let immediatelyPublished = state.publishConfigurationAcknowledgement(sharedAudio: state.sharedAudio,
+                requestID: retryID, actualSampleRate: 44_100, actualBufferFrames: 128,
+                actualChannelCount: 4, status: 2, errorCode: 0)
+            guard holdControlGate(0), !immediatelyPublished else { return false }
+            state.flushConfigurationAcknowledgement(sharedAudio: state.sharedAudio)
+            send("snapshot")
+            guard reply() == "snapshot \(retryID) 48000 64 2 2 4 false" else { return false }
+
+            let iterations = 10_000
+            for patch in [false, true] {
+                let start = transport.setOutputVolume(scalarBits: Float32(0.75).bitPattern, muted: true)
+                send("\(patch ? "patch" : "volume") \(iterations)")
+                for _ in 0..<iterations {
+                    if patch { _ = transport.patchOutputVolume(scalarBits: nil, muted: true) }
+                    else { transport.setOutputVolume(scalarBits: Float32(0.75).bitPattern, muted: true) }
+                    let tuple = transport.outputVolume()
+                    let value = Float32(bitPattern: tuple.scalarBits)
+                    if patch {
+                        guard tuple.muted else { return false }
+                    } else {
+                        guard (value == 0.25 && !tuple.muted) || (value == 0.75 && tuple.muted) else { return false }
+                    }
+                }
+                guard reply() == "ok", transport.outputVolume().generation == start + UInt32(iterations * 2) else {
+                    halLog("    FAIL: cross-process writers lost a volume generation")
+                    return false
+                }
+            }
+            send("quit")
+            child.waitUntilExit()
+            return child.terminationStatus == 0
+        } catch {
+            halLog("    FAIL: control fixture: \(error)")
+            return false
+        }
     }
 
     private static func transportFixtureHeader() -> SharedAudioHeader {
         SharedAudioHeader(
-            magic: 0x534F5446, version: 7, sampleRate: 48_000, bufferFrames: 64, channelCount: 2,
+            magic: 0x534F5446, version: 8, sampleRate: 48_000, bufferFrames: 64, channelCount: 2,
             writePosition: 0, readPosition: 0, active: 0, configChanged: 0,
             driverReady: 0, engineReady: 1, encrypted: 0, volumeScalarBits: Float(1).bitPattern,
             keyFingerprint: 0, frameCounter: 0, requestedSampleRate: 48_000,
@@ -236,7 +996,7 @@ final class HALDriverTests {
             let buffer = SharedAudioBuffer()
             defer { buffer.closeSharedMemory() }
 
-            func fixture(version: UInt32 = 7, rate: UInt32 = 48_000, frames: UInt32 = 64,
+            func fixture(version: UInt32 = 8, rate: UInt32 = 48_000, frames: UInt32 = 64,
                          channels: UInt32 = 2, write: UInt64 = 0, read: UInt64 = 0,
                          configuring: UInt32 = 0) -> Data {
                 var data = Data(count: alignedHeader + capacity * MemoryLayout<Float>.size)
@@ -452,8 +1212,7 @@ final class HALDriverTests {
         guard let manifest = sharedMemoryLayoutManifest(),
               // Rust's repr(C, align(8)) size includes trailing padding. Swift
               // exposes the same ABI value as `stride`; `size` only covers the
-              // last field (which ends at byte 144 since the version-7
-              // volume fields filled the former padding).
+              // last field. Version 8 appends coherent control-plane records.
               MemoryLayout<SharedAudioHeader>.stride == manifest.size,
               MemoryLayout<SharedAudioHeader>.alignment == manifest.alignment else {
             halLog(
@@ -494,6 +1253,12 @@ final class HALDriverTests {
             "configuring_ack": MemoryLayout<SharedAudioHeader>.offset(of: \.configuringAck)!,
             "requested_channel_count": MemoryLayout<SharedAudioHeader>.offset(of: \.requestedChannelCount)!,
             "volume_generation": MemoryLayout<SharedAudioHeader>.offset(of: \.volumeGeneration)!,
+            "control_lock": MemoryLayout<SharedAudioHeader>.offset(of: \.controlLock)!,
+            "actual_channel_count": MemoryLayout<SharedAudioHeader>.offset(of: \.actualChannelCount)!,
+            "config_request_id": MemoryLayout<SharedAudioHeader>.offset(of: \.configRequestID)!,
+            "config_ack_id": MemoryLayout<SharedAudioHeader>.offset(of: \.configAckID)!,
+            "volume_state": MemoryLayout<SharedAudioHeader>.offset(of: \.volumeState)!,
+            "ring_generation": MemoryLayout<SharedAudioHeader>.offset(of: \.ringGeneration)!,
         ]
         guard Set(actualOffsets.keys) == Set(manifest.fields.keys) else {
             halLog("    FAIL: manifest field set does not match Swift header")
@@ -509,7 +1274,7 @@ final class HALDriverTests {
     }
 
     /// Volume conversion curve endpoints/clamps plus the shared-header
-    /// publication round trip the daemon polls (version 7 fields).
+    /// atomic tuple publication round trip the daemon polls.
     static func testVolumeConversionAndSharedRoundTrip() -> Bool {
         halLog("  Test: volume conversion and shared round trip")
 
@@ -552,7 +1317,7 @@ final class HALDriverTests {
 
         var header = SharedAudioHeader(
             magic: 0x534F5446,
-            version: 7,
+            version: 8,
             sampleRate: 48_000,
             bufferFrames: 64,
             channelCount: 2,
@@ -579,7 +1344,8 @@ final class HALDriverTests {
             configuring: 0,
             configuringAck: 0,
             requestedChannelCount: 2,
-            volumeGeneration: 1
+            volumeGeneration: 1,
+            volumeState: UInt64(Float32(1).bitPattern) | (1 << 33)
         )
 
         let fd = Darwin.open(shmPath, O_RDWR)
@@ -669,7 +1435,7 @@ final class HALDriverTests {
 
         var header = SharedAudioHeader(
             magic: 0x534F5446,
-            version: 7,
+            version: 8,
             sampleRate: sampleRate,
             bufferFrames: bufferFrames,
             channelCount: channelCount,
@@ -744,8 +1510,10 @@ final class HALDriverTests {
         }
 
         sharedAudio.acknowledgeConfigChange(
+            requestID: sharedAudio.configurationSnapshot()!.requestID,
             actualSampleRate: 96_000,
             actualBufferFrames: bufferFrames,
+            actualChannelCount: sharedAudio.getRequestedChannelCount(),
             status: 1,
             errorCode: 0
         )
@@ -800,7 +1568,7 @@ final class HALDriverTests {
 
         var header = SharedAudioHeader(
             magic: 0x534F5446,
-            version: 7,
+            version: 8,
             sampleRate: sampleRate,
             bufferFrames: bufferFrames,
             channelCount: activeChannels,
@@ -906,8 +1674,10 @@ final class HALDriverTests {
         }
 
         sharedAudio.acknowledgeConfigChange(
+            requestID: sharedAudio.configurationSnapshot()!.requestID,
             actualSampleRate: 96_000,
             actualBufferFrames: bufferFrames,
+            actualChannelCount: sharedAudio.getRequestedChannelCount(),
             status: 1,
             errorCode: 0
         )
@@ -1056,7 +1826,7 @@ final class HALDriverTests {
 
         var header = SharedAudioHeader(
             magic: 0x534F5446,
-            version: 7,
+            version: 8,
             sampleRate: sampleRate,
             bufferFrames: bufferFrames,
             channelCount: activeChannels,
@@ -1769,7 +2539,7 @@ final class HALDriverTests {
 
         var header = SharedAudioHeader(
             magic: 0x534F5446,
-            version: 7,
+            version: 8,
             sampleRate: sampleRate,
             bufferFrames: bufferFrames,
             channelCount: channelCount,

@@ -65,11 +65,13 @@ pub(super) fn publish_reconfigured_driver_readiness(
     driver_manager: &Arc<Mutex<DriverManager>>,
     system_state: &Arc<Mutex<SystemwideState>>,
     active_config: DriverConfig,
+    request_id: u64,
     readiness: Result<(), String>,
 ) -> Result<(), String> {
     if let Err(error) = readiness {
         system_state.lock().mark_pipeline_recovery(error.clone());
-        driver_manager.lock().acknowledge_config_change(
+        driver_manager.lock().acknowledge_config_request(
+            request_id,
             active_config,
             driver_common::ConfigResult::error(error.clone()),
         );
@@ -98,7 +100,7 @@ pub(super) fn handle_driver_config_change(
         driver_manager,
         audio_manager,
         device_registry,
-        config,
+        driver_common::DriverConfigRequest::untracked(config),
         system_state,
         running,
         None,
@@ -110,7 +112,7 @@ pub(super) fn handle_driver_config_change_with_profiles(
     driver_manager: &Arc<Mutex<DriverManager>>,
     audio_manager: &Arc<Mutex<AudioEngineManager>>,
     device_registry: &Arc<Mutex<DeviceRegistry>>,
-    config: DriverConfig,
+    request: driver_common::DriverConfigRequest,
     system_state: &Arc<Mutex<SystemwideState>>,
     running: &Arc<Mutex<bool>>,
     profiles: &Arc<Mutex<OutputProfileStore>>,
@@ -119,7 +121,7 @@ pub(super) fn handle_driver_config_change_with_profiles(
         driver_manager,
         audio_manager,
         device_registry,
-        config,
+        request,
         system_state,
         running,
         Some(profiles),
@@ -131,11 +133,16 @@ fn handle_driver_config_change_inner(
     driver_manager: &Arc<Mutex<DriverManager>>,
     audio_manager: &Arc<Mutex<AudioEngineManager>>,
     device_registry: &Arc<Mutex<DeviceRegistry>>,
-    config: DriverConfig,
+    request: driver_common::DriverConfigRequest,
     system_state: &Arc<Mutex<SystemwideState>>,
     running: &Arc<Mutex<bool>>,
     profiles: Option<&Arc<Mutex<OutputProfileStore>>>,
 ) {
+    let config = request.config;
+    let request_id = request.request_id;
+    if !driver_manager.lock().config_request_is_current(request_id) {
+        return;
+    }
     let capture_source = driver_manager.lock().capture_source();
     let capture_config = capture_source.as_ref().map(|source| source.configuration());
     let native_event = capture_config == Some(config);
@@ -153,7 +160,8 @@ fn handle_driver_config_change_inner(
     // Validate requested values
     if requested_rate == 0 {
         log::warn!("Invalid config request: sample_rate=0, ignoring");
-        driver_manager.lock().acknowledge_config_change(
+        driver_manager.lock().acknowledge_config_request(
+            request_id,
             DriverConfig::new(48000, requested_frames, config.channel_count),
             driver_common::ConfigResult::error(driver_common::DriverError::invalid_config(
                 "sample_rate",
@@ -175,7 +183,8 @@ fn handle_driver_config_change_inner(
             "Invalid config request: buffer_frames={}, out of range",
             requested_frames
         );
-        driver_manager.lock().acknowledge_config_change(
+        driver_manager.lock().acknowledge_config_request(
+            request_id,
             DriverConfig::new(requested_rate, 512, config.channel_count),
             driver_common::ConfigResult::error(driver_common::DriverError::invalid_config(
                 "buffer_frames",
@@ -189,7 +198,8 @@ fn handle_driver_config_change_inner(
             "Invalid config request: channel_count={}, out of range",
             requested_channels
         );
-        driver_manager.lock().acknowledge_config_change(
+        driver_manager.lock().acknowledge_config_request(
+            request_id,
             DriverConfig::new(requested_rate, requested_frames, 2),
             driver_common::ConfigResult::error(driver_common::DriverError::invalid_config(
                 "channel_count",
@@ -314,6 +324,7 @@ fn handle_driver_config_change_inner(
                     driver_manager,
                     system_state,
                     active_config,
+                    request_id,
                     Err(error.clone()),
                 );
                 return;
@@ -329,9 +340,13 @@ fn handle_driver_config_change_inner(
                 );
             }
 
-            driver_manager
+            if !driver_manager
                 .lock()
-                .acknowledge_config_change(active_config, result);
+                .acknowledge_config_request(request_id, active_config, result)
+            {
+                log::info!("Configuration {request_id} ACK was not published");
+                return;
+            }
 
             if matches!(
                 outcome,
@@ -343,6 +358,7 @@ fn handle_driver_config_change_inner(
                     driver_manager,
                     system_state,
                     active_config,
+                    request_id,
                     Ok(()),
                 );
             }
@@ -357,7 +373,8 @@ fn handle_driver_config_change_inner(
         Err(e) => {
             log::error!("Pipeline reconfiguration failed: {}", e);
             system_state.lock().mark_pipeline_recovery(e.clone());
-            driver_manager.lock().acknowledge_config_change(
+            driver_manager.lock().acknowledge_config_request(
+                request_id,
                 DriverConfig::new(actual_rate, requested_frames, config.channel_count),
                 driver_common::ConfigResult::error(e),
             );

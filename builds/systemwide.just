@@ -4,6 +4,19 @@
 # bundle. The installed-HAL smoke tests remain a separate manual layer.
 
 [group('test')]
+bench-cpal-capture:
+	bash scripts/bench-cpal-capture.sh
+
+[group('test')]
+bench-ipc-control:
+	bash scripts/bench-ipc-control.sh
+
+# Synthetic source-to-post-clamp observation; no physical output is opened.
+[group('test')]
+bench-lab-latency:
+	bash scripts/bench-lab-latency.sh
+
+[group('test')]
 test-systemwide-macos:
 	./scripts/test-systemwide.sh macos
 
@@ -27,6 +40,7 @@ test-systemwide-linux-arm64:
 		--volume sotf-systemwide-cargo-git-linux-arm64:/usr/local/cargo/git \
 		--volume sotf-systemwide-target-linux-arm64:/build-target \
 		--workdir /workspace/sotf-systemwide \
+		--env CARGO_HOME=/usr/local/cargo \
 		--env CARGO_TARGET_DIR=/build-target \
 		--env CARGO_INCREMENTAL=0 \
 		"$image" \

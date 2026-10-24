@@ -100,7 +100,7 @@ def classify(status: dict, device_names: set[str] | None) -> tuple[str, str]:
     """Classify one status poll.
 
     Returns (class, detail) where class is one of:
-      healthy         playback applied and no recovery latch
+      healthy         playback applied, no active incident or fatal/recovery latch
       missing_device  latched device-availability fault AND the desired
                       device is provably absent from enumeration
       fault           latched fault that is not a provable device absence
@@ -108,6 +108,15 @@ def classify(status: dict, device_names: set[str] | None) -> tuple[str, str]:
     """
     recovery = pipeline_recovery(status)
     applied = applied_output_device(status)
+    engine_error = _status_str(status, "last_error")
+    if engine_error:
+        return ("fault", f"engine failure latched: {engine_error}")
+    incident = _status_field(status, "playback_incident")
+    if not recovery and isinstance(incident, dict) and incident.get("resolution") is None:
+        return (
+            "settling",
+            f"output recovery active ({incident.get('kind')}, incident {incident.get('id')})",
+        )
     if applied and not recovery:
         return ("healthy", f"playback applied on {applied!r} with no recovery latch")
     if not recovery:

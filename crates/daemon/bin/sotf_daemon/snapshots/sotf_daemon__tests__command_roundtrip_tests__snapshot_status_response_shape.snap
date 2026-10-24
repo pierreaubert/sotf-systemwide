@@ -1,6 +1,6 @@
 ---
-source: crates/systemwide/crates/daemon/bin/sotf_daemon/tests.rs
-assertion_line: 1771
+source: crates/daemon/bin/sotf_daemon/tests.rs
+assertion_line: 4902
 expression: data
 ---
 {
@@ -37,7 +37,9 @@ expression: data
   "playback_frames_dropped": 0,
   "playback_frames_received": 0,
   "playback_frames_written": 0,
+  "playback_incident": null,
   "playback_output_device": null,
+  "playback_output_generation": 0,
   "playback_stream_error_count": 0,
   "recovery_actions": [
     "driver_not_supported",

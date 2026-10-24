@@ -9,6 +9,7 @@
 #include <mach/mach_time.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include "SharedMemoryDescriptor.h"
 
 static inline uint32_t sotf_atomic_load_u32(const uint32_t *ptr) {
     return atomic_load_explicit((const _Atomic uint32_t *)ptr, memory_order_acquire);
@@ -81,6 +82,13 @@ static inline bool sotf_atomic_compare_exchange_u32(uint32_t *ptr, uint32_t expe
         desired,
         memory_order_acq_rel,
         memory_order_acquire
+    );
+}
+
+static inline bool sotf_atomic_compare_exchange_u64(uint64_t *ptr, uint64_t expected, uint64_t desired) {
+    return atomic_compare_exchange_strong_explicit(
+        (_Atomic uint64_t *)ptr, &expected, desired,
+        memory_order_acq_rel, memory_order_acquire
     );
 }
 

@@ -9,7 +9,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr::{NonNull, null_mut};
 use windows_sys::Win32::Foundation::{
-    GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree,
+    ERROR_ALREADY_EXISTS, ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -22,9 +23,10 @@ use windows_sys::Win32::Security::{
     SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
+    CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+    WRITE_DAC,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -160,9 +162,58 @@ impl PrivateAcl {
         Ok(acl)
     }
 
+    /// Create one directory with its account owner and protected DACL already installed.
+    fn create_directory(&self, path: &Path) -> io::Result<()> {
+        let mut name: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if name.contains(&0) {
+            return Err(denied("IPC directory path contains NUL"));
+        }
+        name.push(0);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: self.0.0.as_ptr(),
+            bInheritHandle: 0,
+        };
+        // SAFETY: the NUL-terminated path and owned descriptor remain valid
+        // through this synchronous call. Windows copies the security descriptor.
+        if unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } != 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) {
+            // Existing objects are not trusted here. secure_directory pins and
+            // validates the final object's type and owner before changing it.
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
+    fn create_directory_tree(&self, path: &Path) -> io::Result<()> {
+        let mut pending = Vec::new();
+        let mut candidate = path;
+        loop {
+            match self.create_directory(candidate) {
+                Ok(()) => break,
+                Err(error) if error.raw_os_error() == Some(ERROR_PATH_NOT_FOUND as i32) => {
+                    pending.push(candidate);
+                    candidate = candidate
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .ok_or(error)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        for directory in pending.into_iter().rev() {
+            self.create_directory(directory)?;
+        }
+        Ok(())
+    }
+
     /// Pin an owned directory, protect its DACL, and keep it from being renamed.
     pub(super) fn secure_directory(&self, path: &Path) -> io::Result<File> {
-        std::fs::create_dir_all(path)?;
+        self.create_directory_tree(path)?;
         let directory = OpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -339,6 +390,28 @@ impl PrivateAcl {
 mod tests {
     use super::PrivateAcl;
     use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn directory_tree_is_private_before_any_later_hardening() {
+        let root = tempfile::tempdir().expect("fixture directory");
+        let parent = root.path().join("private");
+        let child = parent.join("nested");
+        let acl = PrivateAcl::new().expect("account policy");
+        acl.create_directory_tree(&child)
+            .expect("protected creation");
+        for path in [&parent, &child] {
+            let directory = std::fs::OpenOptions::new()
+                .access_mode(super::FILE_READ_ATTRIBUTES | super::READ_CONTROL)
+                .custom_flags(
+                    super::FILE_FLAG_BACKUP_SEMANTICS | super::FILE_FLAG_OPEN_REPARSE_POINT,
+                )
+                .open(path)
+                .expect("inspect newly created directory");
+            acl.validate(&directory)
+                .expect("owner and protection precede hardening");
+        }
+    }
 
     #[test]
     fn token_is_protected_before_write_and_cannot_truncate_a_planted_file() {

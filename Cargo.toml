@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/daemon",
+    "crates/callback-metrics",
 ]
 resolver = "3"
 

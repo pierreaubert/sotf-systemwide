@@ -83,7 +83,12 @@ impl DaemonFixture {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp_dir = tempfile::tempdir().expect("create temp dir");
+        #[cfg(not(windows))]
         let socket_path = temp_dir.path().join("daemon.sock");
+        // Let the daemon create the IPC directory with its creation-time ACL;
+        // tempfile's inherited/default directory owner is not that contract.
+        #[cfg(windows)]
+        let socket_path = temp_dir.path().join("private-ipc").join("daemon.sock");
         let stderr_path = temp_dir.path().join("daemon.stderr.log");
         let stderr = File::create(&stderr_path).expect("create private daemon stderr log");
 

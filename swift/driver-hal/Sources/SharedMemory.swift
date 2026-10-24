@@ -23,7 +23,8 @@ private let kSharedMemoryMagic: UInt32 = 0x534F5446
 /// Version 7: Added output volume fields (volumeScalarBits, outputMuted,
 /// volumeGeneration) in former padding slots so the HAL volume control
 /// (OS media keys) and the daemon share one volume state.
-private let kSharedMemoryVersion: UInt32 = 7
+/// Version 8: Identified configuration ACKs and atomic multiwriter volume tuples.
+private let kSharedMemoryVersion: UInt32 = 8
 private let kDaemonHeartbeatTimeoutMs: UInt64 = 3_000
 // These bounds match driver-hal/src/shared_memory/consts.rs.
 private let kMaximumSampleRate: UInt32 = 192_000
@@ -275,7 +276,27 @@ struct SharedAudioHeader {
     var configuring: UInt32             // Daemon is mutating geometry/ring positions
     var configuringAck: UInt32          // IO participant observed configuring=1
     var requestedChannelCount: UInt32   // Pending channel geometry request
-    var volumeGeneration: UInt32        // Volume publication counter (version 7+)
+    var volumeGeneration: UInt32        // Reserved version 7 publication counter
+    var controlLock: UInt32 = 0
+    var actualChannelCount: UInt32 = 0
+    var configRequestID: UInt64 = 0
+    var configAckID: UInt64 = 0
+    var volumeState: UInt64 = 0
+    var ringGeneration: UInt64 = 1
+}
+
+struct SharedConfigurationSnapshot {
+    let requestID: UInt64
+    let sampleRate: UInt32
+    let bufferFrames: UInt32
+    let channelCount: UInt32
+    let source: UInt32
+    let actualSampleRate: UInt32
+    let actualBufferFrames: UInt32
+    let actualChannelCount: UInt32
+    let status: UInt32
+    let errorCode: UInt32
+    let pending: Bool
 }
 
 private struct EncryptedRecordMetadata {
@@ -291,6 +312,9 @@ final class SharedAudioBuffer {
     private var sharedMemory: UnsafeMutableRawPointer?
     private var memorySize: Int = 0
     private var fileDescriptor: Int32 = -1
+    private var rendezvousDescriptor: Int32 = -1
+    private var backingLength: Int64 = 0
+    private var brokeredMapping = false
 
     /// The path to the shared memory file (stored for cleanup)
     private var currentPath: String = ""
@@ -377,6 +401,14 @@ final class SharedAudioBuffer {
         return now - heartbeat <= kDaemonHeartbeatTimeoutMs
     }
 
+    #if SOTF_HAL_TESTING
+    /// Model daemon liveness without changing readiness or callback behavior.
+    func testSetDaemonHeartbeat(_ unixMillis: UInt64) {
+        guard validatedMapping, let header else { return }
+        atomicStore(&header.pointee.daemonHeartbeatMs, unixMillis)
+    }
+    #endif
+
     /// Debug: get connection state details
     var connectionStateDebug: String {
         let hasMem = sharedMemory != nil
@@ -402,7 +434,8 @@ final class SharedAudioBuffer {
     ///   - bufferFrames: Frames per buffer
     ///   - channelCount: Number of audio channels
     /// - Returns: true if successful
-    func initialize(sampleRate: UInt32, bufferFrames: UInt32, channelCount: UInt32) -> Bool {
+    func initialize(sampleRate: UInt32, bufferFrames: UInt32, channelCount: UInt32,
+                    initialVolumeScalar: Float32 = 1, initialMuted: Bool = false) -> Bool {
         let headerSize = MemoryLayout<SharedAudioHeader>.size
         let alignedHeaderSize = (headerSize + 63) & ~63  // 64-byte aligned
         guard sampleRate > 0, sampleRate <= kMaximumSampleRate,
@@ -424,7 +457,7 @@ final class SharedAudioBuffer {
         // the daemon before IO starts. O_NOFOLLOW refuses a symlinked path
         // outright; the fstat checks below then pin the opened file to a
         // console-user-owned, owner-only regular file.
-        fileDescriptor = Darwin.open(currentPath, O_RDWR | O_NOFOLLOW)
+        fileDescriptor = Darwin.open(currentPath, O_RDONLY | O_NOFOLLOW)
         if fileDescriptor < 0 {
             halLog("SharedMemory: open failed: \(String(cString: strerror(errno)))")
             return false
@@ -445,14 +478,54 @@ final class SharedAudioBuffer {
         }
         backingDevice = statBuf.st_dev
         backingInode = statBuf.st_ino
+        backingLength = statBuf.st_size
 
-        if statBuf.st_size < alignedHeaderSize || statBuf.st_size > alignedHeaderSize + kMaximumAudioBytes {
-            halLog("SharedMemory: file size is outside transport bounds")
+        if statBuf.st_size == 32 {
+            var record = [UInt8](repeating: 0, count: 32)
+            let count = record.withUnsafeMutableBytes {
+                pread(fileDescriptor, $0.baseAddress, $0.count, 0)
+            }
+            guard count == 32, Array(record.prefix(8)) == Array("SOTFMM08".utf8) else { return false }
+            var length: UInt64 = 0
+            for index in 0..<8 { length |= UInt64(record[8 + index]) << (8 * index) }
+            guard length >= UInt64(alignedHeaderSize),
+                  length <= UInt64(alignedHeaderSize + kMaximumAudioBytes) else { return false }
+            let suffix = record[16..<24].map { String(format: "%02x", $0) }.joined()
+            let endpoint = ((currentPath as NSString).deletingLastPathComponent as NSString)
+                .appendingPathComponent(".fd-\(suffix)")
+            let received = record.withUnsafeBufferPointer { bytes in
+                endpoint.withCString { path in
+                    sotf_receive_memory_descriptor(path, statBuf.st_uid, bytes.baseAddress, bytes.count)
+                }
+            }
+            guard received >= 0 else {
+                halLog("SharedMemory: immutable descriptor handoff failed: \(String(cString: strerror(errno)))")
+                return false
+            }
+            rendezvousDescriptor = fileDescriptor
+            fileDescriptor = received
+            brokeredMapping = true
+            memorySize = Int(length)
+        } else {
+            #if SOTF_HAL_TESTING
+            // Explicit legacy fixtures are admitted only by the test build.
+            // Production initialization always uses an immutable descriptor.
+            guard statBuf.st_size >= alignedHeaderSize,
+                  statBuf.st_size <= alignedHeaderSize + kMaximumAudioBytes else { return false }
             Darwin.close(fileDescriptor)
-            fileDescriptor = -1
+            fileDescriptor = Darwin.open(currentPath, O_RDWR | O_NOFOLLOW)
+            guard fileDescriptor >= 0 else { return false }
+            var fixtureStat = stat()
+            guard fstat(fileDescriptor, &fixtureStat) == 0,
+                  sharedMemoryFileIsDaemonOwned(fixtureStat),
+                  fixtureStat.st_dev == backingDevice, fixtureStat.st_ino == backingInode,
+                  fixtureStat.st_size == backingLength else { return false }
+            memorySize = Int(fixtureStat.st_size)
+            #else
+            halLog("SharedMemory: refusing a truncatable audio file")
             return false
+            #endif
         }
-        memorySize = Int(statBuf.st_size)
 
         // Map memory
         sharedMemory = mmap(nil, memorySize, PROT_READ | PROT_WRITE, MAP_SHARED, fileDescriptor, 0)
@@ -503,6 +576,16 @@ final class SharedAudioBuffer {
         encryptedPlaintextScratch = [UInt8](repeating: 0, count: kMaximumRecordBytes)
         encryptedPayloadScratch = [UInt8](repeating: 0, count: kMaximumRecordBytes)
         encryptedHeaderScratch = [UInt8](repeating: 0, count: kEncryptedRecordHeaderBytes)
+        if brokeredMapping {
+            let old = atomicLoad(&header.pointee.volumeState)
+            if old >> 33 == 0 {
+                let bits = UInt64(clampVolumeScalar(initialVolumeScalar).bitPattern)
+                    | (initialMuted ? UInt64(1) << 32 : 0) | (UInt64(1) << 33)
+                // Never overwrite an IPC volume writer that published while
+                // this control-thread attachment was being prepared.
+                _ = sotf_atomic_compare_exchange_u64(&header.pointee.volumeState, old, bits)
+            }
+        }
         validatedMapping = true
         atomicStore(&header.pointee.driverReady, 1)
         if activeSampleRate != sampleRate
@@ -551,12 +634,12 @@ final class SharedAudioBuffer {
         }
         defer { clearReconfiguration(header) }
 
+        let generation = atomicLoad(&header.pointee.ringGeneration)
+        guard generation < UInt64.max else { return false }
+        atomicStore(&header.pointee.ringGeneration, generation + 1)
         atomicStore(&header.pointee.sampleRate, sampleRate)
         atomicStore(&header.pointee.bufferFrames, bufferFrames)
         atomicStore(&header.pointee.channelCount, channelCount)
-        atomicStore(&header.pointee.requestedChannelCount, channelCount)
-        atomicStore(&header.pointee.actualSampleRate, sampleRate)
-        atomicStore(&header.pointee.actualBufferFrames, bufferFrames)
         atomicStore(&header.pointee.writePosition, 0)
         atomicStore(&header.pointee.readPosition, 0)
         audioCapacity = newCapacity
@@ -586,6 +669,12 @@ final class SharedAudioBuffer {
             Darwin.close(fileDescriptor)
             fileDescriptor = -1
         }
+        if rendezvousDescriptor >= 0 {
+            Darwin.close(rendezvousDescriptor)
+            rendezvousDescriptor = -1
+        }
+        brokeredMapping = false
+        backingLength = 0
 
         backingDevice = 0
         backingInode = 0
@@ -600,7 +689,8 @@ final class SharedAudioBuffer {
         guard fileDescriptor >= 0, !currentPath.isEmpty else { return false }
 
         var descriptorStat = stat()
-        guard fstat(fileDescriptor, &descriptorStat) == 0 else { return false }
+        let identityDescriptor = rendezvousDescriptor >= 0 ? rendezvousDescriptor : fileDescriptor
+        guard fstat(identityDescriptor, &descriptorStat) == 0 else { return false }
 
         var pathStat = stat()
         guard lstat(currentPath, &pathStat) == 0 else { return false }
@@ -608,8 +698,8 @@ final class SharedAudioBuffer {
             && descriptorStat.st_ino == pathStat.st_ino
             && descriptorStat.st_dev == backingDevice
             && descriptorStat.st_ino == backingInode
-            && descriptorStat.st_size == memorySize
-            && pathStat.st_size == memorySize
+            && descriptorStat.st_size == backingLength
+            && pathStat.st_size == backingLength
     }
 
     /// Set active state
@@ -1195,91 +1285,107 @@ final class SharedAudioBuffer {
         return atomicLoad(&header.pointee.requestedChannelCount)
     }
 
-    /// Request a configuration change (called by HAL when client changes sample rate)
-    /// Sets configSource=1 (HAL initiated) and configChanged=1
-    ///
-    /// Memory ordering: values are release-stored before `configChanged`; the
-    /// responder uses acquire loads so it observes one coherent request.
+    /// Control-plane publication only: audio IO never takes this bounded gate.
+    private func withControlLock<T>(_ body: (UnsafeMutablePointer<SharedAudioHeader>) -> T) -> T? {
+        guard let header else { return nil }
+        for _ in 0..<128 {
+            if sotf_atomic_compare_exchange_u32(&header.pointee.controlLock, 0, 1) {
+                defer { atomicStore(&header.pointee.controlLock, 0) }
+                return body(header)
+            }
+        }
+        return nil
+    }
+
+    func configurationSnapshot() -> SharedConfigurationSnapshot? {
+        withControlLock { header in
+            let id = atomicLoad(&header.pointee.configRequestID)
+            let acknowledged = atomicLoad(&header.pointee.configAckID) == id
+            return SharedConfigurationSnapshot(
+                requestID: id,
+                sampleRate: atomicLoad(&header.pointee.requestedSampleRate),
+                bufferFrames: atomicLoad(&header.pointee.requestedBufferFrames),
+                channelCount: atomicLoad(&header.pointee.requestedChannelCount),
+                source: atomicLoad(&header.pointee.configSource),
+                actualSampleRate: atomicLoad(&header.pointee.actualSampleRate),
+                actualBufferFrames: atomicLoad(&header.pointee.actualBufferFrames),
+                actualChannelCount: atomicLoad(&header.pointee.actualChannelCount),
+                status: acknowledged ? atomicLoad(&header.pointee.configStatus) : 0,
+                errorCode: acknowledged ? atomicLoad(&header.pointee.configErrorCode) : 0,
+                pending: atomicLoad(&header.pointee.configChanged) != 0 && !acknowledged
+            )
+        }
+    }
+
     @discardableResult
     func requestConfigChange(sampleRate: UInt32, bufferFrames: UInt32, channelCount: UInt32) -> Bool {
-        guard let header = header else { return false }
-        if reconfigurationRequested(header) {
-            return false
-        }
-        atomicStore(&header.pointee.requestedSampleRate, sampleRate)
-        atomicStore(&header.pointee.requestedBufferFrames, bufferFrames)
-        atomicStore(&header.pointee.requestedChannelCount, channelCount)
-        atomicStore(&header.pointee.configStatus, 0)  // pending
-        atomicStore(&header.pointee.configSource, 1)  // HAL initiated
-        atomicStore(&header.pointee.configChanged, 1)
-        return true
+        requestConfigChangeWithID(sampleRate: sampleRate, bufferFrames: bufferFrames, channelCount: channelCount) != nil
     }
 
-    /// Wait for daemon to acknowledge config change
-    /// Returns true if accepted (status=1), false otherwise
-    func waitForConfigAck(timeout: Int) -> Bool {
-        let start = DispatchTime.now()
-        while true {
-            let status = getConfigStatus()
-            if status != 0 {  // Not pending anymore
-                return status == 1  // 1 = accepted
-            }
-            if DispatchTime.now() > start + .milliseconds(timeout) {
-                return false  // Timeout
-            }
-            usleep(10_000)  // 10ms
-        }
+    func requestConfigChangeWithID(sampleRate: UInt32, bufferFrames: UInt32, channelCount: UInt32) -> UInt64? {
+        guard let header, !reconfigurationRequested(header) else { return nil }
+        return withControlLock { header -> UInt64? in
+            let previous = atomicLoad(&header.pointee.configRequestID)
+            guard previous != UInt64.max else { return nil }
+            let id = previous + 1
+            atomicStore(&header.pointee.requestedSampleRate, sampleRate)
+            atomicStore(&header.pointee.requestedBufferFrames, bufferFrames)
+            atomicStore(&header.pointee.requestedChannelCount, channelCount)
+            atomicStore(&header.pointee.configStatus, 0)
+            atomicStore(&header.pointee.configErrorCode, 0)
+            atomicStore(&header.pointee.configSource, 1)
+            atomicStore(&header.pointee.configChanged, 1)
+            atomicStore(&header.pointee.configRequestID, id)
+            return id
+        } ?? nil
     }
 
-    /// Set config status (atomic)
-    func setConfigStatus(_ status: UInt32) {
-        guard let header = header else { return }
-        atomicStore(&header.pointee.configStatus, status)
+    /// Publish an ACK only for the retained request identity.
+    @discardableResult
+    func acknowledgeConfigChange(requestID: UInt64, actualSampleRate: UInt32, actualBufferFrames: UInt32,
+                                 actualChannelCount: UInt32, status: UInt32, errorCode: UInt32) -> Bool {
+        withControlLock { header in
+            guard requestID != 0, atomicLoad(&header.pointee.configRequestID) == requestID else { return false }
+            atomicStore(&header.pointee.actualSampleRate, actualSampleRate)
+            atomicStore(&header.pointee.actualBufferFrames, actualBufferFrames)
+            atomicStore(&header.pointee.actualChannelCount, actualChannelCount)
+            atomicStore(&header.pointee.configErrorCode, errorCode)
+            atomicStore(&header.pointee.configStatus, status)
+            atomicStore(&header.pointee.configAckID, requestID)
+            atomicStore(&header.pointee.configChanged, 0)
+            return true
+        } ?? false
     }
 
-    /// Acknowledge a daemon-initiated config change.
-    func acknowledgeConfigChange(actualSampleRate: UInt32, actualBufferFrames: UInt32, status: UInt32, errorCode: UInt32) {
-        guard let header = header else { return }
-        atomicStore(&header.pointee.actualSampleRate, actualSampleRate)
-        atomicStore(&header.pointee.actualBufferFrames, actualBufferFrames)
-        atomicStore(&header.pointee.configErrorCode, errorCode)
-        atomicStore(&header.pointee.configStatus, status)
-        atomicStore(&header.pointee.configChanged, 0)
-    }
-
-    /// Clear config changed flag (called after handling daemon-initiated change)
-    func clearConfigChanged() {
-        guard let header = header else { return }
-        atomicStore(&header.pointee.configChanged, 0)
-    }
-
-    // MARK: - Output Volume Methods (version 7+)
-
-    /// Current shared output volume. Generation 0 means neither side has
-    /// published a volume yet and the values are meaningless.
+    /// Atomically observe scalar, mute, and generation from one publication.
     func outputVolume() -> (scalarBits: UInt32, muted: Bool, generation: UInt32) {
-        guard let header = header else { return (0, false, 0) }
-        let generation = atomicLoad(&header.pointee.volumeGeneration)
-        let scalarBits = atomicLoad(&header.pointee.volumeScalarBits)
-        let muted = atomicLoad(&header.pointee.outputMuted) != 0
-        return (scalarBits, muted, generation)
+        guard let header else { return (0, false, 0) }
+        let state = atomicLoad(&header.pointee.volumeState)
+        return (UInt32(truncatingIfNeeded: state), state & (1 << 32) != 0, UInt32(state >> 33))
     }
 
-    /// Publish an output volume change and return the new generation.
-    ///
-    /// Memory ordering mirrors the Rust side: values are release-stored
-    /// before the generation, so a reader that observes the new generation
-    /// also observes the values. Generation 0 is the "unpublished"
-    /// sentinel and is skipped on wraparound.
+    /// Patch independent controls without overwriting another writer's mute/volume intent.
+    func patchOutputVolume(scalarBits: UInt32?, muted: Bool?) -> (scalarBits: UInt32, muted: Bool, generation: UInt32)? {
+        guard let header else { return nil }
+        while true {
+            let old = atomicLoad(&header.pointee.volumeState)
+            let previousGeneration = UInt32(old >> 33)
+            let oldBits = previousGeneration == 0 ? Float32(1).bitPattern : UInt32(truncatingIfNeeded: old)
+            let value = Float32(bitPattern: scalarBits ?? oldBits)
+            let bits = (value.isFinite ? min(max(value, 0), 1) : 1).bitPattern
+            let mute = muted ?? (old & (1 << 32) != 0)
+            var generation = (previousGeneration &+ 1) & 0x7fff_ffff
+            if generation == 0 { generation = 1 }
+            let next = UInt64(bits) | (UInt64(mute ? 1 : 0) << 32) | (UInt64(generation) << 33)
+            if sotf_atomic_compare_exchange_u64(&header.pointee.volumeState, old, next) {
+                return (bits, mute, generation)
+            }
+        }
+    }
+
     @discardableResult
     func setOutputVolume(scalarBits: UInt32, muted: Bool) -> UInt32 {
-        guard let header = header else { return 0 }
-        atomicStore(&header.pointee.volumeScalarBits, scalarBits)
-        atomicStore(&header.pointee.outputMuted, muted ? 1 : 0)
-        var generation = atomicLoad(&header.pointee.volumeGeneration) &+ 1
-        if generation == 0 { generation = 1 }
-        atomicStore(&header.pointee.volumeGeneration, generation)
-        return generation
+        patchOutputVolume(scalarBits: scalarBits, muted: muted)?.generation ?? 0
     }
 
     deinit {

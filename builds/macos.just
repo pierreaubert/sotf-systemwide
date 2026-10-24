@@ -82,34 +82,59 @@ test-hal-driver-swift:
 	mkdir -p "$CLANG_CACHE_DIR"
 	HAL_SWIFT_DIR="swift/driver-hal"
 	BUILD_DIR="target/debug/SotFHALTests.bundle"
-	SWIFT_SANITIZER_FLAGS=()
+	# Keep one argument even without a sanitizer: macOS Bash 3.2 treats an
+	# empty array expansion as unbound under nounset.
+	SWIFT_FLAGS=(-O -D SOTF_HAL_TESTING)
+	PRODUCTION_SWIFT_FLAGS=(-O)
 	case "${SOTF_HAL_SANITIZER:-}" in
 		"") ;;
 		thread|address)
-			SWIFT_SANITIZER_FLAGS=("-sanitize=${SOTF_HAL_SANITIZER}")
+			SWIFT_FLAGS+=("-sanitize=${SOTF_HAL_SANITIZER}")
+			PRODUCTION_SWIFT_FLAGS+=("-sanitize=${SOTF_HAL_SANITIZER}")
 			BUILD_DIR="target/debug/SotFHALTests-${SOTF_HAL_SANITIZER}.bundle"
 			;;
 		*) echo "Unsupported SOTF_HAL_SANITIZER" >&2; exit 2 ;;
 	esac
-	mkdir -p "$BUILD_DIR/Contents/MacOS" "$BUILD_DIR/Contents/Resources"
-	WORKER_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
-	{{cargo}} build --manifest-path ../sotf-daw/Cargo.toml -p driver-hal --features swift-stress-worker --bin hal-transport-worker
-	if [[ "$WORKER_TARGET_DIR" = /* ]]; then
-		WORKER_PATH="$WORKER_TARGET_DIR/debug/hal-transport-worker"
-	else
-		WORKER_PATH="$(pwd)/$WORKER_TARGET_DIR/debug/hal-transport-worker"
+	if [[ "${SOTF_HAL_ALLOCATION_PROBE:-0}" = 1 ]]; then
+		test -z "${SOTF_HAL_SANITIZER:-}"
+		BUILD_DIR="target/debug/SotFHALAllocationTests.bundle"
 	fi
+	mkdir -p "$BUILD_DIR/Contents/MacOS" "$BUILD_DIR/Contents/Resources"
+	# Allocation observation is opt-in and incompatible with sanitizer interposers.
+	if [[ "${SOTF_HAL_ALLOCATION_PROBE:-0}" = 1 ]]; then
+		PROBE_LIBRARY="$(pwd)/$BUILD_DIR/Contents/MacOS/libSotFAllocationObserver.dylib"
+		clang -O2 -Wall -Wextra -Werror -dynamiclib \
+			-install_name "@rpath/libSotFAllocationObserver.dylib" \
+			-o "$PROBE_LIBRARY" "$HAL_SWIFT_DIR/TestAllocationObserver.c"
+		SWIFT_FLAGS+=(-D SOTF_HAL_ALLOCATION_PROBE -L "$BUILD_DIR/Contents/MacOS" \
+			-lSotFAllocationObserver -Xlinker -rpath -Xlinker @executable_path)
+	fi
+	WORKER_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+	if [[ "$WORKER_TARGET_DIR" != /* ]]; then
+		WORKER_TARGET_DIR="$(pwd)/$WORKER_TARGET_DIR"
+	fi
+	# Both workspaces must use the directory from which the runners are loaded.
+	# Without an explicit target, Cargo puts the DAW worker in ../sotf-daw/target.
+	export CARGO_TARGET_DIR="$WORKER_TARGET_DIR"
+	WORKER_PROFILE="${SOTF_HAL_WORKER_PROFILE:-debug}"
+	CARGO_PROFILE_FLAGS=(--profile dev)
+	case "$WORKER_PROFILE" in
+		debug) ;;
+		release) CARGO_PROFILE_FLAGS=(--release) ;;
+		*) echo "Unsupported SOTF_HAL_WORKER_PROFILE" >&2; exit 2 ;;
+	esac
+	{{cargo}} build "${CARGO_PROFILE_FLAGS[@]}" --manifest-path ../sotf-daw/Cargo.toml -p driver-hal --features swift-stress-worker --bin hal-transport-worker --bin hal-capture-stress
+	WORKER_PATH="$WORKER_TARGET_DIR/$WORKER_PROFILE/hal-transport-worker"
 	test -x "$WORKER_PATH"
 	echo "Building and running Swift HAL tests..."
 	CLANG_MODULE_CACHE_PATH="$CLANG_CACHE_DIR" swiftc \
-		"${SWIFT_SANITIZER_FLAGS[@]}" \
+		"${SWIFT_FLAGS[@]}" \
 		-o "$BUILD_DIR/Contents/MacOS/SotFHALTests" \
 		-module-name SotFHALTests \
-		-import-objc-header "$HAL_SWIFT_DIR/Sources/BridgingHeader.h" \
+		-import-objc-header "$HAL_SWIFT_DIR/TestBridgingHeader.h" \
 		-framework CoreAudio \
 		-framework CoreFoundation \
 		-framework Foundation \
-		-O \
 		"$HAL_SWIFT_DIR/Sources/Timing.swift" \
 		"$HAL_SWIFT_DIR/Sources/RingBuffer.swift" \
 		"$HAL_SWIFT_DIR/Sources/SharedMemory.swift" \
@@ -118,12 +143,34 @@ test-hal-driver-swift:
 		"$HAL_SWIFT_DIR/Sources/SotFHALDriver.swift" \
 		"$HAL_SWIFT_DIR/Sources/Tests.swift" \
 		"$HAL_SWIFT_DIR/TestsRunner.swift"
+	CLANG_MODULE_CACHE_PATH="$CLANG_CACHE_DIR" swiftc \
+		"${PRODUCTION_SWIFT_FLAGS[@]}" \
+		-o "$BUILD_DIR/Contents/MacOS/SotFHALAttachmentProbe" \
+		-module-name SotFHALAttachmentProbe \
+		-import-objc-header "$HAL_SWIFT_DIR/Sources/BridgingHeader.h" \
+		-framework CoreAudio \
+		-framework CoreFoundation \
+		-framework Foundation \
+		"$HAL_SWIFT_DIR/Sources/Timing.swift" \
+		"$HAL_SWIFT_DIR/Sources/RingBuffer.swift" \
+		"$HAL_SWIFT_DIR/Sources/SharedMemory.swift" \
+		"$HAL_SWIFT_DIR/Sources/Encryption.swift" \
+		"$HAL_SWIFT_DIR/Sources/RealtimeChaChaPoly.swift" \
+		"$HAL_SWIFT_DIR/Sources/SotFHALDriver.swift" \
+		"$HAL_SWIFT_DIR/DescriptorProbe.swift"
 	cp "$HAL_SWIFT_DIR/TestsBundleInfo.plist" "$BUILD_DIR/Contents/Info.plist"
 	cp "../sotf-daw/crates/driver-hal/shared_memory_layout.json" \
 		"$BUILD_DIR/Contents/Resources/shared_memory_layout.json"
 	chmod 755 "$BUILD_DIR/Contents/MacOS/SotFHALTests"
-	SOTF_RUST_HAL_TRANSPORT_WORKER="$WORKER_PATH" \
+	SOTF_SWIFT_HAL_ATTACHMENT_PROBE="$(pwd)/$BUILD_DIR/Contents/MacOS/SotFHALAttachmentProbe" \
+		SOTF_RUST_HAL_TRANSPORT_WORKER="$WORKER_PATH" \
+		SOTF_RUST_HAL_CAPTURE_WORKER="$(dirname "$WORKER_PATH")/hal-capture-stress" \
 		"$BUILD_DIR/Contents/MacOS/SotFHALTests"
+
+# Measure release Rust/Swift transport hot paths with and without control churn.
+[group('test')]
+bench-hal-transport:
+	bash scripts/bench-hal-transport.sh
 
 # Build all macOS daemon components (daemon + Systemwide app + HAL driver)
 [group('build-macos')]

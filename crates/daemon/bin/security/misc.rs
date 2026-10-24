@@ -158,6 +158,10 @@ pub fn ensure_secure_socket_dir(socket_path: &Path) -> std::io::Result<()> {
         return Ok(());
     };
 
+    #[cfg(windows)]
+    let _directory = crate::ipc_transport::secure_windows_runtime_directory(parent)?;
+
+    #[cfg(not(windows))]
     if !parent.exists() {
         std::fs::create_dir_all(parent)?;
     }
