@@ -283,3 +283,14 @@ This repo contains only the daemon crate; driver crates live in the sibling
 - [daemon/README.md](crates/daemon/README.md)
 - [driver-hal README](../sotf-daw/crates/driver-hal/README.md)
 - [daemon/configbar/README_CONFIGURATION.md](crates/daemon/configbar/README_CONFIGURATION.md)
+
+### Recording system audio on macOS
+
+Select **SOTF Virtual Audio** as the playback destination and as the input in your
+recording application. The HAL exposes matching input and output channel counts
+and sample rates. The input loops back the playback mix **before** the daemon's
+plugin chain, EQ, and output volume processing; it does not record the processed
+hardware output. Keep SOTF's hardware output set to a physical device.
+
+After upgrading an older output-only HAL bundle, reinstall the driver and restart
+CoreAudio (or reboot) so recording applications discover the new input stream.

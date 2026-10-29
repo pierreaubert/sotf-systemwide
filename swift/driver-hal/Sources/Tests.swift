@@ -63,6 +63,7 @@ final class HALDriverTests {
     @discardableResult
     static func runAllTests() -> Bool {
         let tests: [(String, () -> Bool)] = [
+            ("testRecordingInputDiscoveryAndLoopback", testRecordingInputDiscoveryAndLoopback),
             ("testZeroTimestampSurvivesRateReanchor", testZeroTimestampSurvivesRateReanchor),
             ("testClockSnapshotsDuringRateChanges", testClockSnapshotsDuringRateChanges),
             ("testRingBufferBasicOperations", testRingBufferBasicOperations),
@@ -337,6 +338,37 @@ final class HALDriverTests {
         } catch { print("Callback fixture failed: \(error)"); return false }
     }
     #endif
+
+    /// Discover the recording endpoint before exercising its real IO callbacks.
+    static func testRecordingInputDiscoveryAndLoopback() -> Bool {
+        let state = DriverState.shared
+        let original = (sampleRate: state.sampleRate, bufferFrames: state.bufferFrameSize, channelCount: state.channelCount)
+        let oldLoopback = state.loopbackEnabled
+        defer {
+            state.loopbackEnabled = oldLoopback
+            state.testPrepareHALCallbackGeometry(sampleRate: UInt32(original.sampleRate),
+                frames: original.bufferFrames, channels: original.channelCount)
+        }
+        state.loopbackEnabled = true
+        for channels: UInt32 in [2, 8] {
+            state.testPrepareHALCallbackGeometry(sampleRate: 48_000, frames: 64, channels: channels)
+            guard testHALRecordingProperties() else { return false }
+            var samples = (0..<Int(64 * channels)).map { Float($0) / 1024 }
+            var recorded = [Float](repeating: -1, count: samples.count)
+            let write = samples.withUnsafeMutableBytes {
+                testInvokeHALCallback(write: true, frames: 64, main: $0.baseAddress!)
+            }
+            let read = recorded.withUnsafeMutableBytes {
+                testInvokeHALCallback(write: false, frames: 64, main: $0.baseAddress!)
+            }
+            guard write == noErr, read == noErr, recorded == samples else { return false }
+            let emptyRead = recorded.withUnsafeMutableBytes {
+                testInvokeHALCallback(write: false, frames: 64, main: $0.baseAddress!)
+            }
+            guard emptyRead == noErr, recorded.allSatisfy({ $0 == 0 }) else { return false }
+        }
+        return true
+    }
 
     /// A live mapping alone must not admit audio from an expired daemon session.
     static func testHALCallbackHonorsDaemonHeartbeat() -> Bool {

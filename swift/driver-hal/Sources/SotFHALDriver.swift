@@ -797,12 +797,16 @@ final class DriverState {
     private func notifyConfigurationPropertiesChanged() {
         notifyPropertyChanged(objectID: kDeviceObjectID, selector: kSelector_NominalSampleRate)
         notifyPropertyChanged(objectID: kDeviceObjectID, selector: kSelector_BufferFrameSize)
-        notifyPropertyChanged(objectID: kDeviceObjectID, selector: kSelector_StreamConfig)
-        notifyPropertyChanged(objectID: kDeviceObjectID, selector: kSelector_PreferredLayout)
-        notifyPropertyChanged(objectID: kOutputStreamObjectID, selector: kSelector_VirtualFormat)
-        notifyPropertyChanged(objectID: kOutputStreamObjectID, selector: kSelector_AvailableVirtualFmts)
-        notifyPropertyChanged(objectID: kOutputStreamObjectID, selector: kSelector_PhysicalFormat)
-        notifyPropertyChanged(objectID: kOutputStreamObjectID, selector: kSelector_AvailablePhysicalFmts)
+        for scope in [kScope_Input, kScope_Output] {
+            notifyPropertyChanged(objectID: kDeviceObjectID, selector: kSelector_StreamConfig, scope: scope)
+            notifyPropertyChanged(objectID: kDeviceObjectID, selector: kSelector_PreferredLayout, scope: scope)
+        }
+        for stream in [kInputStreamObjectID, kOutputStreamObjectID] {
+            notifyPropertyChanged(objectID: stream, selector: kSelector_VirtualFormat)
+            notifyPropertyChanged(objectID: stream, selector: kSelector_AvailableVirtualFmts)
+            notifyPropertyChanged(objectID: stream, selector: kSelector_PhysicalFormat)
+            notifyPropertyChanged(objectID: stream, selector: kSelector_AvailablePhysicalFmts)
+        }
     }
 
     /// Retain a resolved configuration until the bounded shared gate permits publication.
@@ -1119,6 +1123,13 @@ private func scopeMatches(_ queryScope: UInt32, _ targetScope: UInt32) -> Bool {
     return queryScope == kScope_Wildcard || queryScope == targetScope || queryScope == kScope_Global
 }
 
+private func streamObjects(scope: UInt32) -> [AudioObjectID] {
+    var streams: [AudioObjectID] = []
+    if scopeMatches(scope, kScope_Input) { streams.append(kInputStreamObjectID) }
+    if scopeMatches(scope, kScope_Output) { streams.append(kOutputStreamObjectID) }
+    return streams
+}
+
 /// The class filter of an 'ownd' query: the qualifier data holds an
 /// AudioClassID, or 0 here when the caller asked for every owned object.
 private func qualifierClassID(size: UInt32, data: UnsafeRawPointer?) -> UInt32 {
@@ -1138,11 +1149,11 @@ private func ownedObjects(for objectID: AudioObjectID, scope: UInt32, qualifierC
     case kPlugInObjectID:
         return matches([kClassID_Device, kClassID_Object]) ? [kDeviceObjectID] : []
     case kDeviceObjectID:
-        guard scopeMatches(scope, kScope_Output) else { return [] }
         var result: [AudioObjectID] = []
         if matches([kClassID_Stream, kClassID_Object]) {
-            result.append(kOutputStreamObjectID)
+            result.append(contentsOf: streamObjects(scope: scope))
         }
+        guard scopeMatches(scope, kScope_Output) else { return result }
         if matches([kClassID_VolumeControl, kClassID_LevelControl, kClassID_Control, kClassID_Object]) {
             result.append(kVolumeControlObjectID)
         }
@@ -1420,11 +1431,7 @@ private func driverGetPropertyDataSize(_ driver: AudioServerPlugInDriverRef, _ o
         outDataSize.pointee = UInt32(MemoryLayout<AudioObjectID>.size * owned.count)
 
     case kSelector_Streams:
-        if scope == kScope_Input {
-            outDataSize.pointee = 0  // No input streams
-        } else {
-            outDataSize.pointee = UInt32(MemoryLayout<AudioObjectID>.size)  // 1 output stream
-        }
+        outDataSize.pointee = UInt32(MemoryLayout<AudioObjectID>.size * streamObjects(scope: scope).count)
 
     case kSelector_RelatedDevices:
         outDataSize.pointee = UInt32(MemoryLayout<AudioObjectID>.size)
@@ -1618,8 +1625,9 @@ private func driverGetPropertyData(_ driver: AudioServerPlugInDriverRef, _ objec
         outDataSize.pointee = 4
 
     case kSelector_CanBeDefault, kSelector_CanBeSystemDefault:
-        // Output-only device: cannot be default input device
-        let canBe: UInt32 = (scope == kScope_Input) ? 0 : 1
+        // Recording clients may select this device as their default input.
+        // System sound effects remain an output-only role.
+        let canBe: UInt32 = (sel == kSelector_CanBeSystemDefault && scope == kScope_Input) ? 0 : 1
         outData.storeBytes(of: canBe, as: UInt32.self)
         outDataSize.pointee = 4
 
@@ -1670,12 +1678,13 @@ private func driverGetPropertyData(_ driver: AudioServerPlugInDriverRef, _ objec
         outDataSize.pointee = UInt32(MemoryLayout<AudioValueRange>.size)
 
     case kSelector_Streams:
-        if scope == kScope_Input {
-            outDataSize.pointee = 0  // No input streams
-        } else {
-            outData.storeBytes(of: kOutputStreamObjectID, as: AudioObjectID.self)
-            outDataSize.pointee = 4
+        let streams = streamObjects(scope: scope)
+        let requiredSize = UInt32(MemoryLayout<AudioObjectID>.size * streams.count)
+        guard inDataSize >= requiredSize else { return kAudioHardwareBadPropertySizeError }
+        for (index, stream) in streams.enumerated() {
+            outData.assumingMemoryBound(to: AudioObjectID.self)[index] = stream
         }
+        outDataSize.pointee = requiredSize
 
     case kSelector_PreferredStereo:
         let channels = outData.assumingMemoryBound(to: UInt32.self)
@@ -1684,22 +1693,14 @@ private func driverGetPropertyData(_ driver: AudioServerPlugInDriverRef, _ objec
         outDataSize.pointee = 8
 
     case kSelector_StreamConfig:
-        if scope == kScope_Input {
-            // No input streams
-            var bufferList = AudioBufferList()
-            bufferList.mNumberBuffers = 0
-            outData.storeBytes(of: bufferList, as: AudioBufferList.self)
-            outDataSize.pointee = UInt32(MemoryLayout<AudioBufferList>.size)
-        } else {
-            // Output: 1 interleaved buffer with proper channel count
-            var bufferList = AudioBufferList()
-            bufferList.mNumberBuffers = 1
-            bufferList.mBuffers.mNumberChannels = configuration.channelCount
-            bufferList.mBuffers.mDataByteSize = 0
-            bufferList.mBuffers.mData = nil
-            outData.storeBytes(of: bufferList, as: AudioBufferList.self)
-            outDataSize.pointee = UInt32(MemoryLayout<AudioBufferList>.size)
-        }
+        // Both directions expose one interleaved buffer with the active geometry.
+        var bufferList = AudioBufferList()
+        bufferList.mNumberBuffers = 1
+        bufferList.mBuffers.mNumberChannels = configuration.channelCount
+        bufferList.mBuffers.mDataByteSize = 0
+        bufferList.mBuffers.mData = nil
+        outData.storeBytes(of: bufferList, as: AudioBufferList.self)
+        outDataSize.pointee = UInt32(MemoryLayout<AudioBufferList>.size)
 
     // Stream properties
     case kSelector_StreamIsActive:
@@ -2424,6 +2425,57 @@ public func SotFHALDriverFactory(_ allocator: CFAllocator?, _ requestedTypeUUID:
 }
 
 #if SOTF_HAL_TESTING
+// Exercise CoreAudio's property discovery path, including size/data agreement.
+func testHALRecordingProperties() -> Bool {
+    var unusedDriver: UnsafeMutablePointer<AudioServerPlugInDriverInterface>? = nil
+    return withUnsafeMutablePointer(to: &unusedDriver) { driver in
+        func property(_ object: AudioObjectID, _ selector: UInt32, _ scope: UInt32,
+                      _ check: (UnsafeRawPointer, UInt32) -> Bool) -> Bool {
+            var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: 0)
+            guard driverHasProperty(driver, object, 0, &address).boolValue else { return false }
+            var size: UInt32 = 0
+            guard driverGetPropertyDataSize(driver, object, 0, &address, 0, nil, &size) == noErr,
+                  size > 0 else { return false }
+            let bytes = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: 16)
+            defer { bytes.deallocate() }
+            var actual: UInt32 = 0
+            return driverGetPropertyData(driver, object, 0, &address, 0, nil, size, &actual, bytes) == noErr
+                && actual == size && check(UnsafeRawPointer(bytes), actual)
+        }
+        for (scope, expected) in [(kScope_Input, [kInputStreamObjectID]),
+                                  (kScope_Output, [kOutputStreamObjectID]),
+                                  (kScope_Global, [kInputStreamObjectID, kOutputStreamObjectID]),
+                                  (kScope_Wildcard, [kInputStreamObjectID, kOutputStreamObjectID])] {
+            guard property(kDeviceObjectID, kSelector_Streams, scope, { bytes, size in
+                Array(UnsafeBufferPointer(start: bytes.assumingMemoryBound(to: AudioObjectID.self),
+                                          count: Int(size) / MemoryLayout<AudioObjectID>.size)) == expected
+            }) else { return false }
+        }
+        guard property(kDeviceObjectID, kSelector_OwnedObjects, kScope_Input, { bytes, size in
+            size == 4 && bytes.load(as: AudioObjectID.self) == kInputStreamObjectID
+        }), property(kDeviceObjectID, kSelector_CanBeDefault, kScope_Input, { bytes, _ in
+            bytes.load(as: UInt32.self) == 1
+        }), property(kInputStreamObjectID, kSelector_StreamDirection, kScope_Global, { bytes, _ in
+            bytes.load(as: UInt32.self) == 1
+        }) else { return false }
+        for scope in [kScope_Input, kScope_Output] {
+            guard property(kDeviceObjectID, kSelector_StreamConfig, scope, { bytes, _ in
+                let buffers = bytes.load(as: AudioBufferList.self)
+                return buffers.mNumberBuffers == 1
+                    && buffers.mBuffers.mNumberChannels == DriverState.shared.activeConfiguration().channelCount
+            }) else { return false }
+        }
+        for stream in [kInputStreamObjectID, kOutputStreamObjectID] {
+            guard property(stream, kSelector_VirtualFormat, kScope_Global, { bytes, _ in
+                let format = bytes.load(as: AudioStreamBasicDescription.self)
+                let config = DriverState.shared.activeConfiguration()
+                return format.mChannelsPerFrame == config.channelCount && format.mSampleRate == config.sampleRate
+            }) else { return false }
+        }
+        return true
+    }
+}
+
 // Test-build access to the exact callback entry point; no installed driver needed.
 func testInvokeHALCallback(write: Bool, frames: UInt32, main: UnsafeMutableRawPointer,
                            secondary: UnsafeMutableRawPointer? = nil) -> OSStatus {
