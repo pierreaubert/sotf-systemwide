@@ -238,6 +238,11 @@ capture drivers:
   through a C11 atomic snapshot. The CoreAudio IO callback never acquires the
   control-plane `configurationLock`; only successful configuration commits
   update the snapshot, after local ring buffers have been rebuilt.
+- The HAL advertises an input stream as well as an output stream. Recording
+  clients receive the pre-processing playback mix through `WriteMix` → local
+  loopback ring → `ReadInput`, independently of the daemon capture ring. Both
+  streams share the active sample rate and channel geometry and receive format
+  change notifications.
 - The Swift loopback uses one interleaved SPSC ring with C11 acquire/release
   frame cursors. A block is published with one release store after every
   channel has been copied, so consumers cannot observe a partially published
