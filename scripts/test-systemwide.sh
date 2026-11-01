@@ -84,6 +84,14 @@ test_rust_common() {
 test_macos() {
     require_platform Darwin
 
+    # Keep HAL-enabled tests away from the installed driver's shared memory
+    # and session key, matching the isolated systemwide-lab recipe.
+    local contract_runtime_dir
+    contract_runtime_dir=$(mktemp -d /private/tmp/sotf-systemwide-contracts.XXXXXX)
+    trap 'rm -rf "$SOTF_SYSTEMWIDE_RUNTIME_DIR"' EXIT
+    export SOTF_SYSTEMWIDE_RUNTIME_DIR="$contract_runtime_dir"
+    unset SOTF_HAL_SHARED_MEMORY_PATH
+
     phase "macOS HAL Rust tests"
     cargo test --locked --manifest-path ../sotf-daw/Cargo.toml -p driver-hal
 

@@ -285,7 +285,8 @@ clean_build() {
     fi
 }
 
-BUILD_DIR="$PROJECT_ROOT/target/$BUILD_TYPE"
+# Swift dist recipes always stage here, including debug daemon packages.
+BUILD_DIR="$PROJECT_ROOT/target/dist"
 
 # Build all components using just (reuses Justfile logic)
 build_components() {
@@ -298,9 +299,12 @@ build_components() {
     # SwiftPM's scratch tree is regenerated so source/target membership and
     # generated module dependencies cannot survive a Package.swift change.
     log_info "Resolving current workspace dependencies..."
-    cargo metadata --locked --format-version 1 --no-deps >/dev/null
+    local cargo_target_dir
+    cargo_target_dir=$(cargo metadata --locked --format-version 1 --no-deps | \
+        python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+    DAEMON_BUILD_DIR="$cargo_target_dir/$BUILD_TYPE"
     swift package --package-path "$CONFIGBAR_DIR" resolve
-    rm -f "$BUILD_DIR/$DAEMON_BINARY" "$BUILD_DIR/$SYSTEMWIDE_BINARY"
+    rm -f "$DAEMON_BUILD_DIR/$DAEMON_BINARY" "$BUILD_DIR/$SYSTEMWIDE_BINARY"
     rm -rf "$BUILD_DIR/configbar-swiftpm"
 
     if $DEBUG; then
@@ -311,8 +315,7 @@ build_components() {
         if $BUILD_HAL; then
             log_info "Building HAL driver (debug)..."
             # The Swift HAL driver always builds optimised; reuse the dist
-            # recipe so its output ends up under target/dist/, matching the
-            # BUILD_DIR computed above in non-debug mode.
+            # recipe so its output ends up under target/dist/.
             just dist-hal-driver
         fi
 
@@ -329,8 +332,8 @@ build_components() {
     fi
 
     # Verify daemon binary exists
-    if [ ! -f "$BUILD_DIR/$DAEMON_BINARY" ]; then
-        log_error "Daemon binary not found at $BUILD_DIR/$DAEMON_BINARY"
+    if [ ! -f "$DAEMON_BUILD_DIR/$DAEMON_BINARY" ]; then
+        log_error "Daemon binary not found at $DAEMON_BUILD_DIR/$DAEMON_BINARY"
         exit 1
     fi
     if [ ! -f "$BUILD_DIR/$SYSTEMWIDE_BINARY" ]; then
@@ -489,10 +492,10 @@ EOF
     echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 
     # Copy daemon binary to Helpers
-    cp "$BUILD_DIR/$DAEMON_BINARY" "$APP_BUNDLE/Contents/Helpers/"
+    cp "$DAEMON_BUILD_DIR/$DAEMON_BINARY" "$APP_BUNDLE/Contents/Helpers/"
     chmod +x "$APP_BUNDLE/Contents/Helpers/$DAEMON_BINARY"
     if ! cmp -s \
-        "$BUILD_DIR/$DAEMON_BINARY" \
+        "$DAEMON_BUILD_DIR/$DAEMON_BINARY" \
         "$APP_BUNDLE/Contents/Helpers/$DAEMON_BINARY"; then
         log_error "Embedded daemon differs from freshly built daemon"
         exit 1

@@ -41,6 +41,7 @@ swiftc -warnings-as-errors \
 
 echo "==> HAL driver tests type-check, warnings as errors"
 swiftc -warnings-as-errors \
+    -D SOTF_HAL_TESTING \
     -module-cache-path "$module_cache" \
     -typecheck \
     -module-name SotFHALTests \

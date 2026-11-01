@@ -44,6 +44,7 @@ prod-hal-driver:
 	mkdir -p "$BUILD_DIR/Contents/Resources"
 	echo "Building Swift HAL driver..."
 	swiftc \
+		-target "$(uname -m)-apple-macos15.0" \
 		-emit-library \
 		-o "$BUILD_DIR/Contents/MacOS/SotFHAL" \
 		-module-name SotFHAL \
@@ -212,6 +213,7 @@ dist-hal-driver:
 	mkdir -p "$BUILD_DIR/Contents/Resources"
 	echo "Building Swift HAL driver (dist)..."
 	swiftc \
+		-target "$(uname -m)-apple-macos15.0" \
 		-emit-library \
 		-o "$BUILD_DIR/Contents/MacOS/SotFHAL" \
 		-module-name SotFHAL \

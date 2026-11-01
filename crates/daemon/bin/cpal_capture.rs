@@ -358,14 +358,14 @@ fn build_stream_for_format<T>(
     drops: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
     convert: fn(T) -> f32,
-) -> Result<Stream, cpal::BuildStreamError>
+) -> Result<Stream, cpal::Error>
 where
     T: SizedSample + Copy + 'static,
 {
     let mut callback =
         make_input_callback(queue, capacity, drops, config.channels as usize, convert);
     device.build_input_stream(
-        config,
+        *config,
         move |data: &[T], _| callback(data),
         move |_error| {
             failed.store(true, Ordering::Release);
@@ -382,7 +382,7 @@ fn build_stream(
     capacity: Arc<AtomicUsize>,
     drops: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
-) -> Result<Stream, cpal::BuildStreamError> {
+) -> Result<Stream, cpal::Error> {
     // `SampleFormat` is non-exhaustive, so the wildcard arm is required: a
     // future format degrades to "unsupported config" instead of breaking the
     // match.
@@ -455,7 +455,7 @@ fn build_stream(
                 s.to_sample()
             })
         }
-        _ => Err(cpal::BuildStreamError::StreamConfigNotSupported),
+        _ => Err(cpal::ErrorKind::UnsupportedConfig.into()),
     }
 }
 
