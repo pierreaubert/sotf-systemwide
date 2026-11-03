@@ -69,9 +69,8 @@ cargo check -p sotf-daemon && cargo clippy -p sotf-daemon
 
 SOTF crates resolve via `../sotf` (`sotf-player`) and `../sotf-daw`
 (`sotf-engine`, `sotf-plugins`, drivers) path dependencies, so this repo
-builds inside the `all_of_sotf` sibling layout. `cargo` commands with
-`--locked` need a `Cargo.lock` first; it is generated on the first full
-resolve (any `cargo build`/`test`).
+builds inside the `all_of_sotf` sibling layout. Normal Cargo builds and tests
+generate or update `Cargo.lock` when dependency resolution requires it.
 
 ## Security
 

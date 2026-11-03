@@ -40,15 +40,15 @@ def sources():
 
 def steps(output):
     daw = ["--manifest-path", str(ROOT / "../sotf-daw/Cargo.toml")]
-    plan = [("driver-common", ["cargo", "test", "--locked", *daw, "-p", "driver-common"])]
+    plan = [("driver-common", ["cargo", "test", *daw, "-p", "driver-common"])]
     for selector in ("lab_tests", "lab_pcm::tests",
                      "buffered_explicit_capture_is_drained_without_synthetic_frame_pacing"):
         plan.append(("engine-" + selector.replace("::", "-"),
-            ["cargo", "test", "--locked", *daw, "-p", "sotf-engine", "--no-default-features",
+            ["cargo", "test", *daw, "-p", "sotf-engine", "--no-default-features",
              "--features", "test-util", "--lib", selector]))
     plan += [
-        ("daemon-native-acl-and-ipc", ["cargo", "test", "--locked", "-p", "sotf-daemon"]),
-        ("allocation-observer", ["cargo", "test", "--locked", "-p", "sotf-callback-metrics", "allocation::tests"]),
+        ("daemon-native-acl-and-ipc", ["cargo", "test", "-p", "sotf-daemon"]),
+        ("allocation-observer", ["cargo", "test", "-p", "sotf-callback-metrics", "allocation::tests"]),
         ("capture-verifier", [sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests",
                               "-p", "test_cpal_capture_bench.py", "-v"]),
         ("latency-provenance", [sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests",
@@ -59,11 +59,11 @@ def steps(output):
                                      "--output-dir", str(output / "capture-closure")]),
         ("lab-latency-release", [sys.executable, str(ROOT / "scripts/bench_lab_latency.py"),
                                  "--output-dir", str(output / "lab-latency")]),
-        ("driver-lint", ["cargo", "clippy", "--locked", *daw, "-p", "driver-common",
+        ("driver-lint", ["cargo", "clippy", *daw, "-p", "driver-common",
                          "--all-targets", "--no-deps", "--", "-D", "warnings"]),
-        ("daemon-lint", ["cargo", "clippy", "--locked", "-p", "sotf-daemon", "-p", "sotf-callback-metrics",
+        ("daemon-lint", ["cargo", "clippy", "-p", "sotf-daemon", "-p", "sotf-callback-metrics",
                          "--all-targets", "--no-deps", "--", "-D", "warnings"]),
-        ("latency-lint", ["cargo", "clippy", "--locked", "-p", "sotf-daemon", "--bench", "lab_latency_benchmark",
+        ("latency-lint", ["cargo", "clippy", "-p", "sotf-daemon", "--bench", "lab_latency_benchmark",
                           "--features", "lab-latency-bench", "--no-deps", "--", "-D", "warnings"]),
     ]
     return plan

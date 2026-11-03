@@ -46,23 +46,23 @@ test_rust_common() {
     fi
     local engine_filter
     for engine_filter in lab_tests lab_pcm::tests buffered_explicit_capture_is_drained_without_synthetic_frame_pacing; do
-        cargo test --locked --manifest-path ../sotf-daw/Cargo.toml -p sotf-engine \
+        cargo test --manifest-path ../sotf-daw/Cargo.toml -p sotf-engine \
             --no-default-features --features "$engine_features" --lib "$engine_filter"
     done
 
     phase "driver-common tests"
-    cargo test --locked --manifest-path ../sotf-daw/Cargo.toml -p driver-common
+    cargo test --manifest-path ../sotf-daw/Cargo.toml -p driver-common
 
     phase "sotf-daemon tests (including real local IPC)"
     if [[ "$(uname -s)" = "Darwin" ]]; then
-        cargo test --locked -p sotf-daemon --features hal
+        cargo test -p sotf-daemon --features hal
     else
-        cargo test --locked -p sotf-daemon
+        cargo test -p sotf-daemon
     fi
 
     phase "Capture allocation observer self-tests and strict lint"
-    cargo test --locked -p sotf-callback-metrics allocation::tests
-    cargo clippy --locked -p sotf-callback-metrics --all-targets --no-deps -- -D warnings
+    cargo test -p sotf-callback-metrics allocation::tests
+    cargo clippy -p sotf-callback-metrics --all-targets --no-deps -- -D warnings
 
     phase "Release CPAL capture closure allocation and timing"
     python3 -m unittest discover -s scripts/tests -p test_cpal_capture_bench.py -v
@@ -77,7 +77,7 @@ test_rust_common() {
     phase "Release source-to-sink latency and PCM integrity"
     python3 -m unittest discover -s scripts/tests -p test_lab_latency_bench.py -v
     bash scripts/bench-lab-latency.sh
-    cargo clippy --locked -p sotf-daemon --bench lab_latency_benchmark \
+    cargo clippy -p sotf-daemon --bench lab_latency_benchmark \
         --features lab-latency-bench --no-deps -- -D warnings
 }
 
@@ -93,12 +93,12 @@ test_macos() {
     unset SOTF_HAL_SHARED_MEMORY_PATH
 
     phase "macOS HAL Rust tests"
-    cargo test --locked --manifest-path ../sotf-daw/Cargo.toml -p driver-hal
+    cargo test --manifest-path ../sotf-daw/Cargo.toml -p driver-hal
 
     test_rust_common
 
     phase "strict Rust lint"
-    cargo clippy --locked \
+    cargo clippy \
         --manifest-path ../sotf-daw/Cargo.toml \
         -p driver-common \
         -p driver-hal \
@@ -106,7 +106,7 @@ test_macos() {
         --no-deps \
         -- \
         -D warnings
-    cargo clippy --locked \
+    cargo clippy \
         -p sotf-daemon \
         --all-targets \
         --no-deps \
@@ -164,12 +164,12 @@ test_linux() {
     require_arm64
 
     phase "portable HAL streaming regression tests"
-    cargo test --locked -p sotf-daemon --test hal_driver_contract_tests
+    cargo test -p sotf-daemon --test hal_driver_contract_tests
 
     test_rust_common
 
     phase "strict Rust lint"
-    cargo clippy --locked \
+    cargo clippy \
         --manifest-path ../sotf-daw/Cargo.toml \
         -p driver-common \
         -p driver-hal \
@@ -177,7 +177,7 @@ test_linux() {
         --no-deps \
         -- \
         -D warnings
-    cargo clippy --locked \
+    cargo clippy \
         -p sotf-daemon \
         --all-targets \
         --no-deps \

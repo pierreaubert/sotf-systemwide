@@ -89,8 +89,3 @@ inherits = "release"
 lto = "fat"
 codegen-units = 1
 incremental = false
-
-# Cargo patches are not inherited from the sibling application workspace.
-# Keep SOFA and the audio engine on the same SQLite version.
-[patch."https://github.com/pierreaubert/sofa-reader"]
-sofa-reader = { path = "../sofa-reader" }

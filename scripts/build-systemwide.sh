@@ -300,7 +300,7 @@ build_components() {
     # generated module dependencies cannot survive a Package.swift change.
     log_info "Resolving current workspace dependencies..."
     local cargo_target_dir
-    cargo_target_dir=$(cargo metadata --locked --format-version 1 --no-deps | \
+    cargo_target_dir=$(cargo metadata --format-version 1 --no-deps | \
         python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
     DAEMON_BUILD_DIR="$cargo_target_dir/$BUILD_TYPE"
     swift package --package-path "$CONFIGBAR_DIR" resolve

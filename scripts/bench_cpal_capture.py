@@ -73,7 +73,7 @@ def main():
     before_path.write_text(json.dumps(before, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     build_log = output / "build.jsonl"
     with build_log.open("w", encoding="utf-8") as stream:
-        subprocess.run(["cargo", "build", "--locked", "--release", "-p", "sotf-callback-metrics",
+        subprocess.run(["cargo", "build", "--release", "-p", "sotf-callback-metrics",
                         "--message-format=json"], cwd=ROOT, stdout=stream, check=True)
     executables = set()
     for line in build_log.read_text(encoding="utf-8").splitlines():
