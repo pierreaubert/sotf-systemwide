@@ -390,6 +390,7 @@ pub fn connect_loopback(port: u16) -> std::io::Result<std::net::TcpStream> {
 /// first line so the daemon can tell the owning user apart from any other
 /// local user able to reach the loopback listener.
 #[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))] // Client half: exercised by tests and external clients.
 pub fn connect_windows(port_file: &Path) -> std::io::Result<IpcStream> {
     let port = read_port_file(port_file)?;
     let token = read_token_file(&token_file_for_port_file(port_file))?;
@@ -439,11 +440,13 @@ pub struct IpcAuthToken([u8; IPC_AUTH_TOKEN_BYTES]);
 #[cfg(any(windows, test))]
 impl IpcAuthToken {
     /// Wrap raw token bytes (parsed or generated, never logged).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_bytes(bytes: [u8; IPC_AUTH_TOKEN_BYTES]) -> Self {
         Self(bytes)
     }
 
     /// Borrow the raw bytes for file publication or comparison.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn bytes(&self) -> &[u8; IPC_AUTH_TOKEN_BYTES] {
         &self.0
     }
@@ -543,6 +546,7 @@ pub fn write_token_file(token_file: &Path, token: &IpcAuthToken) -> std::io::Res
 
 /// Read a auth token back from `token_file` (Windows).
 #[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))] // Only called by `connect_windows`.
 pub fn read_token_file(token_file: &Path) -> std::io::Result<IpcAuthToken> {
     use std::io::Read;
     let acl = windows_acl::PrivateAcl::new()?;

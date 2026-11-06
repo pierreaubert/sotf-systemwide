@@ -995,6 +995,7 @@ mod tests {
     }
     #[cfg(unix)]
     use super::{bind_unix_socket, socket_is_unix_socket};
+    #[cfg(unix)]
     use std::fs;
     use tempfile::tempdir;
 

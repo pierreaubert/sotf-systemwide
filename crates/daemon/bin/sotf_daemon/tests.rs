@@ -5,8 +5,9 @@ use super::audio_daemon::{
     RuntimeTelemetry, VolumeSyncTracker, changed_plugin_parameters, encode_plugin_param_value,
     join_initial_playback_thread, pipeline_timing_after_config_request,
     rack_plugins_to_linear_graph, reorder_linear_graph, startup_channel_geometry,
-    wait_for_playback_observation,
 };
+#[cfg(unix)]
+use super::audio_daemon::wait_for_playback_observation;
 use super::audio_daemon::{ClientSlot, clone_client_shutdown_stream, try_acquire_client_slot};
 use super::command::Command;
 use super::configured::configured_output_device_from_value;
@@ -28,6 +29,7 @@ use super::pipeline_reconfigure_outcome::acknowledged_config_for_outcome;
 use super::pipeline_reconfigure_outcome::handle_driver_config_change;
 use super::pipeline_reconfigure_outcome::publish_reconfigured_driver_readiness;
 use super::pipeline_reconfigure_outcome::reconfigure_audio_pipeline;
+#[cfg(unix)]
 use super::pipeline_reconfigure_outcome::wait_for_reconfigured_playback;
 use super::pipeline_spec::{PipelineSpec, pipeline_spec_to_json, pipeline_specs_match};
 use super::pipeline_supervisor::PipelineSupervisor;
@@ -1481,10 +1483,12 @@ mod ipc_safety_tests {
 
     #[test]
     fn apply_pipeline_plan_starts_engine_with_negotiated_timing() {
-        let source = include_str!("audio_daemon.rs");
+        let source = include_str!("audio_daemon.rs").replace("\r\n", "\n");
         assert!(
             source.contains("Self::start_pipeline_plan(")
-                && source.contains("sample_rate,\n                buffer_frames,"),
+                && source.contains(
+                    "effective_driver_sample_rate,\n                effective_driver_buffer_frames,"
+                ),
             "HAL playback restart must route negotiated timing through the shared starter"
         );
     }

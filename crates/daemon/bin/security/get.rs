@@ -1,6 +1,6 @@
-use super::misc::{
-    daemon_session_key_path_from_env, hal_session_key_path_from_env, secure_socket_path_from_env,
-};
+use super::misc::{daemon_session_key_path_from_env, hal_session_key_path_from_env};
+#[cfg(unix)]
+use super::misc::secure_socket_path_from_env;
 use std::path::PathBuf;
 
 /// Get the secure socket path for this user

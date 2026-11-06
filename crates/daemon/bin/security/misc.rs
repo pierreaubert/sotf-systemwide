@@ -91,6 +91,7 @@ pub(super) fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
         .filter(|path| !path.as_os_str().is_empty())
 }
 
+#[cfg_attr(all(not(unix), not(test)), allow(dead_code))]
 pub(super) fn secure_socket_path_from_env(
     socket_override: Option<OsString>,
     runtime_dir: Option<OsString>,

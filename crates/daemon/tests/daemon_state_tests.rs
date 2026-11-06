@@ -358,7 +358,7 @@ fn systemwide_pkg_ships_launch_agent_and_exposes_installer_progress_and_logs() {
 
 #[test]
 fn systemwide_pkg_preinstall_boots_out_both_launch_agents() {
-    let source = include_str!("../../../scripts/build-systemwide.sh");
+    let source = include_str!("../../../scripts/build-systemwide.sh").replace("\r\n", "\n");
     let preinstall_start = source
         .find("cat > \"$pkg_scripts/preinstall\"")
         .expect("app package preinstall should exist");
@@ -433,9 +433,11 @@ fn systemwide_app_icon_uses_configbar_svg_source() {
 
 #[test]
 fn configbar_output_device_refresh_tracks_channel_limits() {
-    let configbar = include_str!("../../../swift/configbar/src/ConfigBar.swift");
-    let configbar_pure = include_str!("../../../swift/configbar/src/ConfigBarPure.swift");
-    let rack = include_str!("../../../swift/configbar/src/PluginRackView.swift");
+    let configbar = include_str!("../../../swift/configbar/src/ConfigBar.swift").replace("\r\n", "\n");
+    let configbar_pure =
+        include_str!("../../../swift/configbar/src/ConfigBarPure.swift").replace("\r\n", "\n");
+    let rack =
+        include_str!("../../../swift/configbar/src/PluginRackView.swift").replace("\r\n", "\n");
 
     assert!(
         configbar.contains("Button(action: {\n                            loadDevices()\n                        })"),
