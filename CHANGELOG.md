@@ -6,6 +6,9 @@ release is recorded here.
 
 ## Unreleased
 
+- Windows packaging now uses the workspace (installer) version from the root
+  `Cargo.toml` (0.7.18), aligned with macOS/Linux, instead of the daemon crate
+  version (0.1.38), which remains on its independent track.
 - Apply owner-only Windows security descriptors when creating runtime directories
   and both IPC rendezvous files. Validate port files before connecting, bound
   reads, and preserve planted staging entries on exclusive-creation failure.

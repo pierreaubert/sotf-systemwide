@@ -79,6 +79,11 @@ cargo build -p sotf-daemon --features hal --release
 
 # Any platform (NullDriver fallback)
 cargo build -p sotf-daemon --release
+
+# Windows: packaged sotf-daemon.exe (+ dist\ zip); -Configuration Dist
+# -StaticCrt cuts a self-contained shipping exe, -NoPackage only builds
+powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
+# or: just build-windows / just dist-windows
 ```
 
 ## Running

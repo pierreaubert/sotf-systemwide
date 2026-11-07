@@ -7,13 +7,18 @@
 # ----------------------------------------------------------------------
 
 # Use `mbx` when installed, else plain `cargo` (mirrors ../math-audio).
-cargo := `if command -v mbx >/dev/null 2>&1; then echo mbx; else echo cargo; fi`
+cargo := if os() == "windows" { "cargo" } else { `if command -v mbx >/dev/null 2>&1; then echo mbx; else echo cargo; fi` }
+
+# No `sh` on a stock Windows box: run recipe lines with PowerShell there.
+# Shebang recipes (bash) are unaffected on every platform.
+set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 
 _default:
 	just --list
 
 import 'builds/macos.just'
 import 'builds/systemwide.just'
+import 'builds/windows.just'
 
 # ----------------------------------------------------------------------
 # TEST
