@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=SotF Systemwide Daemon
+GenericName=System-wide audio processor
+Comment=Capture system audio, process it through the SOTF plugin chain, and output to physical devices
+Exec=sotf-daemon
+Icon=sotf-daemon
+Terminal=false
+NoDisplay=true
+Categories=AudioVideo;Audio;
+StartupNotify=false

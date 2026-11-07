@@ -1,0 +1,15 @@
+[Unit]
+Description=SotF systemwide audio daemon
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sotf-daemon
+RuntimeDirectory=sotf
+Environment=SOTF_SYSTEMWIDE_RUNTIME_DIR=%t/sotf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

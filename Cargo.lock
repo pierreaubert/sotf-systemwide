@@ -1967,7 +1967,6 @@ version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
- "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -3234,7 +3233,6 @@ dependencies = [
  "roomeq-export",
  "roomeq-model",
  "roomeq-quality",
- "rusqlite",
  "rustfft",
  "same-file",
  "schemars",
@@ -3787,7 +3785,6 @@ dependencies = [
  "sotf-rubato",
  "tempfile",
  "thiserror 2.0.21",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3908,7 +3905,6 @@ dependencies = [
  "rayon",
  "realfft",
  "rtrb",
- "rusqlite",
  "rustfft",
  "serde",
  "serde_json",
