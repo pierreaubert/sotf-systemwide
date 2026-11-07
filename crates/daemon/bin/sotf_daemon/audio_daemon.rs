@@ -1175,7 +1175,7 @@ impl SystemwideController {
                     println!("   Ignoring configured output device {:?}: {}", device, e);
                 }
             } else {
-                println!("   No output device override; playback thread will choose a safe device");
+                println!("   No output device selected; resolving the default-safe output");
             }
 
             // Recall the stored DSP profile for the device playback will
@@ -3057,6 +3057,22 @@ impl SystemwideController {
 
         match result {
             Ok(_) => {
+                // Seal the applied record: a plan that stayed unresolved
+                // (enumeration empty at resolve time) adopts the device
+                // the engine actually opened, so status never reports
+                // applied=null for a playing pipeline.
+                if plan.spec.output_device.is_none() {
+                    let observed = self
+                        .manager
+                        .lock()
+                        .get_engine_state()
+                        .playback_output_device;
+                    plan.spec.output_device =
+                        super::misc::resolve_applied_output_device(None, observed.as_deref());
+                    if let Some(device) = &plan.spec.output_device {
+                        log::info!("Recorded engine-opened output device as applied: {device}");
+                    }
+                }
                 match &fallback {
                     Some(fallback) => self
                         .system_state

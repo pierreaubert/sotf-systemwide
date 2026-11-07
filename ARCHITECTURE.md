@@ -844,11 +844,17 @@ Key observations:
   telemetry exposes those components and the observed ring fill separately;
   ring capacity itself is not latency.
 - Output device safety is enforced by rejecting virtual/loopback device names
-  for the physical output side. When no hardware sink is selected, the engine
-  scans for a physical output without opening the macOS default device first,
-  because the default device is normally `SotF Virtual Audio` in systemwide
-  mode. The daemon must not become a CoreAudio playback client of its own
-  virtual capture device.
+  for the physical output side. When no hardware sink is selected (fresh
+  install, nothing selected or persisted), the daemon resolves the
+  default-safe output — the system default when it is a safe physical device,
+  otherwise the first safe enumerated device — before the engine starts,
+  without opening the macOS default device first, because the default device
+  is normally `SotF Virtual Audio` in systemwide mode. The daemon must not
+  become a CoreAudio playback client of its own virtual capture device. The
+  applied pipeline spec records the concrete device the engine opened (a
+  still-unresolved plan is backfilled from the engine's observed output at
+  commit), so `applied_output_device` is never `null` for a playing pipeline;
+  the engine's own virtual-output refusal remains a second line of defence.
 
 ## Use Case: User Adds A Plugin
 

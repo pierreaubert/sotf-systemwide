@@ -111,7 +111,7 @@ impl PipelineSupervisor {
             );
         } else if output_device.is_some() {
             log::warn!(
-                "Ignoring virtual output device selection {:?}; playback thread will choose a safe device",
+                "Ignoring virtual output device selection {:?}; output resolution will choose a safe device",
                 output_device
             );
             output_device = None;

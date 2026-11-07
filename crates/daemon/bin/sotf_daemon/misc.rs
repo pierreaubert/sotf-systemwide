@@ -781,32 +781,10 @@ pub(super) fn select_fallback_output_device(candidates: &[FallbackCandidate]) ->
         .map(|candidate| candidate.name.clone())
 }
 
-/// Resolve the device an engine start should open. A missing desired device
-/// degrades to the default-safe fallback instead of failing the start; the
-/// fallback record lets the caller preserve the desired device. `None`
-/// (engine chooses), present devices, unsafe names (owned by the
-/// prepare-level virtual-device rule), and enumeration failures pass through
-/// unchanged.
-pub(super) fn resolve_effective_output_device(
-    desired_device: Option<&str>,
-) -> EffectiveOutputDevice {
-    let passthrough = |device: Option<String>| EffectiveOutputDevice {
-        device,
-        fallback: None,
-    };
-    let Some(desired) = desired_device
-        .map(str::trim)
-        .filter(|desired| !desired.is_empty())
-    else {
-        return passthrough(None);
-    };
-    if !is_safe_output_device_name(desired) {
-        return passthrough(Some(desired.to_string()));
-    }
-    let enumerated = match list_audio_devices() {
-        Ok(devices) => devices,
-        Err(_) => return passthrough(Some(desired.to_string())),
-    };
+/// Enumerated output devices for resolution; `None` when enumeration
+/// fails (no devices visible yet, e.g. right after a CoreAudio restart).
+fn enumerate_fallback_candidates() -> Option<Vec<FallbackCandidate>> {
+    let enumerated = list_audio_devices().ok()?;
     let mut candidates = Vec::new();
     for device in &enumerated {
         let Some(name) = device.get("name").and_then(Value::as_str) else {
@@ -820,6 +798,38 @@ pub(super) fn resolve_effective_output_device(
                 .unwrap_or(false),
         });
     }
+    Some(candidates)
+}
+
+/// Resolve the device an engine start should open. A missing desired device
+/// degrades to the default-safe fallback instead of failing the start; the
+/// fallback record lets the caller preserve the desired device. No desired
+/// device (fresh install, nothing selected or persisted) resolves to the
+/// same default-safe output, so the applied spec names the concrete device
+/// instead of carrying `None` ("engine chooses") into status, where
+/// `applied_output_device` stayed `null` while playback ran. Present
+/// devices, unsafe names (owned by the prepare-level virtual-device rule),
+/// and enumeration failures pass through unchanged; an enumeration failure
+/// with no desired device stays `None` and the commit-time backfill
+/// ([`resolve_applied_output_device`]) records what the engine opened.
+pub(super) fn resolve_effective_output_device(
+    desired_device: Option<&str>,
+) -> EffectiveOutputDevice {
+    let passthrough = |device: Option<String>| EffectiveOutputDevice {
+        device,
+        fallback: None,
+    };
+    let desired = desired_device
+        .map(str::trim)
+        .filter(|desired| !desired.is_empty());
+    if let Some(desired) = desired
+        && !is_safe_output_device_name(desired)
+    {
+        return passthrough(Some(desired.to_string()));
+    }
+    let Some(candidates) = enumerate_fallback_candidates() else {
+        return passthrough(desired.map(str::to_string));
+    };
     resolve_effective_output_device_with_candidates(desired, &candidates)
 }
 
@@ -827,9 +837,15 @@ pub(super) fn resolve_effective_output_device(
 /// already-enumerated candidate list, so substitution stays unit-testable
 /// without audio hardware.
 fn resolve_effective_output_device_with_candidates(
-    desired: &str,
+    desired: Option<&str>,
     candidates: &[FallbackCandidate],
 ) -> EffectiveOutputDevice {
+    let Some(desired) = desired else {
+        return EffectiveOutputDevice {
+            device: select_fallback_output_device(candidates),
+            fallback: None,
+        };
+    };
     let names: Vec<&str> = candidates
         .iter()
         .map(|candidate| candidate.name.as_str())
@@ -853,6 +869,23 @@ fn resolve_effective_output_device_with_candidates(
             fallback: None,
         },
     }
+}
+
+/// Device name to record in the applied spec after a successful start. A
+/// planned device wins; only an unresolved plan (`None`, e.g. enumeration
+/// was empty right after a CoreAudio restart) adopts the device the engine
+/// actually opened. A virtual/loopback observation never becomes the
+/// applied output: it stays an explicit fault, not a silent route.
+pub(super) fn resolve_applied_output_device(
+    planned_device: Option<&str>,
+    observed_device: Option<&str>,
+) -> Option<String> {
+    if let Some(planned) = planned_device {
+        return Some(planned.to_string());
+    }
+    observed_device
+        .filter(|observed| is_safe_output_device_name(observed))
+        .map(str::to_string)
 }
 
 /// Elevate the calling daemon-owned thread to audio-work priority.
@@ -1239,22 +1272,23 @@ mod tests {
         ];
         // Present desired passes through untouched.
         let effective =
-            resolve_effective_output_device_with_candidates("Mac mini Speakers", &candidates);
+            resolve_effective_output_device_with_candidates(Some("Mac mini Speakers"), &candidates);
         assert_eq!(effective.device.as_deref(), Some("Mac mini Speakers"));
         assert!(effective.fallback.is_none());
         // Missing desired degrades to the default-safe output.
-        let effective = resolve_effective_output_device_with_candidates("EVO8", &candidates);
+        let effective = resolve_effective_output_device_with_candidates(Some("EVO8"), &candidates);
         assert_eq!(effective.device.as_deref(), Some("Mac mini Speakers"));
         let fallback = effective.fallback.expect("fallback record");
         assert_eq!(fallback.desired, "EVO8");
         assert_eq!(fallback.applied, "Mac mini Speakers");
         // Nothing safe enumerated: pass through so the start fails loudly.
-        let effective = resolve_effective_output_device_with_candidates("EVO8", &[]);
+        let effective = resolve_effective_output_device_with_candidates(Some("EVO8"), &[]);
         assert_eq!(effective.device.as_deref(), Some("EVO8"));
         assert!(effective.fallback.is_none());
         // ASIO prefix gap still counts as present.
         let candidates = vec![candidate("EVO8", false)];
-        let effective = resolve_effective_output_device_with_candidates("ASIO:EVO8", &candidates);
+        let effective =
+            resolve_effective_output_device_with_candidates(Some("ASIO:EVO8"), &candidates);
         assert_eq!(effective.device.as_deref(), Some("ASIO:EVO8"));
         assert!(effective.fallback.is_none());
     }
@@ -1265,7 +1299,7 @@ mod tests {
         // Missing desired resolved to a physical fallback: the lab sink
         // would reject that name, so it degrades to the lab output with
         // the original desired preserved in the fallback record.
-        let resolved = resolve_effective_output_device_with_candidates("EVO8", &candidates);
+        let resolved = resolve_effective_output_device_with_candidates(Some("EVO8"), &candidates);
         let adapted = effective_output_for_sink(resolved, SinkType::LabNull, Some("EVO8"));
         assert_eq!(
             adapted.device.as_deref(),
@@ -1277,7 +1311,7 @@ mod tests {
 
         // A present physical desired device is substituted the same way.
         let resolved =
-            resolve_effective_output_device_with_candidates("Mac mini Speakers", &candidates);
+            resolve_effective_output_device_with_candidates(Some("Mac mini Speakers"), &candidates);
         let adapted =
             effective_output_for_sink(resolved, SinkType::LabNull, Some("Mac mini Speakers"));
         assert_eq!(
@@ -1303,7 +1337,7 @@ mod tests {
         assert!(adapted.fallback.is_none());
 
         let resolved =
-            resolve_effective_output_device_with_candidates("Mac mini Speakers", &candidates);
+            resolve_effective_output_device_with_candidates(Some("Mac mini Speakers"), &candidates);
         let unadapted =
             effective_output_for_sink(resolved, SinkType::Cpal, Some("Mac mini Speakers"));
         assert_eq!(unadapted.device.as_deref(), Some("Mac mini Speakers"));
@@ -1311,12 +1345,9 @@ mod tests {
     }
 
     #[test]
-    fn effective_device_passes_through_without_enumeration() {
-        // None and unsafe names never consult enumeration: the engine owns
-        // the former, the prepare-level virtual-device rule the latter.
-        let effective = resolve_effective_output_device(None);
-        assert_eq!(effective.device, None);
-        assert!(effective.fallback.is_none());
+    fn effective_device_passes_through_unsafe_names_without_enumeration() {
+        // Unsafe names never consult enumeration: the prepare-level
+        // virtual-device rule owns rejecting them.
         let effective = resolve_effective_output_device(Some("SotF Virtual Audio"));
         assert_eq!(effective.device.as_deref(), Some("SotF Virtual Audio"));
         assert!(effective.fallback.is_none());
@@ -1325,6 +1356,88 @@ mod tests {
             "ASIO:EVO8",
             &["Mac mini Speakers", "EVO8"]
         ));
+    }
+
+    #[test]
+    fn unselected_output_picks_default_safe_device_from_candidates() {
+        // Systemwide mode: the macOS default is the virtual capture
+        // device, so the first safe physical device wins.
+        let candidates = vec![
+            candidate("SotF Virtual Audio", true),
+            candidate("MacBook Pro Speakers", false),
+        ];
+        let effective = resolve_effective_output_device_with_candidates(None, &candidates);
+        assert_eq!(effective.device.as_deref(), Some("MacBook Pro Speakers"));
+        assert!(effective.fallback.is_none());
+        // A safe system default wins over enumeration order.
+        let candidates = vec![candidate("HDMI Monitor", false), candidate("EVO8", true)];
+        let effective = resolve_effective_output_device_with_candidates(None, &candidates);
+        assert_eq!(effective.device.as_deref(), Some("EVO8"));
+        assert!(effective.fallback.is_none());
+        // Nothing safe: stay unresolved so the start fails loudly (or the
+        // engine's own pick is backfilled at commit); never pick virtual.
+        let candidates = vec![candidate("SotF Virtual Audio", true)];
+        let effective = resolve_effective_output_device_with_candidates(None, &candidates);
+        assert_eq!(effective.device, None);
+        assert!(effective.fallback.is_none());
+        let effective = resolve_effective_output_device_with_candidates(None, &[]);
+        assert_eq!(effective.device, None);
+    }
+
+    #[test]
+    fn applied_output_backfills_only_an_unresolved_plan() {
+        use super::resolve_applied_output_device;
+        // Planned device wins over a diverging observation.
+        assert_eq!(
+            resolve_applied_output_device(Some("EVO8"), Some("MacBook Pro Speakers")),
+            Some("EVO8".to_string())
+        );
+        // Unresolved plan adopts the safe device the engine opened.
+        assert_eq!(
+            resolve_applied_output_device(None, Some("MacBook Pro Speakers")),
+            Some("MacBook Pro Speakers".to_string())
+        );
+        // A virtual observation never becomes the applied output.
+        assert_eq!(
+            resolve_applied_output_device(None, Some("SotF Virtual Audio")),
+            None
+        );
+        assert_eq!(resolve_applied_output_device(None, None), None);
+    }
+
+    #[test]
+    fn unselected_output_resolves_to_default_safe_device() {
+        // Regression (fresh-install smoke failure): with no selected or
+        // persisted device, resolution passed None ("engine chooses")
+        // into the applied spec, so status reported
+        // applied_output_device=null forever while playback ran on the
+        // default speakers. Resolution must name the concrete
+        // default-safe device the engine will open; virtual devices
+        // never qualify. Host-adaptive like the clarify test below:
+        // headless machines enumerate nothing safe and expect None.
+        let enumerated = list_audio_devices().unwrap_or_default();
+        let candidates: Vec<FallbackCandidate> = enumerated
+            .iter()
+            .filter_map(|device| {
+                device
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .map(|name| FallbackCandidate {
+                        name: name.to_string(),
+                        is_default: device
+                            .get("is_default")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false),
+                    })
+            })
+            .collect();
+        let expected = select_fallback_output_device(&candidates);
+        let effective = resolve_effective_output_device(None);
+        assert_eq!(effective.device, expected);
+        assert!(effective.fallback.is_none());
+        if let Some(device) = &effective.device {
+            assert!(super::is_safe_output_device_name(device), "{device}");
+        }
     }
 
     #[test]

@@ -23,6 +23,24 @@
   rejected from graphs. `spectrum_analyzer` stays hidden: it is a
   daemon-owned system type with no daemon data path exposing its readings.
 
+## Fresh installs resolve a concrete default output
+
+- Fix the installer smoke failure on machines with no previously selected
+  or persisted output device. Resolution used to pass `None` ("engine
+  chooses") into the applied spec, so the daemon played through the
+  built-in speakers while status reported `applied_output_device: null`
+  forever and the postinstall smoke test polled `settling` until it failed
+  the install. An unselected output now resolves to the same default-safe
+  device used for missing-device fallback (system default when safe,
+  otherwise first safe enumerated; virtual devices never qualify) before
+  the engine starts, which also gives cold start the real device name for
+  DSP-profile recall and sample-rate negotiation.
+- If enumeration is still empty at resolve time (e.g. right after the
+  installer's CoreAudio restart) the engine starts unresolved as before,
+  and the apply commit backfills the applied spec with the safe device
+  the engine actually opened — `applied_output_device` is never `null`
+  for a playing pipeline.
+
 ## Missing output devices fall back to the default output
 
 - Engine starts whose desired output device is not enumerated now degrade to
