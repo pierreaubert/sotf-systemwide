@@ -75,6 +75,26 @@ for artifact in \
     check "dry-run expects $artifact" sh -c "echo \"\$0\" | grep -q '$artifact'" "$dry_out"
 done
 
+# The notarization gate in sign-macos.sh must reject payloads that are not
+# Developer ID signed (the exact status-4000 failure, caught locally).
+# /bin/echo is platform-signed, not Developer ID, so it must fail.
+if [ "$(uname -s)" = "Darwin" ]; then
+    gate_dir="$workdir/gate"
+    mkdir -p "$gate_dir"
+    cp /bin/echo "$gate_dir/echo"
+    check "payload gate rejects non-Developer-ID binary" \
+        bash -c "source scripts/sign-macos.sh >/dev/null 2>&1; ! verify_payload_signatures '$gate_dir'"
+    empty_dir="$workdir/empty"
+    mkdir -p "$empty_dir"
+    check "payload gate passes an empty tree" \
+        bash -c "source scripts/sign-macos.sh >/dev/null 2>&1; verify_payload_signatures '$empty_dir'"
+fi
+
+# The no-argument sign-macos scan must not sweep stale version variants
+# (e.g. a rejected -0.7.19b- pkg) into a signing/notarization run.
+check "sign-macos scan glob excludes version variants" \
+    grep -qF '/*-"$VERSION"-*.pkg' scripts/sign-macos.sh
+
 # cross.just is imported and exposes the release recipes.
 if command -v just >/dev/null 2>&1; then
     check "just lists cross-arm" sh -c "just --list 2>/dev/null | grep -q 'cross-arm'"

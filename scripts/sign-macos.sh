@@ -109,11 +109,55 @@ check_prerequisites() {
         log_error "productsign not found (Xcode Command Line Tools required)"
         exit 1
     fi
+
+    # productsign requires a Developer ID *Installer* certificate; an
+    # Application identity fails only after the full build. Resolve the
+    # configured identity (name or SHA-1) against the keychain up front.
+    if [ -n "${INSTALLER_DEVELOPER_ID:-}" ]; then
+        local identity_line
+        identity_line=$(security find-identity -v 2>/dev/null | grep -F "$INSTALLER_DEVELOPER_ID" || true)
+        if [ -z "$identity_line" ]; then
+            log_error "INSTALLER_DEVELOPER_ID not found in keychain: $INSTALLER_DEVELOPER_ID"
+            exit 1
+        fi
+        if ! grep -q "Developer ID Installer" <<< "$identity_line"; then
+            log_error "INSTALLER_DEVELOPER_ID is not an installer identity: $identity_line"
+            log_info "productsign needs 'Developer ID Installer: Your Name (TEAMID)'"
+            exit 1
+        fi
+    fi
 }
 
 is_macho_file() {
     local file_path="$1"
     [ -f "$file_path" ] && file "$file_path" | grep -q "Mach-O"
+}
+
+# Fail unless every Mach-O under $1 is Developer ID signed with a secure
+# timestamp and the hardened runtime — exactly what notarization rejects
+# on (status 4000), except detected locally in seconds instead of after
+# an Apple round-trip. (Same check as build-systemwide.sh.)
+verify_payload_signatures() {
+    local root_dir="$1"
+    local failures=0 candidate info
+    while IFS= read -r -d '' candidate; do
+        is_macho_file "$candidate" || continue
+        info=$(codesign -dvv "$candidate" 2>&1)
+        if ! grep -q "^Authority=Developer ID Application" <<< "$info"; then
+            log_error "Not Developer ID signed: ${candidate#$root_dir/}"
+            failures=$((failures + 1))
+            continue
+        fi
+        if ! grep -q "^Timestamp=" <<< "$info"; then
+            log_error "Missing secure timestamp: ${candidate#$root_dir/}"
+            failures=$((failures + 1))
+        fi
+        if ! grep "^CodeDirectory" <<< "$info" | grep -qF "(runtime)"; then
+            log_error "Hardened runtime not enabled: ${candidate#$root_dir/}"
+            failures=$((failures + 1))
+        fi
+    done < <(find "$root_dir" -type f -print0)
+    [ "$failures" -eq 0 ]
 }
 
 is_desktop_code() {
@@ -266,6 +310,29 @@ sign_dmg() {
 sign_pkg() {
     local pkg_path="$1"
 
+    # productsign only signs the container: an unsigned-payload pkg would
+    # still be rejected by notarization (status 4000) after a full Apple
+    # round-trip. When this pkg will be container-signed or notarized,
+    # verify the payloads locally first and fail fast.
+    if $NOTARIZE || [ -n "${INSTALLER_DEVELOPER_ID:-}" ]; then
+        if ! /usr/sbin/pkgutil --payload-files "$pkg_path" >/dev/null; then
+            log_error "Package payload is not readable; rebuild the pkg before signing"
+            exit 1
+        fi
+        local expanded_parent
+        expanded_parent=$(mktemp -d)
+        /usr/sbin/pkgutil --expand-full "$pkg_path" "$expanded_parent/full"
+        if ! verify_payload_signatures "$expanded_parent/full"; then
+            rm -rf "$expanded_parent"
+            log_error "Pkg payloads would fail notarization (see above)."
+            log_info "Rebuild with payload signing enabled, e.g.: just release-local --sign"
+            log_info "or: DEVELOPER_ID='Developer ID Application: ...' ./scripts/build-systemwide.sh"
+            exit 1
+        fi
+        rm -rf "$expanded_parent"
+        log_info "  Payload signatures verified (Developer ID + timestamp + hardened runtime)"
+    fi
+
     if [ -z "${INSTALLER_DEVELOPER_ID:-}" ]; then
         log_warning "INSTALLER_DEVELOPER_ID not set, skipping pkg signing: $(basename "$pkg_path")"
         return
@@ -273,10 +340,6 @@ sign_pkg() {
 
     log_info "Signing pkg: $(basename "$pkg_path")"
     log_info "  Payload code must be signed before pkgbuild; signing installer container only."
-    if ! /usr/sbin/pkgutil --payload-files "$pkg_path" >/dev/null; then
-        log_error "Package payload is not readable; rebuild the pkg before signing"
-        exit 1
-    fi
 
     # pkg files use productsign, not codesign
     local signed_pkg="${pkg_path%.pkg}-signed.pkg"
@@ -378,8 +441,10 @@ main() {
         #     (sotf-desktop-VERSION-macos-arm64, sotf-tui-VERSION-macos-x86_64, …)
         local found=false
         shopt -s nullglob
-        for f in "$DIST_DIR"/*"$VERSION"*.dmg \
-                 "$DIST_DIR"/*"$VERSION"*.pkg \
+        # "-$VERSION-" (not "$VERSION") so stale variants like
+        # sotf-systemwide-0.7.19b-... are not swept into the signing run.
+        for f in "$DIST_DIR"/*-"$VERSION"-*.dmg \
+                 "$DIST_DIR"/*-"$VERSION"-*.pkg \
                  "$DIST_DIR"/*"$VERSION"-macos-arm64 \
                  "$DIST_DIR"/*"$VERSION"-macos-x86_64; do
             if [ -f "$f" ]; then

@@ -92,7 +92,15 @@ sotf): the ARM Mac builds the macOS pkg natively plus Linux/Windows ARM64
 in Docker, and the configured x86 builder (`spin.local`) builds
 Linux/Windows x86 in Docker (`scripts/cross-docker.sh`,
 `builds/docker/Dockerfile.*`) from an rsync snapshot of the aggregate tree.
-Builds are unsigned unless `--sign` is passed.
+Builds are unsigned unless `--sign` is passed. For a distributable macOS
+pkg: build with `just release-local --sign --arch arm64` (payloads get
+Developer ID + timestamp + hardened runtime), then
+`source ~/.sotf-release.conf` and run
+`./scripts/sign-macos.sh --notarize dist/sotf-systemwide-<version>-macos-arm64.pkg`
+(container `productsign` + notarytool submit + staple), and finish with
+`just release-local --post-only` to refresh `SHA256SUMS`. Both build and
+sign scripts verify payload signatures locally so unsigned payloads fail
+fast instead of at Apple.
 
 ## Security
 

@@ -223,6 +223,33 @@ sign_payload_code() {
     )
 }
 
+# Fail unless every Mach-O under $1 is Developer ID signed with a secure
+# timestamp and the hardened runtime — exactly what notarization rejects
+# on (status 4000), except detected locally in seconds instead of after
+# an Apple round-trip.
+verify_payload_signatures() {
+    local root_dir="$1"
+    local failures=0 candidate info
+    while IFS= read -r -d '' candidate; do
+        is_macho_file "$candidate" || continue
+        info=$(codesign -dvv "$candidate" 2>&1)
+        if ! grep -q "^Authority=Developer ID Application" <<< "$info"; then
+            log_error "Not Developer ID signed: ${candidate#$root_dir/}"
+            failures=$((failures + 1))
+            continue
+        fi
+        if ! grep -q "^Timestamp=" <<< "$info"; then
+            log_error "Missing secure timestamp: ${candidate#$root_dir/}"
+            failures=$((failures + 1))
+        fi
+        if ! grep "^CodeDirectory" <<< "$info" | grep -qF "(runtime)"; then
+            log_error "Hardened runtime not enabled: ${candidate#$root_dir/}"
+            failures=$((failures + 1))
+        fi
+    done < <(find "$root_dir" -type f -print0)
+    [ "$failures" -eq 0 ]
+}
+
 sign_release_payloads() {
     if [ -z "${DEVELOPER_ID:-}" ]; then
         log_warning "DEVELOPER_ID not set; app/daemon/HAL payloads will not be Developer ID signed"
@@ -269,6 +296,18 @@ validate_pkg_payload() {
             log_error "HAL component payload is missing $DRIVER_NAME/Contents/MacOS/SotFHAL"
             exit 1
         fi
+    fi
+
+    # A build that claims to be signed (DEVELOPER_ID set) must produce
+    # payloads notarization will accept; catch it here, not at Apple.
+    if [ -n "${DEVELOPER_ID:-}" ]; then
+        /usr/sbin/pkgutil --expand-full "$pkg_path" "$expanded_parent/full"
+        if ! verify_payload_signatures "$expanded_parent/full"; then
+            rm -rf "$expanded_parent"
+            log_error "Signed build produced payloads that would fail notarization (see above)"
+            exit 1
+        fi
+        log_success "Package payload signatures verified (Developer ID + timestamp + hardened runtime)"
     fi
 
     rm -rf "$expanded_parent"
