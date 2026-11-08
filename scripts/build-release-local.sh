@@ -1,0 +1,538 @@
+#!/bin/bash
+#
+# Local release build orchestrator for SotF Systemwide.
+# (Adapted from ../sotf/scripts/build-release-local.sh.)
+#
+# Builds the full release matrix for the workspace version in Cargo.toml:
+#   - This Mac (ARM):  macos-arm64 pkg natively + Linux/Windows ARM64 in
+#     Docker (`just cross-arm`).
+#   - Remote x86 builder (spin.local by default): Linux/Windows x86 in
+#     Docker after an rsync snapshot of the aggregate all_of_sotf tree.
+#
+# Artifacts collect in dist/ and a SHA256SUMS-<version>.txt is generated.
+# The two phases run in parallel (remote in the background, log preserved).
+#
+# Usage:
+#   ./build-release-local.sh                  # Full matrix (default)
+#   ./build-release-local.sh --arch arm64     # This Mac only
+#   ./build-release-local.sh --arch x86_64    # Remote x86 builder only
+#   ./build-release-local.sh --skip-local     # Same as --arch x86_64
+#   ./build-release-local.sh --skip-remote    # Same as --arch arm64
+#   ./build-release-local.sh --dry-run        # Show what would be done
+#   ./build-release-local.sh --post-only      # Verify dist/ + checksums only
+#   ./build-release-local.sh --clean-remote   # Wipe the remote snapshot first
+#   ./build-release-local.sh --config <file>  # Alternate config file
+#   ./build-release-local.sh --init-config    # Write a template config
+#
+# Configuration (default: ~/.sotf-release.conf — the same file sotf uses):
+#   LINUX_HOST / LINUX_PORT / LINUX_SSH_KEY   SSH to the x86 builder
+#   LINUX_PROJECT_DIR                         sotf checkout there; the
+#                                             systemwide snapshot defaults
+#                                             to <its parent>/all_of_sotf-release
+#   SYSTEMWIDE_REMOTE_DIR                     Override the snapshot dir
+#   DEVELOPER_ID / INSTALLER_DEVELOPER_ID     Only used with --sign
+#
+# Signing: builds are unsigned by default (ad-hoc HAL only), exactly like
+# the 0.7.18 dist artifacts. --sign exports DEVELOPER_ID from the config
+# so build-systemwide.sh Developer-ID-signs the macOS payloads; installer
+# signing + notarization remain a separate scripts/sign-macos.sh step.
+#
+# Prerequisites:
+#   - Local: Docker, just, Rust toolchain, Xcode CLT, rsync, ssh
+#   - Remote: Docker (the builds run scripts/cross-docker.sh directly;
+#     no just or Rust needed on the remote host itself)
+#
+
+set -uo pipefail
+# NOTE: no set -e — remote/parallel steps are wrapped in explicit error
+# handling so the summary can name which phase failed (as in sotf).
+
+trap 'sotf_log_error "Unexpected error at line $LINENO (exit $?)"' ERR
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AGGREGATE_ROOT="$(cd "$PROJECT_ROOT/.." && pwd)"
+DIST_DIR="$PROJECT_ROOT/dist"
+CONFIG_FILE="${HOME}/.sotf-release.conf"
+
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+VERSION=$(sotf_version "$PROJECT_ROOT")
+if [ -z "$VERSION" ]; then
+    echo "ERROR: Could not extract version from Cargo.toml" >&2
+    exit 1
+fi
+
+# Options
+DRY_RUN=false
+SKIP_LOCAL=false
+SKIP_REMOTE=false
+SIGN=false
+POST_ONLY=false
+CLEAN_REMOTE=false
+INIT_CONFIG=false
+ARCH_SELECTION=all
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dry-run)      DRY_RUN=true; shift ;;
+        --skip-local)   SKIP_LOCAL=true; shift ;;
+        --skip-remote)  SKIP_REMOTE=true; shift ;;
+        --sign)         SIGN=true; shift ;;
+        --post-only)    POST_ONLY=true; shift ;;
+        --clean-remote) CLEAN_REMOTE=true; shift ;;
+        --init-config)  INIT_CONFIG=true; shift ;;
+        --arch)
+            if [ "$#" -lt 2 ]; then
+                echo "--arch requires arm64, x86_64, or all" >&2
+                exit 1
+            fi
+            case "$2" in
+                arm64|x86_64|all) ARCH_SELECTION="$2" ;;
+                *)
+                    echo "Invalid architecture '$2' (choose arm64, x86_64, or all)" >&2
+                    exit 1
+                    ;;
+            esac
+            shift 2
+            ;;
+        --config)       CONFIG_FILE="$2"; shift 2 ;;
+        --help|-h)
+            sed -n '2,/^$/p' "$0" | sed 's/^#//' | sed 's/^ //'
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+case "$ARCH_SELECTION" in
+    arm64)  SKIP_REMOTE=true ;;
+    x86_64) SKIP_LOCAL=true ;;
+esac
+
+log_phase() { echo -e "\n${SOTF_BOLD}${SOTF_CYAN}=== $1 ===${SOTF_NC}\n"; }
+log_dry()   { echo -e "${SOTF_YELLOW}[DRY-RUN]${SOTF_NC} Would: $1"; }
+
+# Run a command, or only describe it under --dry-run.
+run_cmd() {
+    if $DRY_RUN; then
+        log_dry "$*"
+        return 0
+    fi
+    "$@"
+}
+
+# -----------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------
+
+generate_config_template() {
+    cat > "$CONFIG_FILE" << 'CONF'
+# SotF Release Build Configuration
+# Generated by build-release-local.sh --init-config (sotf-systemwide).
+# The same file is used by ../sotf/scripts/build-release-local.sh.
+
+# --- x86 build machine (Linux + Windows x86 via Docker) ---
+# Must have: Docker. The script rsyncs an aggregate source snapshot,
+# runs scripts/cross-docker.sh there, and copies dist/ artifacts back.
+LINUX_HOST="pierre@spin.local"
+LINUX_PORT="22"
+LINUX_PROJECT_DIR="/home/pierre/src/sotf"
+LINUX_SSH_KEY=""
+
+# Systemwide snapshot directory on the x86 builder (optional; defaults
+# to <parent of LINUX_PROJECT_DIR>/all_of_sotf-release).
+SYSTEMWIDE_REMOTE_DIR=""
+
+# --- macOS signing (only used with --sign) ---
+DEVELOPER_ID=""
+INSTALLER_DEVELOPER_ID=""
+APPLE_ID=""
+NOTARIZATION_PROFILE="autoeq-notarization"
+
+# --- Windows signing (reserved; not wired into the gnullvm zip flow) ---
+WINDOWS_CERT_FILE=""
+WINDOWS_CERT_PASSWORD=""
+WINDOWS_TIMESTAMP_URL="http://timestamp.digicert.com"
+CONF
+    echo "Config template written to $CONFIG_FILE"
+    echo "Edit it with your SSH host and signing credentials."
+}
+
+if $INIT_CONFIG; then
+    if [ -f "$CONFIG_FILE" ]; then
+        echo "Config already exists at $CONFIG_FILE" >&2
+        echo "Remove it first if you want a fresh template." >&2
+        exit 1
+    fi
+    generate_config_template
+    exit 0
+fi
+
+if ! $SKIP_REMOTE || $SIGN; then
+    if [ ! -f "$CONFIG_FILE" ]; then
+        sotf_log_error "Config file not found: $CONFIG_FILE"
+        sotf_log_info "Run: $0 --init-config"
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+REMOTE_HOST="${LINUX_HOST:-}"
+REMOTE_PORT="${LINUX_PORT:-22}"
+REMOTE_KEY="${LINUX_SSH_KEY:-}"
+if [ -n "${SYSTEMWIDE_REMOTE_DIR:-}" ]; then
+    REMOTE_DIR="$SYSTEMWIDE_REMOTE_DIR"
+elif [ -n "${LINUX_PROJECT_DIR:-}" ]; then
+    REMOTE_DIR="$(dirname "$LINUX_PROJECT_DIR")/all_of_sotf-release"
+else
+    # Relative to the remote home directory (ssh/rsync start there).
+    REMOTE_DIR="src/all_of_sotf-release"
+fi
+
+# -----------------------------------------------------------------------
+# SSH / RSYNC HELPERS (shapes lifted from sotf's orchestrator)
+# -----------------------------------------------------------------------
+
+build_ssh_transport() {
+    SSH_TRANSPORT_CMD=(ssh)
+    [ -n "$REMOTE_PORT" ] && SSH_TRANSPORT_CMD+=(-p "$REMOTE_PORT")
+    [ -n "$REMOTE_KEY" ] && SSH_TRANSPORT_CMD+=(-i "$REMOTE_KEY")
+    return 0
+}
+
+ssh_cmd() {
+    build_ssh_transport
+    "${SSH_TRANSPORT_CMD[@]}" -o BatchMode=yes -o ConnectTimeout=15 "$REMOTE_HOST" "$*"
+}
+
+# Aggregate snapshot excludes: remotes consume source only; every repo's
+# build output and VCS metadata stay behind (same list as sotf's).
+AGGREGATE_RSYNC_EXCLUDES=(
+    --exclude='/tmp/'
+    --exclude='.git/'
+    --exclude='target/'
+    --exclude='target-static/'
+    --exclude='.docker-target/'
+    --exclude='dist/'
+    --exclude='tools/'
+    --exclude='node_modules/'
+    --exclude='venv/'
+    --exclude='.venv/'
+    --exclude='__pycache__/'
+    --exclude='.tokensave/'
+    --exclude='.claude/'
+    --exclude='.serena/'
+    --exclude='DerivedData/'
+    --exclude='coverage/'
+    --exclude='mutants.out/'
+    --exclude='data_cached/'
+    --exclude='data_generated/'
+    --exclude='.DS_Store'
+    --exclude='.vs/'
+    --exclude='.vscode/'
+    --exclude='.zed/'
+    --exclude='.idea/'
+    --exclude='.fleet/'
+    --exclude='.qwen/'
+    --exclude='.worktrees/'
+    --exclude='*.o'
+    --exclude='*.d'
+)
+
+handle_rsync_status() {
+    local status="$1" label="$2"
+    [ "$status" -eq 0 ] && return 0
+    # 24 = files vanished while reading the live tree (editor churn).
+    if [ "$status" -eq 24 ]; then
+        sotf_log_warning "$label completed with vanished source files (rsync exit 24); continuing"
+        return 0
+    fi
+    return "$status"
+}
+
+# -----------------------------------------------------------------------
+# RESULTS TRACKING + EXPECTED MATRIX
+# -----------------------------------------------------------------------
+
+declare -a BUILD_RESULTS=()
+BUILD_FAILED=false
+record_result() {
+    BUILD_RESULTS+=("$1")
+    case "$1" in *FAIL*) BUILD_FAILED=true ;; esac
+}
+
+expected_artifacts() {
+    if ! $SKIP_LOCAL; then
+        echo "sotf-systemwide-${VERSION}-macos-arm64.pkg"
+        echo "sotf-systemwide-${VERSION}-linux-arm64.tar.gz"
+        echo "sotf-systemwide-${VERSION}-linux-arm64.AppImage"
+        echo "sotf-systemwide_${VERSION}_arm64.deb"
+        echo "sotf-systemwide-${VERSION}-windows-arm64.zip"
+    fi
+    if ! $SKIP_REMOTE; then
+        echo "sotf-systemwide-${VERSION}-linux-x86_64.tar.gz"
+        echo "sotf-systemwide-${VERSION}-linux-x86_64.AppImage"
+        echo "sotf-systemwide_${VERSION}_amd64.deb"
+        echo "sotf-systemwide-${VERSION}-windows-x64.zip"
+    fi
+}
+
+# -----------------------------------------------------------------------
+# PREFLIGHT
+# -----------------------------------------------------------------------
+
+preflight() {
+    log_phase "Preflight (v$VERSION)"
+    local failed=false
+
+    # Version bookkeeping gates: keep the dual-version records honest.
+    local daemon_version daemon_changelog_version
+    daemon_version=$(grep -m1 '^version = ' "$PROJECT_ROOT/crates/daemon/Cargo.toml" | sed -E 's/version = "(.*)"/\1/')
+    daemon_changelog_version=$(grep -m1 '^# ' "$PROJECT_ROOT/crates/daemon/CHANGELOG.md" | sed -E 's/^# ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+    if [ "$daemon_version" != "$daemon_changelog_version" ]; then
+        sotf_log_error "Daemon version drift: crates/daemon/Cargo.toml is $daemon_version but crates/daemon/CHANGELOG.md tops at $daemon_changelog_version"
+        failed=true
+    fi
+    if ! grep -q "^## $VERSION " "$PROJECT_ROOT/CHANGELOG.md"; then
+        sotf_log_error "Root CHANGELOG.md has no '## $VERSION (daemon $daemon_version)' section"
+        failed=true
+    fi
+
+    if [ -n "$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null)" ]; then
+        sotf_log_warning "Working tree is dirty; the release will build the tree as-is (snapshot semantics)"
+    fi
+
+    if ! $SKIP_LOCAL; then
+        for tool in docker just cargo rsync ssh; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+                sotf_log_error "Missing local tool: $tool"
+                failed=true
+            fi
+        done
+        if [ "$(uname -m)" != "arm64" ] && [ "$(uname -m)" != "aarch64" ]; then
+            sotf_log_error "Local phase builds the ARM matrix and needs an ARM host (this host: $(uname -m)); use --arch x86_64"
+            failed=true
+        fi
+    fi
+
+    if ! $SKIP_REMOTE; then
+        if [ -z "$REMOTE_HOST" ]; then
+            sotf_log_error "LINUX_HOST is not set in $CONFIG_FILE"
+            failed=true
+        elif $DRY_RUN; then
+            log_dry "ssh $REMOTE_HOST 'docker --version'"
+        elif ! ssh_cmd "docker --version" >/dev/null 2>&1; then
+            sotf_log_error "Cannot reach $REMOTE_HOST over ssh or docker is unavailable there"
+            failed=true
+        else
+            sotf_log_success "Remote builder reachable: $REMOTE_HOST (snapshot: $REMOTE_DIR)"
+        fi
+    fi
+
+    if $SIGN && [ -z "${DEVELOPER_ID:-}" ]; then
+        sotf_log_error "--sign given but DEVELOPER_ID is empty in $CONFIG_FILE"
+        failed=true
+    fi
+
+    if $failed; then
+        sotf_log_error "Preflight failed; fix the above and re-run"
+        exit 1
+    fi
+    sotf_log_success "Preflight OK (workspace $VERSION, daemon $daemon_version)"
+}
+
+# -----------------------------------------------------------------------
+# BUILD PHASES
+# -----------------------------------------------------------------------
+
+build_local() {
+    log_phase "Local ARM builds (this Mac): macOS pkg + Linux/Windows ARM64 (Docker)"
+    if $DRY_RUN; then
+        log_dry "just cross-arm"
+        record_result "SKIP local ARM (dry-run)"
+        return 0
+    fi
+    # Unsigned by default: scrub signing identities from the environment
+    # so the artifacts match the unsigned dist convention unless --sign.
+    if $SIGN; then
+        export DEVELOPER_ID="${DEVELOPER_ID:-}"
+        export INSTALLER_DEVELOPER_ID="${INSTALLER_DEVELOPER_ID:-}"
+        sotf_log_info "Signing macOS payloads with: $DEVELOPER_ID"
+        sign_env=()
+    else
+        sign_env=(-u DEVELOPER_ID -u INSTALLER_DEVELOPER_ID)
+    fi
+    if (cd "$PROJECT_ROOT" && env ${sign_env[@]+"${sign_env[@]}"} just cross-arm); then
+        record_result "OK   local ARM (macos-arm64 pkg, linux-arm64, windows-arm64)"
+    else
+        record_result "FAIL local ARM (just cross-arm)"
+    fi
+}
+
+sync_remote() {
+    log_phase "Sync aggregate snapshot -> $REMOTE_HOST:$REMOTE_DIR"
+    if $CLEAN_REMOTE; then
+        case "$REMOTE_DIR" in
+            *all_of_sotf-release) ;;
+            *)
+                sotf_log_error "Refusing --clean-remote on unexpected remote dir: $REMOTE_DIR"
+                return 1
+                ;;
+        esac
+        run_cmd ssh_cmd "rm -rf '$REMOTE_DIR' && docker volume rm sotf-systemwide-target-linux-x86 sotf-systemwide-target-windows-x86 >/dev/null 2>&1 || true" || return 1
+    fi
+    run_cmd ssh_cmd "mkdir -p '$REMOTE_DIR'" || return 1
+    if $DRY_RUN; then
+        log_dry "rsync aggregate $AGGREGATE_ROOT/ -> $REMOTE_HOST:$REMOTE_DIR/"
+        return 0
+    fi
+    build_ssh_transport
+    rsync -az --delete \
+        -e "${SSH_TRANSPORT_CMD[*]}" \
+        "${AGGREGATE_RSYNC_EXCLUDES[@]}" \
+        "$AGGREGATE_ROOT/" "${REMOTE_HOST}:${REMOTE_DIR}/"
+    handle_rsync_status "$?" "aggregate sync"
+}
+
+build_remote() {
+    log_phase "Remote x86 builds ($REMOTE_HOST): Linux/Windows x86 (Docker)"
+    if $DRY_RUN; then
+        log_dry "ssh $REMOTE_HOST 'cd $REMOTE_DIR/sotf-systemwide && ./scripts/cross-docker.sh linux-x86 && ./scripts/cross-docker.sh windows-x86'"
+        return 0
+    fi
+    ssh_cmd "cd '$REMOTE_DIR/sotf-systemwide' && ./scripts/cross-docker.sh linux-x86 && ./scripts/cross-docker.sh windows-x86"
+}
+
+fetch_remote() {
+    log_phase "Fetch remote artifacts -> dist/"
+    if $DRY_RUN; then
+        log_dry "rsync $REMOTE_HOST:$REMOTE_DIR/sotf-systemwide/dist/*$VERSION* -> dist/"
+        return 0
+    fi
+    build_ssh_transport
+    rsync -avz \
+        -e "${SSH_TRANSPORT_CMD[*]}" \
+        --include="*${VERSION}*" --exclude='*' \
+        "${REMOTE_HOST}:${REMOTE_DIR}/sotf-systemwide/dist/" "$DIST_DIR/"
+    handle_rsync_status "$?" "artifact fetch"
+}
+
+# -----------------------------------------------------------------------
+# POST: VERIFY + CHECKSUMS + SUMMARY
+# -----------------------------------------------------------------------
+
+post_steps() {
+    log_phase "Verify artifacts + checksums"
+    local missing=0 artifact
+    while IFS= read -r artifact; do
+        if [ -s "$DIST_DIR/$artifact" ]; then
+            sotf_log_success "$artifact ($(du -h "$DIST_DIR/$artifact" | cut -f1))"
+        elif $DRY_RUN; then
+            log_dry "expect dist/$artifact"
+            missing=$((missing + 1))
+        else
+            sotf_log_error "Missing artifact: dist/$artifact"
+            missing=$((missing + 1))
+        fi
+    done <<EOF
+$(expected_artifacts)
+EOF
+
+    if [ "$missing" -gt 0 ] && ! $DRY_RUN; then
+        record_result "FAIL $missing expected artifact(s) missing"
+        return 1
+    fi
+    if $DRY_RUN; then
+        log_dry "shasum -a 256 (expected artifacts) > dist/SHA256SUMS-$VERSION.txt"
+        return 0
+    fi
+
+    local shasum_cmd="shasum -a 256"
+    command -v shasum >/dev/null 2>&1 || shasum_cmd="sha256sum"
+    # shellcheck disable=SC2086
+    (cd "$DIST_DIR" && expected_artifacts | xargs $shasum_cmd > "SHA256SUMS-$VERSION.txt")
+    sotf_log_success "Checksums: dist/SHA256SUMS-$VERSION.txt"
+}
+
+print_summary() {
+    log_phase "Summary (v$VERSION)"
+    local result
+    for result in ${BUILD_RESULTS[@]+"${BUILD_RESULTS[@]}"}; do
+        echo "  $result"
+    done
+    echo ""
+    echo "Artifacts: $DIST_DIR"
+    if $BUILD_FAILED; then
+        sotf_log_error "Release build FAILED"
+    else
+        sotf_log_success "Release build complete"
+    fi
+}
+
+# -----------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------
+
+preflight
+run_cmd mkdir -p "$DIST_DIR" "$PROJECT_ROOT/target/release-logs"
+
+REMOTE_PID=""
+REMOTE_LOG="$PROJECT_ROOT/target/release-logs/remote-x86-$VERSION.log"
+
+if ! $POST_ONLY; then
+    if ! $SKIP_REMOTE; then
+        if sync_remote; then
+            if $SKIP_LOCAL; then
+                if build_remote && fetch_remote; then
+                    record_result "OK   remote x86 (linux-x86_64, windows-x64)"
+                else
+                    record_result "FAIL remote x86 build/fetch"
+                fi
+            elif $DRY_RUN; then
+                build_remote
+                fetch_remote
+                record_result "SKIP remote x86 (dry-run)"
+            else
+                sotf_log_info "Starting remote x86 builds in the background (log: $REMOTE_LOG)"
+                build_remote > "$REMOTE_LOG" 2>&1 &
+                REMOTE_PID=$!
+            fi
+        else
+            record_result "FAIL remote snapshot sync"
+        fi
+    fi
+
+    if ! $SKIP_LOCAL; then
+        build_local
+    fi
+
+    if [ -n "$REMOTE_PID" ]; then
+        sotf_log_info "Waiting for remote x86 builds (log: $REMOTE_LOG)..."
+        if wait "$REMOTE_PID"; then
+            if fetch_remote; then
+                record_result "OK   remote x86 (linux-x86_64, windows-x64)"
+            else
+                record_result "FAIL remote artifact fetch"
+            fi
+        else
+            sotf_log_error "Remote x86 builds failed; last log lines:"
+            tail -n 50 "$REMOTE_LOG" || true
+            record_result "FAIL remote x86 build (see $REMOTE_LOG)"
+        fi
+    fi
+fi
+
+if ! post_steps; then
+    BUILD_FAILED=true
+fi
+print_summary
+if $BUILD_FAILED; then
+    exit 1
+fi
+exit 0

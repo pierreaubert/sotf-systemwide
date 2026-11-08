@@ -6,9 +6,22 @@ release is recorded here.
 
 ## Unreleased
 
+## 0.7.19 (daemon 0.1.39)
+
+- Release binaries for every platform are now produced by one configurable
+  orchestrator, `scripts/build-release-local.sh` (mirrors sotf): the ARM Mac
+  builds macOS arm64 natively plus Linux/Windows ARM64 in Docker, the x86
+  builder (`spin.local` by default, see `~/.sotf-release.conf`) builds
+  Linux/Windows x86 in Docker from an rsync snapshot, and `dist/` collects
+  the full matrix with a SHA256SUMS file.
+- Fresh macOS installs no longer fail the postinstall smoke test: with no
+  output device selected or persisted the daemon now resolves the
+  default-safe device before starting (and backfills the applied record
+  from the engine's observed output), so `applied_output_device` is never
+  `null` for a playing pipeline. See the daemon 0.1.39 notes.
 - Windows packaging now uses the workspace (installer) version from the root
-  `Cargo.toml` (0.7.18), aligned with macOS/Linux, instead of the daemon crate
-  version (0.1.38), which remains on its independent track.
+  `Cargo.toml`, aligned with macOS/Linux, instead of the daemon crate
+  version, which remains on its independent track.
 - Apply owner-only Windows security descriptors when creating runtime directories
   and both IPC rendezvous files. Validate port files before connecting, bound
   reads, and preserve planted staging entries on exclusive-creation failure.

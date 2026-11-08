@@ -1,0 +1,49 @@
+# Tools-only image for native Linux release builds of sotf-daemon.
+#
+# Cargo runs after the aggregate all_of_sotf tree is mounted at /workspace
+# (see scripts/cross-docker.sh), so this image carries only system
+# dependencies plus the Rust toolchain from the rust:bookworm base image.
+# One file serves both architectures: the platform is chosen at build time
+# (docker build --platform linux/arm64|linux/amd64).
+#
+# Dependency set mirrors builds/systemwide/Dockerfile.test-linux-arm64,
+# which is what the Linux test gate builds the daemon with.
+
+FROM rust:bookworm
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        clang \
+        cmake \
+        curl \
+        file \
+        git \
+        libasound2-dev \
+        libclang-dev \
+        libsqlite3-dev \
+        libssl-dev \
+        mold \
+        ninja-build \
+        pkg-config \
+        zip \
+    && rm -rf /var/lib/apt/lists/*
+
+# rust:bookworm ships the current stable toolchain under its versioned
+# name. Expose it as `stable` via a symlink (rustup discovers toolchains
+# by directory scan) so the workspace rust-toolchain.toml (channel =
+# "stable") resolves to the bundled toolchain with no downloads.
+ENV RUSTUP_TOOLCHAIN=stable
+RUN set -eu; \
+    triple=$(rustc -vV | sed -n 's/^host: //p'); \
+    cd /usr/local/rustup/toolchains; \
+    real=$(ls -d *-"$triple" | grep -v '^stable-' | sort -V | tail -n 1); \
+    [ -n "$real" ] || { echo "no preinstalled toolchain for $triple"; exit 1; }; \
+    [ -e "stable-$triple" ] || ln -s "$real" "stable-$triple"; \
+    [ -x "stable-$triple/bin/rustc" ] || { echo "stable toolchain alias broken"; exit 1; }; \
+    rustc --version && cargo --version
+
+WORKDIR /workspace/sotf-systemwide

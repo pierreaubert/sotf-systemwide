@@ -72,6 +72,28 @@ SOTF crates resolve via `../sotf` (`sotf-player`) and `../sotf-daw`
 builds inside the `all_of_sotf` sibling layout. Normal Cargo builds and tests
 generate or update `Cargo.lock` when dependency resolution requires it.
 
+## Releasing
+
+The workspace version in the root `Cargo.toml` (`0.7.x`) stamps every
+installer artifact; the daemon crate keeps its own `0.1.x` version. Record
+each release in the root `CHANGELOG.md` (`## <version> (daemon <version>)`)
+and keep `crates/daemon/CHANGELOG.md`'s top header equal to the daemon
+crate version — the release script's preflight enforces both.
+
+```bash
+just release-local                  # full matrix -> dist/ + SHA256SUMS
+just release-local --arch arm64     # this ARM Mac only
+just release-local --dry-run        # show the plan
+just cross-arm / just cross-x86     # per-machine halves (builds/cross.just)
+```
+
+`scripts/build-release-local.sh` reads `~/.sotf-release.conf` (shared with
+sotf): the ARM Mac builds the macOS pkg natively plus Linux/Windows ARM64
+in Docker, and the configured x86 builder (`spin.local`) builds
+Linux/Windows x86 in Docker (`scripts/cross-docker.sh`,
+`builds/docker/Dockerfile.*`) from an rsync snapshot of the aggregate tree.
+Builds are unsigned unless `--sign` is passed.
+
 ## Security
 
 - Per-user shared memory path (`/tmp/sotf-{uid}/`)

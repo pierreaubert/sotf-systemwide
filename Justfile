@@ -16,6 +16,7 @@ set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 _default:
 	just --list
 
+import 'builds/cross.just'
 import 'builds/macos.just'
 import 'builds/systemwide.just'
 import 'builds/windows.just'

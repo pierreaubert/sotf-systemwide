@@ -446,8 +446,13 @@ create_appimage() {
 
     log_info "Creating AppImage..."
 
-    local appdir="$DIST_DIR/${APP_NAME}.AppDir"
-    rm -rf "$appdir"
+    # Stage the AppDir on a local filesystem, not in $DIST_DIR: linuxdeploy's
+    # copy step fails with "Permission denied" when the AppDir lives on a
+    # Docker Desktop (virtiofs) bind mount, and the AppDir is transient —
+    # only $OUTPUT (written separately below) belongs in $DIST_DIR.
+    local appdir_parent
+    appdir_parent=$(mktemp -d)
+    local appdir="$appdir_parent/${APP_NAME}.AppDir"
 
     # Use the canonical desktop file from builds/linux/
     local desktop_file="$ASSETS_DIR/${DESKTOP_NAME}.desktop"
@@ -484,6 +489,22 @@ create_appimage() {
     esac
     export OUTPUT="$DIST_DIR/${APP_NAME}-${VERSION}-linux-${arch}.AppImage"
 
+    # Prefer a cached type2 runtime (tools/runtime-<arch>): appimagetool
+    # otherwise downloads it from GitHub on every run, and that download
+    # 504s often enough to fail release builds. Extract one from any
+    # existing AppImage with:
+    #   dd if=<app>.AppImage of=tools/runtime-<arch> bs=1 \
+    #      count=$(<app>.AppImage --appimage-offset)
+    local runtime_file=""
+    case "$arch" in
+        x86_64) runtime_file="$TOOLS_DIR/runtime-x86_64" ;;
+        arm64)  runtime_file="$TOOLS_DIR/runtime-aarch64" ;;
+    esac
+    if [ -n "$runtime_file" ] && [ -f "$runtime_file" ]; then
+        export LDAI_RUNTIME_FILE="$runtime_file"
+        log_info "Using cached AppImage runtime: $runtime_file"
+    fi
+
     local deploy_args=(
         --appdir "$appdir"
         --executable "$BUILD_DIR/$BINARY_NAME"
@@ -502,7 +523,7 @@ create_appimage() {
 
     run_linuxdeploy "${deploy_args[@]}"
 
-    rm -rf "$appdir"
+    rm -rf "$appdir_parent"
     log_success "AppImage created: $OUTPUT"
 }
 

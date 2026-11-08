@@ -1,0 +1,96 @@
+# Tools-only image for Windows gnullvm cross builds of sotf-daemon.exe.
+#
+# Adapted from ../sotf/builds/from_macos_arm/Dockerfile.*-pc-windows-gnullvm:
+# pinned Rust toolchain + llvm-mingw for the *-w64-mingw32 clang/LLD
+# wrappers the gnullvm targets need. Cargo runs after the aggregate
+# all_of_sotf tree is mounted at /workspace (see scripts/cross-docker.sh,
+# which also passes the target-specific CC/CXX/AR/linker environment).
+#
+# Build args:
+#   WINDOWS_TARGET   x86_64-pc-windows-gnullvm | aarch64-pc-windows-gnullvm
+# The llvm-mingw host tarball follows the container architecture
+# (docker build --platform), not the Windows target.
+
+FROM ubuntu:24.04
+
+ARG WINDOWS_TARGET=x86_64-pc-windows-gnullvm
+ARG RUST_TOOLCHAIN=1.99.0
+ARG LLVM_MINGW_VERSION=20260421
+ARG TARGETARCH
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    build-essential \
+    gcc \
+    g++ \
+    pkg-config \
+    ca-certificates \
+    cmake \
+    ninja-build \
+    perl \
+    zip \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Install the release Rust toolchain (pinned, like sotf's images).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --default-toolchain ${RUST_TOOLCHAIN} --profile minimal && \
+    rm -rf /root/.cargo/registry /root/.cargo/git
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+# Keep builds on the pinned toolchain even though the mounted workspace
+# has rust-toolchain.toml with channel = "stable".
+ENV RUSTUP_TOOLCHAIN=${RUST_TOOLCHAIN}
+
+RUN rustup target add --toolchain ${RUST_TOOLCHAIN} ${WINDOWS_TARGET}
+
+# Ubuntu mingw-w64 lacks complete gnullvm support (and any Windows ARM64
+# tools); llvm-mingw supplies the clang/LLD wrappers. The tarball host
+# arch is the container arch: amd64 -> x86_64, arm64 -> aarch64.
+# Prefer a cached tarball from the `mingwcache` build context
+# (tools/mingw-cache/llvm-mingw.tar.xz, seeded once per machine):
+# GitHub release downloads 504 often enough to fail release builds.
+# The context is always passed by scripts/cross-docker.sh (possibly
+# empty, in which case the download below runs with retries).
+RUN --mount=type=bind,from=mingwcache,target=/mingwcache \
+    set -eu; \
+    case "${TARGETARCH}" in \
+        amd64) mingw_host=x86_64 ;; \
+        arm64) mingw_host=aarch64 ;; \
+        *) echo "unsupported container arch: ${TARGETARCH}"; exit 1 ;; \
+    esac; \
+    if [ -f /mingwcache/llvm-mingw.tar.xz ]; then \
+        echo "Using cached llvm-mingw tarball"; \
+        cp /mingwcache/llvm-mingw.tar.xz /tmp/llvm-mingw.tar.xz; \
+    else \
+        url="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-${mingw_host}.tar.xz"; \
+        for attempt in 1 2 3 4 5 6 7 8; do \
+            if curl -fsSL -o /tmp/llvm-mingw.tar.xz "$url"; then break; fi; \
+            echo "llvm-mingw download attempt $attempt failed; retrying in 20s"; \
+            sleep 20; \
+        done; \
+    fi; \
+    test -s /tmp/llvm-mingw.tar.xz || { echo "llvm-mingw tarball unavailable (no cache, download failed)"; exit 1; }; \
+    tar -xJf /tmp/llvm-mingw.tar.xz -C /opt && \
+    mv "/opt/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-${mingw_host}" /opt/llvm-mingw && \
+    rm /tmp/llvm-mingw.tar.xz
+
+# Some crates emit MSVC-style capitalized link names (Userenv, Advapi32,
+# Kernel32). LLD searches the mingw sysroot case-sensitively and only
+# ships lowercase import libraries, so provide capitalized aliases
+# (same workaround as sotf's images).
+RUN for pair in userenv:Userenv advapi32:Advapi32 kernel32:Kernel32; do \
+        lower="${pair%%:*}"; upper="${pair##*:}"; \
+        for dir in /opt/llvm-mingw/*-w64-mingw32/lib; do \
+            if [ -f "$dir/lib${lower}.a" ]; then cp "$dir/lib${lower}.a" "$dir/lib${upper}.a"; fi; \
+        done; \
+    done
+
+ENV PATH="/opt/llvm-mingw/bin:${PATH}"
+
+WORKDIR /workspace/sotf-systemwide

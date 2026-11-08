@@ -1,4 +1,4 @@
-# 0.1.38 (unreleased)
+# 0.1.39
 
 ## Encrypted realtime transport can be enabled
 

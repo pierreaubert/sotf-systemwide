@@ -3748,7 +3748,7 @@ dependencies = [
 
 [[package]]
 name = "sotf-callback-metrics"
-version = "0.7.18"
+version = "0.7.19"
 dependencies = [
  "cpal",
  "driver-common",
