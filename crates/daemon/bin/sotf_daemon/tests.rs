@@ -1,4 +1,6 @@
 #![allow(clippy::field_reassign_with_default)]
+#[cfg(unix)]
+use super::audio_daemon::wait_for_playback_observation;
 use super::audio_daemon::{
     AudioDaemon, CaptureResumeTracker, ConfigChangeDebouncer, METERING_LATENCY_BUDGET_MICROS,
     PIPELINE_RESPONSE_BUDGET_BYTES, PLAYBACK_IDLE_REBUILD_THRESHOLD, PlaybackProgress,
@@ -6,8 +8,6 @@ use super::audio_daemon::{
     join_initial_playback_thread, pipeline_timing_after_config_request,
     rack_plugins_to_linear_graph, reorder_linear_graph, startup_channel_geometry,
 };
-#[cfg(unix)]
-use super::audio_daemon::wait_for_playback_observation;
 use super::audio_daemon::{ClientSlot, clone_client_shutdown_stream, try_acquire_client_slot};
 use super::command::Command;
 use super::configured::configured_output_device_from_value;
@@ -2286,6 +2286,56 @@ mod ipc_safety_tests {
                 .as_deref()
                 .is_some_and(|e| e.contains("requires input_channels or output_channels"))
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn external_rate_change_reconfigures_capture_and_processing_together() {
+        let state = fake_driver_state();
+        let daemon = test_daemon_with_driver(Arc::clone(&state));
+        let start = daemon.handle_command(Command::LoadPlugins {
+            plugins: vec![],
+            input_channels: 2,
+            output_channels: 2,
+        });
+        assert!(start.success, "{start:?}");
+        state.lock().requested_configs.clear();
+        let status = daemon.driver_manager.lock().status();
+        let config = super::super::device_listener::external_rate_request(&status, Some(96_000))
+            .expect("changed rate must produce a request");
+        let response = daemon.apply_external_rate_change(status, config);
+        assert!(response.success, "{response:?}");
+        assert_eq!(state.lock().requested_configs, vec![config]);
+        assert_eq!(
+            daemon.system_state.lock().processing_timing,
+            Some((96_000, 1024))
+        );
+        daemon.manager.lock().stop().unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn external_rate_change_restores_pipeline_when_driver_rejects_it() {
+        let state = fake_driver_state();
+        let daemon = test_daemon_with_driver(Arc::clone(&state));
+        let start = daemon.handle_command(Command::LoadPlugins {
+            plugins: vec![],
+            input_channels: 2,
+            output_channels: 2,
+        });
+        assert!(start.success, "{start:?}");
+        state.lock().fail_next_config = Some("rejected".to_owned());
+        let status = daemon.driver_manager.lock().status();
+        let config = super::super::device_listener::external_rate_request(&status, Some(96_000))
+            .expect("changed rate must produce a request");
+        let response = daemon.apply_external_rate_change(status, config);
+        assert!(!response.success, "{response:?}");
+        assert_eq!(
+            daemon.system_state.lock().processing_timing,
+            Some((48_000, 512))
+        );
+        assert_eq!(state.lock().status.sample_rate, 48_000);
+        daemon.manager.lock().stop().unwrap();
     }
 
     #[test]

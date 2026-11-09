@@ -242,7 +242,9 @@ capture drivers:
   clients receive the pre-processing playback mix through `WriteMix` → local
   loopback ring → `ReadInput`, independently of the daemon capture ring. Both
   streams share the active sample rate and channel geometry and receive format
-  change notifications.
+  change notifications. Physical stream format is read-only; clients change
+  the device nominal rate and wait for the format notification instead of
+  receiving an immediate success for an asynchronously applied change.
 - The Swift loopback uses one interleaved SPSC ring with C11 acquire/release
   frame cursors. A block is published with one release store after every
   channel has been copied, so consumers cannot observe a partially published
@@ -985,6 +987,11 @@ device, channel geometry, sample rate, and buffer size before releasing the
 mute. Its error response carries the restored pipeline generation so the next
 UI intent cannot reuse a stale concurrency token; failure of that restore
 retains the existing explicit `restart_daemon` recovery state.
+
+A settled external change to the physical output's nominal rate uses the same
+transaction, including a daemon-originated capture-driver configuration request.
+This keeps virtual capture and processing at the same rate, with rollback on
+failure, rather than treating the physical device event as a HAL acknowledgement.
 
 ## Installation And Upgrade Lifecycle
 

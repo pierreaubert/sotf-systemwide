@@ -1343,7 +1343,6 @@ private func driverIsPropertySettable(_ driver: AudioServerPlugInDriverRef, _ ob
         kSelector_NominalSampleRate,
         kSelector_BufferFrameSize,
         kSelector_VirtualFormat,
-        kSelector_PhysicalFormat,
         kSelector_VolumeScalar,
         kSelector_VolumeDecibels,
         kSelector_Mute,
@@ -1880,7 +1879,14 @@ private func driverSetPropertyData(_ driver: AudioServerPlugInDriverRef, _ objec
         }
         halLog("Queued buffer size request: \(newSize)")
 
-    case kSelector_VirtualFormat, kSelector_PhysicalFormat:
+    case kSelector_PhysicalFormat:
+        // The physical format follows the nominal rate. A format change is
+        // asynchronous, so reporting success here lets clients use it before
+        // the daemon has committed the new geometry. Clients can set the
+        // device's nominal rate and wait for its change notification.
+        return kAudioHardwareIllegalOperationError
+
+    case kSelector_VirtualFormat:
         let asbd = data.load(as: AudioStreamBasicDescription.self)
         let active = state.activeConfiguration()
         let requestedRate: UInt32?
@@ -2466,6 +2472,19 @@ func testHALRecordingProperties() -> Bool {
             }) else { return false }
         }
         for stream in [kInputStreamObjectID, kOutputStreamObjectID] {
+            var physical = AudioObjectPropertyAddress(mSelector: kSelector_PhysicalFormat,
+                                                       mScope: kScope_Global, mElement: 0)
+            var settable = DarwinBoolean(true)
+            guard driverIsPropertySettable(driver, stream, 0, &physical, &settable) == noErr,
+                  !settable.boolValue else { return false }
+            var requested = AudioStreamBasicDescription()
+            requested.mSampleRate = 96_000
+            requested.mChannelsPerFrame = 2
+            let old = DriverState.shared.activeConfiguration()
+            guard driverSetPropertyData(driver, stream, 0, &physical, 0, nil,
+                UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &requested)
+                    == kAudioHardwareIllegalOperationError,
+                  DriverState.shared.activeConfiguration() == old else { return false }
             guard property(stream, kSelector_VirtualFormat, kScope_Global, { bytes, _ in
                 let format = bytes.load(as: AudioStreamBasicDescription.self)
                 let config = DriverState.shared.activeConfiguration()

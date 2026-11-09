@@ -1502,9 +1502,8 @@ impl SystemwideController {
                 // listeners): sample-rate changes made in Audio MIDI Setup
                 // or another host, plus device/default churn. Device
                 // churn only invalidates cached enumeration; a settled
-                // nominal-rate change on the applied output is treated
-                // like a HAL config request so it gets the same
-                // negotiation, acknowledgement, and rollback handling.
+                // nominal-rate change on the applied output runs through
+                // the driver configuration transaction, including rollback.
                 let applied_device = daemon.system_state.lock().applied_output_device();
                 device_listener.watch_output_device(applied_device.as_deref());
                 for event in device_listener.drain_events() {
@@ -1539,15 +1538,13 @@ impl SystemwideController {
                             "Output device nominal sample rate changed externally; reconfiguring to {} Hz",
                             config.sample_rate
                         );
-                        handle_driver_config_change(
-                            &daemon.driver_manager,
-                            &daemon.manager,
-                            &daemon.device_registry,
-                            driver_common::DriverConfigRequest::untracked(config),
-                            &daemon.system_state,
-                            &daemon.running,
-                            &daemon.output_profiles,
-                        );
+                        let response = daemon.apply_external_rate_change(driver_status, config);
+                        if !response.success {
+                            log::error!(
+                                "External sample-rate reconfiguration failed: {}",
+                                response.error.as_deref().unwrap_or("unknown error")
+                            );
+                        }
                     }
                 }
 
@@ -2499,6 +2496,31 @@ impl SystemwideController {
             driver_sample_rate,
             driver_buffer_frames,
             PipelineApplyIntent::EnsurePlaying,
+        )
+    }
+
+    pub(super) fn apply_external_rate_change(
+        &self,
+        driver_status: driver_common::DriverStatus,
+        config: DriverConfig,
+    ) -> Response {
+        let plan = {
+            let state = self.system_state.lock();
+            state.applied_spec().and_then(|spec| {
+                state
+                    .prepare_from_spec(spec, config.channel_count as usize)
+                    .ok()
+            })
+        };
+        let Some(plan) = plan else {
+            return Response::err("No applied pipeline to reconfigure");
+        };
+        self.apply_pipeline_plan_with_driver_config(
+            plan,
+            driver_status,
+            config.sample_rate,
+            config.buffer_frames,
+            PipelineApplyIntent::ReconfigureDriver,
         )
     }
 

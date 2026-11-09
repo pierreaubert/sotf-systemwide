@@ -7,8 +7,8 @@
 //! nominal sample rate ('nsrt'), the system device list ('dev#'), and the
 //! default output device ('dOut'). This module registers those listeners
 //! and forwards coalesced events to the driver config watcher, which
-//! treats an external nominal-rate change like a HAL config request
-//! (debounced, negotiated against the device, acknowledged back).
+//! applies an external nominal-rate change through the driver configuration
+//! transaction (debounced, negotiated against the device, and rolled back on failure).
 //!
 //! Other platforms get an inert stub with the same API. Set
 //! `SOTF_DEVICE_LISTENER=0` to disable registration on macOS as well.
