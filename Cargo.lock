@@ -1302,8 +1302,8 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "gpui-builder"
-version = "0.10.44"
-source = "git+https://github.com/pierreaubert/gpui-toolkit#4469cdce54e82d2e7684b129f0de9ad15a163cda"
+version = "0.11.0"
+source = "git+https://github.com/pierreaubert/gpui-toolkit#6db6047a8d7dfc305a100f960cdadee6ed798e43"
 dependencies = [
  "gpui-pretext",
  "serde",
@@ -1311,16 +1311,16 @@ dependencies = [
 
 [[package]]
 name = "gpui-design"
-version = "0.10.44"
-source = "git+https://github.com/pierreaubert/gpui-toolkit#4469cdce54e82d2e7684b129f0de9ad15a163cda"
+version = "0.11.0"
+source = "git+https://github.com/pierreaubert/gpui-toolkit#6db6047a8d7dfc305a100f960cdadee6ed798e43"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "gpui-pretext"
-version = "0.10.44"
-source = "git+https://github.com/pierreaubert/gpui-toolkit#4469cdce54e82d2e7684b129f0de9ad15a163cda"
+version = "0.11.0"
+source = "git+https://github.com/pierreaubert/gpui-toolkit#6db6047a8d7dfc305a100f960cdadee6ed798e43"
 dependencies = [
  "hashbrown 0.17.1",
  "unicode-bidi",
