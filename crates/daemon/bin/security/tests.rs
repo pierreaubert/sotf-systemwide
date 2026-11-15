@@ -3,12 +3,12 @@ use super::get::encryption_impl;
 use super::get::get_current_uid;
 use super::get::get_hal_key_path;
 use super::get::get_secure_socket_path;
-use super::misc::{
-    MAX_USER_AUDIO_FILE_BYTES, daemon_session_key_path_from_env,
-    hal_session_key_path_from_env, secure_socket_path_from_env, validate_user_load_path,
-};
 #[cfg(unix)]
 use super::misc::ensure_secure_socket_dir;
+use super::misc::{
+    MAX_USER_AUDIO_FILE_BYTES, daemon_session_key_path_from_env, hal_session_key_path_from_env,
+    secure_socket_path_from_env, validate_user_load_path,
+};
 use super::peer_class::classify_peer;
 use super::peer_class::peer_allows_command;
 use super::types::PeerClass;
@@ -468,7 +468,9 @@ fn test_socket_path_respects_override_or_user_runtime() {
         } else {
             assert_eq!(
                 path,
-                PathBuf::from("C:\\ProgramData").join("sotf").join("daemon.sock")
+                PathBuf::from("C:\\ProgramData")
+                    .join("sotf")
+                    .join("daemon.sock")
             );
         }
         return;
@@ -564,13 +566,8 @@ fn test_socket_path_explicit_override_is_absolute() {
     } else {
         "/tmp/sotf-lab-override/daemon.sock"
     };
-    let explicit = secure_socket_path_from_env(
-        Some(OsString::from(explicit_path)),
-        None,
-        None,
-        None,
-        42,
-    );
+    let explicit =
+        secure_socket_path_from_env(Some(OsString::from(explicit_path)), None, None, None, 42);
     assert_eq!(explicit, PathBuf::from(explicit_path));
     assert!(explicit.is_absolute());
 }

@@ -32,6 +32,7 @@ APP_NAME="sotf-systemwide"
 BINARY_NAME="sotf-daemon"
 PACKAGE_NAME="sotf-daemon"
 SERVICE_NAME="sotf-daemon.service"
+SINK_CONF_NAME="10-sotf-virtual-sink.conf"
 DESKTOP_NAME="org.spinorama.sotf-daemon"
 
 # Paths
@@ -249,10 +250,12 @@ install_linuxdeploy() {
 }
 
 run_linuxdeploy() {
+    # NO_STRIP: keep symbols like the .deb binaries (crash reports,
+    # and the artifact floor gate attributes SIMD by symbol name).
     if [ -f /.dockerenv ] || [ ! -e /dev/fuse ]; then
-        APPIMAGE_EXTRACT_AND_RUN=1 "$LINUXDEPLOY_BIN" "$@"
+        NO_STRIP=1 APPIMAGE_EXTRACT_AND_RUN=1 "$LINUXDEPLOY_BIN" "$@"
     else
-        "$LINUXDEPLOY_BIN" "$@"
+        NO_STRIP=1 "$LINUXDEPLOY_BIN" "$@"
     fi
 }
 
@@ -359,6 +362,13 @@ create_tarball() {
     fi
     cp "$ASSETS_DIR/$SERVICE_NAME" "$staging_dir/"
 
+    # PipeWire virtual sink drop-in (installer-provisioned system-audio tap)
+    if [ ! -f "$ASSETS_DIR/$SINK_CONF_NAME" ]; then
+        log_error "Virtual sink config not found: $ASSETS_DIR/$SINK_CONF_NAME"
+        exit 1
+    fi
+    cp "$ASSETS_DIR/$SINK_CONF_NAME" "$staging_dir/"
+
     # Third-party notices, next to the payload like the macOS bundle's
     # Resources directory.
     stage_linux_notices "$staging_dir/share/doc/sotf"
@@ -372,26 +382,37 @@ set -e
 
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
+PW_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pipewire/pipewire.conf.d"
+SINK_CONF="10-sotf-virtual-sink.conf"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ "$1" = "--uninstall" ]; then
     systemctl --user disable --now sotf-daemon.service 2>/dev/null || true
     rm -f "$UNIT_DIR/sotf-daemon.service"
     rm -f "$BIN_DIR/sotf-daemon"
+    # Remove the virtual-sink drop-in only if it is still exactly the
+    # file we shipped; a user-edited copy is theirs to keep/delete.
+    if [ -f "$PW_CONF_DIR/$SINK_CONF" ] && cmp -s "$PW_CONF_DIR/$SINK_CONF" "$SCRIPT_DIR/$SINK_CONF"; then
+        rm -f "$PW_CONF_DIR/$SINK_CONF"
+        echo "Removed $PW_CONF_DIR/$SINK_CONF (restart PipeWire to drop the sink)."
+    fi
     systemctl --user daemon-reload 2>/dev/null || true
     echo "sotf-daemon uninstalled."
     exit 0
 fi
 
-mkdir -p "$BIN_DIR" "$UNIT_DIR"
+mkdir -p "$BIN_DIR" "$UNIT_DIR" "$PW_CONF_DIR"
 
 cp "$SCRIPT_DIR/sotf-daemon" "$BIN_DIR/sotf-daemon"
 chmod +x "$BIN_DIR/sotf-daemon"
 cp "$SCRIPT_DIR/sotf-daemon.service" "$UNIT_DIR/sotf-daemon.service"
+cp "$SCRIPT_DIR/$SINK_CONF" "$PW_CONF_DIR/$SINK_CONF"
 
 systemctl --user daemon-reload 2>/dev/null || true
 echo "sotf-daemon installed to $BIN_DIR/sotf-daemon"
 echo "Enable with: systemctl --user enable --now sotf-daemon.service"
+echo "Then restart PipeWire (systemctl --user restart pipewire.service)"
+echo "and select \"SotF Virtual\" as the system output in sound settings."
 INSTALL_EOF
     chmod +x "$staging_dir/install-daemon.sh"
 
@@ -558,7 +579,8 @@ create_deb() {
     mkdir -p "$deb_dir/DEBIAN"
     mkdir -p "$deb_dir/usr/bin"
     mkdir -p "$deb_dir/usr/lib/systemd/user"
-    mkdir -p "$deb_dir/usr/share/doc/sotf"
+    mkdir -p "$deb_dir/usr/share/pipewire/pipewire.conf.d"
+    mkdir -p "$deb_dir/usr/share/doc/sotf-systemwide"
 
     # Daemon binary
     cp "$BUILD_DIR/$BINARY_NAME" "$deb_dir/usr/bin/sotf-daemon"
@@ -572,11 +594,23 @@ create_deb() {
     cp "$ASSETS_DIR/$SERVICE_NAME" "$deb_dir/usr/lib/systemd/user/$SERVICE_NAME"
     chmod 644 "$deb_dir/usr/lib/systemd/user/$SERVICE_NAME"
 
+    # PipeWire virtual sink (system drop-in; appears after a PipeWire
+    # restart or next login)
+    if [ ! -f "$ASSETS_DIR/$SINK_CONF_NAME" ]; then
+        log_error "Virtual sink config not found: $ASSETS_DIR/$SINK_CONF_NAME"
+        exit 1
+    fi
+    cp "$ASSETS_DIR/$SINK_CONF_NAME" "$deb_dir/usr/share/pipewire/pipewire.conf.d/$SINK_CONF_NAME"
+    chmod 644 "$deb_dir/usr/share/pipewire/pipewire.conf.d/$SINK_CONF_NAME"
+
+    # Strip debug symbols (lintian: unstripped-binary-or-object)
+    strip "$deb_dir/usr/bin/sotf-daemon" || true
+
     # Third-party notices
-    stage_linux_notices "$deb_dir/usr/share/doc/sotf"
+    stage_linux_notices "$deb_dir/usr/share/doc/sotf-systemwide"
 
     # Create copyright file
-    cat > "$deb_dir/usr/share/doc/sotf/copyright" << EOF
+    cat > "$deb_dir/usr/share/doc/sotf-systemwide/copyright" << EOF
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: SotF Systemwide
 Source: https://github.com/pierreaubert/all_of_sotf
@@ -587,14 +621,14 @@ License: GPL-3.0-or-later
 EOF
 
     # Create changelog (minimal)
-    cat > "$deb_dir/usr/share/doc/sotf/changelog" << EOF
+    cat > "$deb_dir/usr/share/doc/sotf-systemwide/changelog" << EOF
 sotf-systemwide (${VERSION}) stable; urgency=medium
 
   * Release ${VERSION}
 
  -- SotF Team <sotf@example.com>  $(date -R)
 EOF
-    gzip -9 -n "$deb_dir/usr/share/doc/sotf/changelog"
+    gzip -9 -n "$deb_dir/usr/share/doc/sotf-systemwide/changelog"
 
     # Calculate installed size (in KB)
     local installed_size
@@ -608,10 +642,10 @@ Section: sound
 Priority: optional
 Architecture: ${deb_arch}
 Installed-Size: ${installed_size}
-Depends: libasound2 (>= 1.0.16)
+Depends: libasound2t64 | libasound2 (>= 1.0.16), libpipewire-0.3-0
 Recommends: pipewire | pulseaudio
 Maintainer: SotF Team <sotf@example.com>
-Homepage: https://github.com/pierreaubert/all_of_sotf
+Homepage: https://github.com/pierreaubert/sotf-systemwide
 Description: System-wide audio processing daemon
  SotF Systemwide captures system audio, runs it through the SOTF plugin
  chain, and outputs to physical devices. External GUIs control it over a

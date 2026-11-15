@@ -909,64 +909,41 @@ pub(super) fn elevate_daemon_thread_to_audio_work(context: &str) {
     }
 }
 
+/// Whether a device *name* may be the physical systemwide output.
+/// Delegates to the shared endpoint classifier in sotf-capture so the
+/// daemon, the engine and the players agree on what is virtual/null
+/// (including Linux names: monitor sources, PipeWire loopbacks, the
+/// ALSA sample discarder). Name-only by necessity at the call sites
+/// that only have a persisted name; id-aware checks should prefer
+/// `AudioDevice::device_class`.
 pub(super) fn is_safe_output_device_name(name: &str) -> bool {
-    let lowercase_name = name.to_ascii_lowercase();
-    ![
-        "sotf",
-        "blackhole",
-        "zoomaudio",
-        "loopback",
-        "virtual",
-        "soundflower",
-        "background music",
-        "audio bridge",
-    ]
-    .iter()
-    .any(|virtual_name| lowercase_name.contains(virtual_name))
+    sotf_audio::devices::classify_device(name, None).is_physical_output_candidate()
 }
 
 pub(super) fn list_audio_devices() -> Result<Vec<serde_json::Value>, String> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-
-    let host = cpal::default_host();
+    // Enumerate through the shared device layer (sotf-capture via
+    // sotf-engine): it dedupes the ALSA PCM aliases cpal reports per
+    // card, clamps software-PCM capability fiction, and classifies
+    // each endpoint. The previous hand-rolled cpal walk returned
+    // ~60 rows on a PipeWire desktop, including the sample discarder.
+    // The fast listing matters: resolution calls this on startup and
+    // shutdown paths, where full supported-config probing takes
+    // seconds on ALSA and would outlive the shutdown window.
+    let outputs = sotf_audio::devices::list_output_devices()?;
     let mut devices = Vec::new();
-
-    if let Some(default_out) = host.default_output_device() {
-        let name = default_out
-            .description()
-            .map(|d| d.name().to_string())
-            .unwrap_or_else(|_| "Unknown".to_string());
-        devices.push(serde_json::json!({
-            "name": name,
-            "is_default": true,
-        }));
-    }
-
-    if let Ok(output_devices) = host.output_devices() {
-        for device in output_devices {
-            let name = device
-                .description()
-                .map(|d| d.name().to_string())
-                .unwrap_or_else(|_| "Unknown".to_string());
-
-            if devices
-                .iter()
-                .any(|d| d["name"] == name && d["is_default"] == true)
-            {
-                continue;
-            }
-
-            let mut device_info = serde_json::json!({
-                "name": name,
-                "is_default": false,
+    {
+        for device in &outputs {
+            let mut info = serde_json::json!({
+                "name": device.name,
+                "is_default": device.is_default,
+                "id": device.device_id,
+                "class": device.device_class().as_str(),
             });
-
-            if let Ok(config) = device.default_output_config() {
-                device_info["channels"] = config.channels().into();
-                device_info["sample_rate"] = config.sample_rate().into();
+            if let Some(config) = &device.default_config {
+                info["channels"] = config.channels.into();
+                info["sample_rate"] = config.sample_rate.into();
             }
-
-            devices.push(device_info);
+            devices.push(info);
         }
     }
 

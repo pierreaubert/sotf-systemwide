@@ -311,12 +311,20 @@ capture drivers:
   start) is also escalated to a restart after two consecutive latched probes:
   reachability alone is not health.
 
-On Linux and Windows the daemon captures through the cpal-backed
-`CpalCaptureDriver` (bounded drop-oldest queue; `SOTF_CAPTURE_DEVICE` selects
-the endpoint, default input otherwise — a PipeWire monitor source on Linux, a
-WASAPI capture or virtual-cable endpoint on Windows). `NullDriver` remains as
-the status-only fallback (`SOTF_SYSTEMWIDE_DRIVER=null`), and tests may select
-the deterministic lab driver.
+On Linux the daemon captures through `PipeWireCaptureDriver`, a
+native PipeWire input stream targeted at the installer-provisioned
+SotF Virtual sink with `stream.capture-sink=true` (bounded
+drop-oldest queue shared with the cpal driver). Through ALSA the
+default input is a microphone, never the system mix, so the
+cpal-backed `CpalCaptureDriver` is guarded: the driver manager
+resolves a monitor/virtual endpoint (or an explicitly opted-in
+microphone via `SOTF_ALLOW_MIC_CAPTURE=1`) and otherwise leaves
+capture inactive with a named log fault instead of feeding the room
+back into the speakers. On Windows the cpal path is unchanged
+(WASAPI capture or virtual-cable endpoint via
+`SOTF_CAPTURE_DEVICE`). `NullDriver` remains as the status-only
+fallback (`SOTF_SYSTEMWIDE_DRIVER=null`), and tests may select the
+deterministic lab driver.
 
 ## Component View
 

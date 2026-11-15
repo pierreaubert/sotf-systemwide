@@ -2,14 +2,30 @@
 #
 # Cargo runs after the aggregate all_of_sotf tree is mounted at /workspace
 # (see scripts/cross-docker.sh), so this image carries only system
-# dependencies plus the Rust toolchain from the rust:bookworm base image.
+# dependencies plus the copied Rust toolchain.
 # One file serves both architectures: the platform is chosen at build time
 # (docker build --platform linux/arm64|linux/amd64).
 #
 # Dependency set mirrors builds/systemwide/Dockerfile.test-linux-arm64,
 # which is what the Linux test gate builds the daemon with.
 
-FROM rust:bookworm
+# Builder stage: Ubuntu 24.04 is the supported glibc floor
+# (linux-2026114.md D1), so system libraries and headers come from
+# noble — including libpipewire-0.3-dev 1.0.5, which Debian bookworm
+# cannot provide for the native PipeWire backend. The Rust toolchain
+# still comes from the rust:bookworm image (copied in below) instead
+# of rustup-init, because large downloads from static.rust-lang.org
+# are truncated on some networks (curl 18) and neither rustup-init
+# nor rustup retries/resumes them sufficiently. Base-image layers
+# arrive through Docker's own resumable pull, and a toolchain built
+# against bookworm glibc runs fine on noble's newer glibc.
+FROM rust:bookworm AS toolchain
+
+FROM ubuntu:24.04 AS builder
+COPY --from=toolchain /usr/local/cargo /usr/local/cargo
+COPY --from=toolchain /usr/local/rustup /usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup
+ENV PATH="/usr/local/cargo/bin:${PATH}"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -23,6 +39,8 @@ RUN apt-get update \
         file \
         git \
         libasound2-dev \
+        libpipewire-0.3-dev \
+        libspa-0.2-dev \
         libclang-dev \
         libsqlite3-dev \
         libssl-dev \
@@ -32,10 +50,10 @@ RUN apt-get update \
         zip \
     && rm -rf /var/lib/apt/lists/*
 
-# rust:bookworm ships the current stable toolchain under its versioned
-# name. Expose it as `stable` via a symlink (rustup discovers toolchains
-# by directory scan) so the workspace rust-toolchain.toml (channel =
-# "stable") resolves to the bundled toolchain with no downloads.
+# The copied toolchain ships under its versioned name. Expose it as
+# `stable` via a symlink (rustup discovers toolchains by directory
+# scan) so the workspace rust-toolchain.toml (channel = "stable")
+# resolves to the bundled toolchain with no downloads.
 ENV RUSTUP_TOOLCHAIN=stable
 RUN set -eu; \
     triple=$(rustc -vV | sed -n 's/^host: //p'); \

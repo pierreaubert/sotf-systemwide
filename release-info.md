@@ -40,6 +40,9 @@ Highlights:
 
 - Same plugin chain and per-device profiles as the SOTF players: pick a
   different output and its stored EQ/DSP is recalled automatically.
+- Linux: the installer adds a "SotF Virtual" PipeWire sink — select it
+  as the system output and your apps play through SotF. The daemon
+  never captures your microphone by mistake.
 - Feedback-safe by construction: virtual/loopback devices can never be
   selected as the physical output, and if your chosen interface is
   unplugged or powered off, playback falls back to a safe physical

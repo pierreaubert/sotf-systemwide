@@ -4,7 +4,15 @@ Workspace (pkg) versions and the daemon crate version are independent: the
 installer is `0.7.x` while `sotf-daemon` is `0.1.x`. The mapping for each
 release is recorded here.
 
-## Unreleased
+## 0.7.20 (daemon 0.1.40)
+
+- Linux systemwide is now usable out of the box: the installer adds a
+  "SotF Virtual" PipeWire sink (select it as the system output), the
+  daemon captures its monitor through a native PipeWire driver, and
+  capture can no longer silently fall back to the microphone or to a
+  null/discarder output while reporting Playing. Linux release
+  binaries are built for x86-64-v2 (Apollo Lake and later) on Ubuntu
+  24.04, fixing SIGILL crashes on Intel CPUs.
 
 ## 0.7.19 (daemon 0.1.39)
 

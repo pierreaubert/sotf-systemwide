@@ -19,6 +19,8 @@ mod cpal_capture;
 mod driver_manager;
 mod ipc_transport;
 mod lock_order;
+#[cfg(all(target_os = "linux", target_env = "gnu", feature = "pipewire-io"))]
+mod pipewire_capture;
 mod plugin_artifact;
 mod security;
 
@@ -67,10 +69,77 @@ use security::{ensure_secure_socket_dir, get_secure_socket_path};
 #[cfg(all(target_os = "macos", feature = "hal"))]
 use security::{get_hal_key_path, get_key_path};
 
+/// Write the SotF Virtual sink drop-in to the user's PipeWire
+/// config when no copy exists in any config directory yet. The sink
+/// only appears after a PipeWire restart, which the daemon never
+/// forces (it would interrupt all desktop audio); the log line
+/// names the command for the user / next login to pick it up.
+#[cfg(all(target_os = "linux", target_env = "gnu", feature = "pipewire-io"))]
+fn provision_virtual_sink_dropin() {
+    const FILE_NAME: &str = "10-sotf-virtual-sink.conf";
+    const CONTENTS: &str = include_str!("../../../builds/linux/10-sotf-virtual-sink.conf");
+
+    // A driver override that is not the PipeWire backend does not
+    // need the sink; leave the user's PipeWire config alone.
+    match std::env::var("SOTF_SYSTEMWIDE_DRIVER") {
+        Ok(choice) => {
+            let choice = choice.trim().to_ascii_lowercase();
+            if matches!(choice.as_str(), "fake" | "lab" | "null" | "cpal") {
+                return;
+            }
+        }
+        Err(_) => {}
+    }
+
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+        });
+    let Some(config_home) = config_home else {
+        return;
+    };
+    let user_path = config_home.join("pipewire/pipewire.conf.d").join(FILE_NAME);
+    let system_path = std::path::Path::new("/usr/share/pipewire/pipewire.conf.d").join(FILE_NAME);
+    let etc_path = std::path::Path::new("/etc/pipewire/pipewire.conf.d").join(FILE_NAME);
+    if user_path.exists() || system_path.exists() || etc_path.exists() {
+        return;
+    }
+    let Some(parent) = user_path.parent() else {
+        return;
+    };
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        log::warn!("[Daemon] Cannot create {}: {error}", parent.display());
+        return;
+    }
+    match std::fs::write(&user_path, CONTENTS) {
+        Ok(()) => log::info!(
+            "[Daemon] Installed SotF Virtual sink config at {}; run \
+             `systemctl --user restart pipewire.service` (or log in again) \
+             and select \"SotF Virtual\" as the system output",
+            user_path.display()
+        ),
+        Err(error) => {
+            log::warn!("[Daemon] Cannot write {}: {error}", user_path.display());
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
+
+    // Silence alsa-lib's stderr probe spew before any cpal
+    // enumeration (SOTF_ALSA_VERBOSE=1 restores it).
+    #[cfg(target_os = "linux")]
+    sotf_audio::devices::install_alsa_error_handler();
+
+    // Provision the SotF Virtual PipeWire sink on first start (the
+    // .deb installs the same file system-wide; AppImage/tarball
+    // installs rely on this). Never overwrites an existing file.
+    #[cfg(all(target_os = "linux", target_env = "gnu", feature = "pipewire-io"))]
+    provision_virtual_sink_dropin();
 
     // The accept loop runs on this thread; keep it at audio-work priority so
     // IPC control and metering stay responsive under load. Engine audio

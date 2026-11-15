@@ -5,6 +5,8 @@
 //! and Windows, uses the `cpal`-backed capture driver (PipeWire monitor /
 //! WASAPI capture). Falls back to NullDriver when no driver is available.
 
+#[cfg(any(target_os = "linux", test))]
+use crate::cpal_capture::CaptureSelection;
 use crate::cpal_capture::CpalCaptureDriver;
 use driver_common::{AudioDriver, ConfigResult, DriverConfig, DriverError, DriverStatus};
 use sotf_audio::SinkType;
@@ -224,6 +226,13 @@ fn create_platform_driver_for_choice(choice: Option<&str>) -> Box<dyn AudioDrive
             log::info!("[DriverManager] Forcing cpal capture driver via {DRIVER_OVERRIDE_ENV}");
             return Box::new(CpalCaptureDriver::new());
         }
+        #[cfg(all(target_os = "linux", target_env = "gnu", feature = "pipewire-io"))]
+        Some(choice) if choice == "pipewire" => {
+            log::info!(
+                "[DriverManager] Forcing native PipeWire capture driver via {DRIVER_OVERRIDE_ENV}"
+            );
+            return Box::new(crate::pipewire_capture::PipeWireCaptureDriver::new());
+        }
         Some(choice) if !choice.is_empty() => {
             log::warn!(
                 "[DriverManager] Ignoring unknown {}={}",
@@ -240,10 +249,36 @@ fn create_platform_driver_for_choice(choice: Option<&str>) -> Box<dyn AudioDrive
         return Box::new(driver_hal::HalDriver::new());
     }
 
-    // Linux/Windows capture through cpal input streams (PipeWire monitor /
-    // WASAPI capture). The driver degrades to installed=false when no input
+    // Linux: the native PipeWire driver captures the SotF Virtual
+    // sink's monitor directly (the only way to tap the system mix;
+    // through ALSA the default input is a microphone). It degrades
+    // to inactive when PipeWire or the sink is unavailable.
+    #[cfg(all(target_os = "linux", target_env = "gnu", feature = "pipewire-io"))]
+    {
+        log::info!("[DriverManager] Creating native PipeWire capture driver");
+        return Box::new(crate::pipewire_capture::PipeWireCaptureDriver::new());
+    }
+
+    // Linux without the native backend: resolve a system-audio
+    // capture endpoint first. The cpal default input on a stock
+    // PipeWire desktop is a microphone, and capturing it would feed
+    // the room back into the speakers while reporting Playing; the
+    // resolver only hands the driver a monitor/virtual source (or an
+    // explicitly opted-in microphone).
+    #[cfg(all(
+        target_os = "linux",
+        any(not(target_env = "gnu"), not(feature = "pipewire-io"))
+    ))]
+    {
+        let selection = resolve_linux_capture_selection();
+        log::info!("[DriverManager] Creating cpal capture driver (selection: {selection:?})");
+        return Box::new(CpalCaptureDriver::with_selection(selection));
+    }
+
+    // Windows capture through cpal input streams (WASAPI capture).
+    // The driver degrades to installed=false when no input
     // device exists, so headless machines keep status-only behavior.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(target_os = "windows")]
     {
         log::info!("[DriverManager] Creating cpal capture driver");
         return Box::new(CpalCaptureDriver::new());
@@ -253,6 +288,104 @@ fn create_platform_driver_for_choice(choice: Option<&str>) -> Box<dyn AudioDrive
     {
         log::info!("[DriverManager] No platform driver available, using NullDriver");
         Box::new(driver_common::NullDriver::new())
+    }
+}
+
+/// Opt-in for capturing a physical microphone as the systemwide
+/// source. Off by default because mic -> processing -> speakers is
+/// an acoustic feedback path, not a system-audio tap.
+#[cfg(target_os = "linux")]
+const ALLOW_MIC_CAPTURE_ENV: &str = "SOTF_ALLOW_MIC_CAPTURE";
+
+/// Decide the Linux capture endpoint from enumerated inputs.
+/// `candidates` are (display name, stable id, endpoint class).
+#[cfg(target_os = "linux")]
+fn pick_capture_candidate(
+    candidates: &[(String, Option<String>, sotf_audio::devices::DeviceClass)],
+    explicit: Option<&str>,
+    allow_mic: bool,
+) -> CaptureSelection {
+    use sotf_audio::devices::DeviceClass;
+
+    if let Some(wanted) = explicit.filter(|name| !name.trim().is_empty()) {
+        let needle = wanted.to_ascii_lowercase();
+        let found = candidates
+            .iter()
+            .find(|(name, _, _)| name == wanted)
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|(name, _, _)| name.to_ascii_lowercase().contains(&needle))
+            })
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|(_, id, _)| id.as_deref().is_some_and(|id| id == wanted))
+            });
+        return match found {
+            Some((name, _, DeviceClass::Null)) => CaptureSelection::Inactive(format!(
+                "capture device '{name}' is a null/discarder endpoint and cannot                  capture system audio; select a monitor/virtual source instead"
+            )),
+            Some((name, _, DeviceClass::Physical)) if !allow_mic => {
+                CaptureSelection::Inactive(format!(
+                    "capture device '{name}' is a physical microphone input;                      systemwide would feed the room back into the speakers.                      Select a monitor/virtual source, or set                      {ALLOW_MIC_CAPTURE_ENV}=1 to use it anyway"
+                ))
+            }
+            Some((name, _, _)) => CaptureSelection::Device(name.clone()),
+            // Keep the historical not-found error from the driver.
+            None => CaptureSelection::Device(wanted.to_string()),
+        };
+    }
+
+    let virtuals: Vec<&(String, Option<String>, DeviceClass)> = candidates
+        .iter()
+        .filter(|(_, _, class)| *class == DeviceClass::Virtual)
+        .collect();
+    if let Some((name, _, _)) = virtuals
+        .iter()
+        .find(|(name, _, _)| name.to_ascii_lowercase().contains("sotf"))
+        .or_else(|| virtuals.first())
+    {
+        return CaptureSelection::Device(name.clone());
+    }
+    if allow_mic {
+        return CaptureSelection::Legacy;
+    }
+    CaptureSelection::Inactive(
+        "no system-audio capture source found (no monitor/virtual input).          The installer adds the SotF Virtual PipeWire sink; after installing          it, restart PipeWire (systemctl --user restart pipewire.service)          so its monitor source appears, or set SOTF_CAPTURE_DEVICE to a          monitor source."
+            .to_string(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_capture_selection() -> CaptureSelection {
+    let explicit = std::env::var(crate::cpal_capture::CAPTURE_DEVICE_ENV).ok();
+    let allow_mic = std::env::var(ALLOW_MIC_CAPTURE_ENV).is_ok_and(|value| value == "1");
+    match sotf_audio::devices::list_input_devices() {
+        Ok(inputs) => {
+            let candidates: Vec<(String, Option<String>, sotf_audio::devices::DeviceClass)> =
+                inputs
+                    .iter()
+                    .map(|device| {
+                        (
+                            device.name.clone(),
+                            device.device_id.clone(),
+                            device.device_class(),
+                        )
+                    })
+                    .collect();
+            pick_capture_candidate(&candidates, explicit.as_deref(), allow_mic)
+        }
+        Err(error) => {
+            log::warn!("[DriverManager] Capture device enumeration failed: {error}");
+            // Enumeration failure must not silently degrade to the
+            // default microphone either.
+            if allow_mic {
+                CaptureSelection::Legacy
+            } else {
+                CaptureSelection::Inactive(format!("cannot enumerate capture devices: {error}"))
+            }
+        }
     }
 }
 
@@ -659,5 +792,80 @@ mod tests {
 
         assert_eq!(status.driver_name, "None");
         assert!(!status.platform_supported);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod capture_pick_tests {
+    use super::pick_capture_candidate;
+    use crate::cpal_capture::CaptureSelection;
+    use sotf_audio::devices::DeviceClass;
+
+    fn candidates() -> Vec<(String, Option<String>, DeviceClass)> {
+        vec![
+            (
+                "USB Audio Front Microphone".to_string(),
+                Some("alsa:plughw:CARD=0,DEV=0".to_string()),
+                DeviceClass::Physical,
+            ),
+            (
+                "Monitor of USB Audio Speakers".to_string(),
+                Some("alsa:pulse".to_string()),
+                DeviceClass::Virtual,
+            ),
+            (
+                "SotF Virtual".to_string(),
+                Some("alsa:pipewire".to_string()),
+                DeviceClass::Virtual,
+            ),
+        ]
+    }
+
+    #[test]
+    fn auto_pick_prefers_sotf_virtual_monitor() {
+        assert_eq!(
+            pick_capture_candidate(&candidates(), None, false),
+            CaptureSelection::Device("SotF Virtual".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_pick_without_monitor_is_inactive_not_microphone() {
+        let only_mic = &candidates()[..1];
+        match pick_capture_candidate(only_mic, None, false) {
+            CaptureSelection::Inactive(reason) => {
+                assert!(
+                    reason.contains("no system-audio capture source"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected Inactive, got {other:?}"),
+        }
+        assert_eq!(
+            pick_capture_candidate(only_mic, None, true),
+            CaptureSelection::Legacy
+        );
+    }
+
+    #[test]
+    fn explicit_microphone_requires_opt_in() {
+        match pick_capture_candidate(&candidates(), Some("USB Audio Front Microphone"), false) {
+            CaptureSelection::Inactive(reason) => {
+                assert!(reason.contains("SOTF_ALLOW_MIC_CAPTURE=1"), "{reason}");
+            }
+            other => panic!("expected Inactive, got {other:?}"),
+        }
+        assert_eq!(
+            pick_capture_candidate(&candidates(), Some("USB Audio Front Microphone"), true),
+            CaptureSelection::Device("USB Audio Front Microphone".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_unknown_device_keeps_driver_not_found_error() {
+        assert_eq!(
+            pick_capture_candidate(&candidates(), Some("no such thing"), false),
+            CaptureSelection::Device("no such thing".to_string())
+        );
     }
 }
