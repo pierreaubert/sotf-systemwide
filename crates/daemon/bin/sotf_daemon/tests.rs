@@ -155,6 +155,35 @@ fn progress_tracks_stages_and_distinguishes_stall_from_delayed_observation() {
 }
 
 #[test]
+fn progress_detects_no_clock_callback_storm() {
+    // Null/discarder sink signature from the live probe: millions of
+    // callbacks, ~zero frames written. A real 48 kHz device at a
+    // 64-frame quantum makes 750 callbacks/s with frames tracking.
+    let started = std::time::Instant::now();
+    let mut progress = PlaybackProgress::default();
+    let mut engine = sotf_audio::AudioEngineState::default();
+    progress.observe(started, 1, true, &engine);
+
+    engine.playback_callback_count = 2_000_000;
+    engine.playback_frames_written = 942;
+    let later = started + std::time::Duration::from_secs(3);
+    progress.observe(later, 1, true, &engine);
+    assert!(progress.callback_storm(later));
+
+    // Healthy device: callbacks and written frames advance together.
+    let mut healthy = PlaybackProgress::default();
+    let mut engine = sotf_audio::AudioEngineState::default();
+    healthy.observe(started, 1, true, &engine);
+    engine.playback_callback_count = 2_250;
+    engine.playback_frames_written = 144_000;
+    healthy.observe(later, 1, true, &engine);
+    assert!(!healthy.callback_storm(later));
+
+    // Too early to judge.
+    assert!(!progress.callback_storm(started + std::time::Duration::from_secs(1)));
+}
+
+#[test]
 fn progress_cannot_reuse_prior_pause_generation_or_stream_epoch_activity() {
     let now = std::time::Instant::now();
     let mut progress = PlaybackProgress::default();

@@ -1,6 +1,6 @@
 [Unit]
 Description=SotF systemwide audio daemon
-After=pipewire.service wireplumber.service
+After=pipewire.service wireplumber.service pipewire-pulse.service
 Wants=pipewire.service
 
 [Service]

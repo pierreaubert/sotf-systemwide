@@ -62,10 +62,14 @@ fails.
 ### Platform support
 
 - **macOS**: Full support via CoreAudio HAL driver (`--features hal`)
-- **Linux**: The daemon captures through the cpal-backed driver
-  (`CpalCaptureDriver`, bounded drop-oldest queue; `SOTF_CAPTURE_DEVICE`
-  selects the endpoint, default input otherwise — typically a PipeWire
-  monitor source). `NullDriver` remains the status-only fallback.
+- **Linux**: The installer adds a "SotF Virtual" PipeWire sink
+  (`10-sotf-virtual-sink.conf`); select it as the system output and the
+  daemon captures its monitor through the native PipeWire driver,
+  processes it, and plays to the output chosen in SotF. The cpal
+  capture driver remains available (`SOTF_SYSTEMWIDE_DRIVER=cpal`) for
+  ALSA-only setups with an explicit `SOTF_CAPTURE_DEVICE`. The daemon
+  never captures the default microphone by mistake: with no monitor
+  source available it stays inactive and says why in the log. `NullDriver` remains the status-only fallback.
 - **Windows**: Same cpal capture path (WASAPI capture endpoint). Render-
   endpoint loopback is not exposed via cpal, so system-audio capture needs
   a virtual-cable device selected with `SOTF_CAPTURE_DEVICE`.

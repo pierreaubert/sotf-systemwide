@@ -433,7 +433,8 @@ fn systemwide_app_icon_uses_configbar_svg_source() {
 
 #[test]
 fn configbar_output_device_refresh_tracks_channel_limits() {
-    let configbar = include_str!("../../../swift/configbar/src/ConfigBar.swift").replace("\r\n", "\n");
+    let configbar =
+        include_str!("../../../swift/configbar/src/ConfigBar.swift").replace("\r\n", "\n");
     let configbar_pure =
         include_str!("../../../swift/configbar/src/ConfigBarPure.swift").replace("\r\n", "\n");
     let rack =

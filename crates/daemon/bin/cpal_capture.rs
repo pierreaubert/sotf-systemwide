@@ -3,8 +3,13 @@
 //! This is the capture path for Linux and Windows, where no privileged
 //! system-audio tap exists like the macOS CoreAudio HAL driver:
 //!
-//! - Linux: `cpal` opens the default (or `SOTF_CAPTURE_DEVICE`-selected) input,
-//!   which on PipeWire/PulseAudio setups is typically a monitor source.
+//! - Linux: `cpal` opens the input the driver manager resolved (a
+//!   monitor/virtual source, an explicit `SOTF_CAPTURE_DEVICE`, or —
+//!   only under `SOTF_SYSTEMWIDE_DRIVER=cpal` — the legacy default
+//!   input). The default input on a stock PipeWire desktop is a
+//!   microphone, never the system mix, so unguarded default capture
+//!   would feed the room back into the speakers; see
+//!   [`CaptureSelection`].
 //! - Windows: `cpal` opens the WASAPI default input (or selected endpoint).
 //!   WASAPI render-endpoint loopback is not exposed through `cpal`, so
 //!   system-audio capture needs a virtual-cable/monitor device named via
@@ -116,7 +121,29 @@ struct CaptureState {
 /// `cpal`-backed [`AudioDriver`] for Linux/Windows (/macOS without HAL).
 ///
 /// See the module docs for the platform mapping and queue discipline.
+/// How the capture endpoint was chosen for this driver instance.
+///
+/// The driver manager resolves system-audio safety (monitor/virtual
+/// source vs physical microphone) before construction; this driver
+/// only executes the decision so the file stays free of daemon
+/// policy and shared-device-layer dependencies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureSelection {
+    /// Historical behavior: `SOTF_CAPTURE_DEVICE` or the default
+    /// input. Used for the explicit `SOTF_SYSTEMWIDE_DRIVER=cpal`
+    /// escape hatch and non-Linux platforms.
+    Legacy,
+    /// Capture from exactly this enumerated device name.
+    Device(String),
+    /// Do not capture: no system-audio endpoint is available. The
+    /// string is the user-facing reason, logged at startup; status
+    /// reports the driver as not installed instead of capturing a
+    /// microphone by mistake.
+    Inactive(String),
+}
+
 pub struct CpalCaptureDriver {
+    selection: CaptureSelection,
     state: Arc<Mutex<CaptureState>>,
     queue: Arc<CaptureQueue>,
     queue_capacity_samples: Arc<AtomicUsize>,
@@ -141,7 +168,13 @@ impl std::fmt::Debug for CpalCaptureDriver {
 impl CpalCaptureDriver {
     /// Create an uninitialized driver with device-default format wants.
     pub fn new() -> Self {
+        Self::with_selection(CaptureSelection::Legacy)
+    }
+
+    /// Create a driver bound to a manager-resolved endpoint decision.
+    pub fn with_selection(selection: CaptureSelection) -> Self {
         Self {
+            selection,
             state: Arc::new(Mutex::new(CaptureState {
                 initialized: false,
                 engine_ready: false,
@@ -256,7 +289,7 @@ impl CaptureInput for CpalCaptureReader {
 
 /// Push converted samples, dropping the oldest on overflow (shared by the
 /// realtime callback and the test seam so both obey one discipline).
-fn push_samples(
+pub(crate) fn push_samples(
     queue: &Arc<CaptureQueue>,
     capacity: &Arc<AtomicUsize>,
     drops: &Arc<AtomicU64>,
@@ -307,7 +340,7 @@ fn push_samples(
 /// Writes exactly `frames * channels` samples and never touches the
 /// partial-frame tail; returns the frame count. An empty queue (underrun)
 /// returns `0` and leaves `buffer` untouched.
-fn drain_frames(queue: &CaptureQueue, channels: usize, buffer: &mut [f32]) -> usize {
+pub(crate) fn drain_frames(queue: &CaptureQueue, channels: usize, buffer: &mut [f32]) -> usize {
     let channels = channels.max(1);
     let complete_samples = buffer.len() - (buffer.len() % channels);
     if complete_samples == 0 {
@@ -460,7 +493,7 @@ fn build_stream(
 }
 
 /// Validate a configuration request; `0` keeps the current value.
-fn validate_config(config: DriverConfig) -> Result<(), DriverError> {
+pub(crate) fn validate_config(config: DriverConfig) -> Result<(), DriverError> {
     if config.sample_rate != 0 && !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&config.sample_rate)
     {
         return Err(DriverError::invalid_config(
@@ -499,23 +532,42 @@ impl AudioDriver for CpalCaptureDriver {
         if self.state.lock().initialized {
             return Ok(());
         }
+        if let CaptureSelection::Inactive(reason) = &self.selection {
+            log::error!("[CpalCapture] Capture inactive: {reason}");
+            self.state.lock().initialized = true;
+            return Ok(());
+        }
         let host = cpal::default_host();
-        let wanted_device = std::env::var(CAPTURE_DEVICE_ENV)
-            .ok()
-            .filter(|name| !name.trim().is_empty());
+        let wanted_device = match &self.selection {
+            CaptureSelection::Device(name) => Some(name.clone()),
+            _ => std::env::var(CAPTURE_DEVICE_ENV)
+                .ok()
+                .filter(|name| !name.trim().is_empty()),
+        };
 
         let device = match wanted_device {
             Some(wanted) => {
                 let needle = wanted.to_ascii_lowercase();
                 let found = host.input_devices().ok().and_then(|devices| {
-                    devices
+                    let named: Vec<_> = devices
                         .filter_map(|device| {
                             device
                                 .description()
                                 .ok()
                                 .map(|description| (device, description.name().to_string()))
                         })
-                        .find(|(_, name)| name.to_ascii_lowercase().contains(&needle))
+                        .collect();
+                    // Exact enumerated name wins so a resolved device
+                    // cannot be shadowed by an earlier substring match.
+                    named
+                        .iter()
+                        .position(|(_, name)| name == &wanted)
+                        .or_else(|| {
+                            named
+                                .iter()
+                                .position(|(_, name)| name.to_ascii_lowercase().contains(&needle))
+                        })
+                        .and_then(|index| named.into_iter().nth(index))
                         .map(|(device, _)| device)
                 });
                 match found {

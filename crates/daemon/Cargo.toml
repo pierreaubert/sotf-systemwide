@@ -1,7 +1,7 @@
 [package]
 name = "sotf-daemon"
 description = "an audio player and recorder that support audio plugins"
-version = "0.1.39"
+version = "0.1.40"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,7 +9,11 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = []
+default = ["pipewire-io"]
+# Native PipeWire system-audio capture (Linux in effect; the deps
+# below are target-gated, so enabling this off Linux is a no-op).
+# Building on Linux requires libpipewire-0.3-dev.
+pipewire-io = ["dep:pipewire", "dep:libspa", "dep:libspa-sys"]
 hal = ["driver-hal", "sotf-plugins/hal", "sotf-engine/hal"]
 asio = ["sotf-engine/asio"]
 # Explicit opt-in for the device-free end-to-end measurement executable.
@@ -36,6 +40,16 @@ ctrlc = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 cpal = { workspace = true }
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+# Native PipeWire capture (pipewire_capture.rs). The 0.8 series
+# matches the PipeWire 1.0 runtime in Ubuntu 24.04, the supported
+# floor. Optional behind the pipewire-io feature (on by default).
+# glibc only: static musl builds cannot link libpipewire and keep
+# the cpal/ALSA capture path.
+pipewire = { version = "0.8", optional = true }
+libspa = { version = "0.8", optional = true }
+libspa-sys = { version = "0.8", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

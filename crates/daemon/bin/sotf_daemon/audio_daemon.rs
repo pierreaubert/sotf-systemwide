@@ -611,6 +611,25 @@ impl PlaybackProgress {
         }
     }
 
+    /// True when the output callback is spinning without an audio
+    /// clock: a null/discarder sink consumes buffers as fast as the
+    /// CPU hands them over (millions of callbacks, ~no frames
+    /// written), where a real device paces callbacks by its hardware
+    /// clock. Thresholds are deliberately far outside any real
+    /// device's behavior (a 48 kHz/64-frame device peaks at 750
+    /// callbacks/s with frames written tracking callbacks).
+    pub(super) fn callback_storm(&self, now: Instant) -> bool {
+        let Some(elapsed) = Self::age(now, self.started) else {
+            return false;
+        };
+        if elapsed < Duration::from_secs(2) {
+            return false;
+        }
+        let callbacks = self.counters[1];
+        let written = self.counters[2];
+        callbacks > 100_000 && written.saturating_mul(100) < callbacks
+    }
+
     fn snapshot(&self, now: Instant, generation: u64, epoch: u64, output_generation: u64) -> Value {
         let millis =
             |time| Self::age(now, time).map(|age| age.as_millis().min(u64::MAX as u128) as u64);
@@ -964,6 +983,29 @@ impl SystemwideController {
                 1,
             ) == "fresh"
         };
+        // No-clock output (null/discarder sink): callbacks spin at
+        // CPU speed while no frames are written. That is never a
+        // healthy physical device; withdraw readiness and record the
+        // recovery instead of reporting Playing into the void.
+        if streaming == sotf_audio::manager::StreamingState::Playing {
+            let storm = self.playback_progress.lock().callback_storm(now);
+            if storm {
+                self.driver_manager.lock().set_engine_ready(false);
+                let mut state = self.system_state.lock();
+                if state.pipeline_recovery().is_none() {
+                    state.mark_pipeline_recovery(format!(
+                        "Output device '{}' has no audio clock ({} callbacks with {} frames written);                          it looks like a null/discarder sink — select a physical output device",
+                        engine
+                            .playback_output_device
+                            .clone()
+                            .unwrap_or_else(|| "<unknown>".to_string()),
+                        engine.playback_callback_count,
+                        engine.playback_frames_written,
+                    ));
+                }
+                return;
+            }
+        }
         let progressed = previous.is_some_and(|(epoch, stream, callbacks)| {
             epoch == generation
                 && stream == engine.playback_output_generation

@@ -427,6 +427,37 @@ fetch_remote() {
 # POST: VERIFY + CHECKSUMS + SUMMARY
 # -----------------------------------------------------------------------
 
+# Instruction/glibc floor gate for shipped Linux artifacts
+# (x86-64-v2 / Apollo Lake, GLIBC <= 2.39 / Ubuntu 24.04; sotf#246).
+# The checker lives at the aggregate root (../../scripts from here);
+# release builds always run inside the aggregate tree. Hard gate: a
+# missing checker fails the release rather than skipping the check.
+verify_linux_artifact_floors() {
+    local checker="$PROJECT_ROOT/../scripts/check-linux-artifact.sh"
+    if [ ! -x "$checker" ]; then
+        sotf_log_error "Linux artifact floor checker not found: $checker"
+        record_result "FAIL Linux artifact floors (checker missing)"
+        return 1
+    fi
+    local linux_artifacts=() artifact
+    while IFS= read -r artifact; do
+        case "$artifact" in *linux*|*.deb) linux_artifacts+=("$DIST_DIR/$artifact") ;; esac
+    done <<EOF
+$(expected_artifacts)
+EOF
+    if [ "${#linux_artifacts[@]}" -eq 0 ]; then
+        sotf_log_error "No Linux artifacts among expected artifacts"
+        record_result "FAIL Linux artifact floors (none expected)"
+        return 1
+    fi
+    if ! "$checker" "${linux_artifacts[@]}"; then
+        record_result "FAIL Linux artifact floors"
+        return 1
+    fi
+    record_result "PASS Linux artifact floors"
+    return 0
+}
+
 post_steps() {
     log_phase "Verify artifacts + checksums"
     local missing=0 artifact
@@ -446,6 +477,9 @@ EOF
 
     if [ "$missing" -gt 0 ] && ! $DRY_RUN; then
         record_result "FAIL $missing expected artifact(s) missing"
+        return 1
+    fi
+    if ! $DRY_RUN && ! verify_linux_artifact_floors; then
         return 1
     fi
     if $DRY_RUN; then
