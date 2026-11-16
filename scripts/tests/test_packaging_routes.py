@@ -61,7 +61,22 @@ class PackagingRouteTests(unittest.TestCase):
                 version = toolchain.group(1)
                 if version == "stable":
                     self.assertRegex(text, r"(?m)^FROM .*rust:(?:bookworm|stable)")
-                    self.assertIn("stable-aarch64-unknown-linux-gnu/bin/rustc", text)
+                    arch = next(
+                        (
+                            candidate
+                            for candidate in ("aarch64", "x86_64")
+                            if candidate in dockerfile.name
+                        ),
+                        None,
+                    )
+                    if arch is not None:
+                        self.assertIn(
+                            f"stable-{arch}-unknown-linux-gnu/bin/rustc", text
+                        )
+                    else:
+                        self.assertRegex(
+                            text, r"stable-[\w-]+-unknown-linux-gnu/bin/rustc"
+                        )
                 else:
                     base = re.search(r"(?m)^FROM .*rust:([\d.]+)-", text)
                     if base:
@@ -96,6 +111,8 @@ class PackagingRouteTests(unittest.TestCase):
             self.assertTrue((mounted_root / sibling).is_dir(), sibling)
         self.assertIn("FROM --platform=linux/arm64 ubuntu:24.04", dockerfile)
         self.assertIn("libasound2-dev", dockerfile)
+        self.assertIn("libpipewire-0.3-dev", dockerfile)
+        self.assertIn("libspa-0.2-dev", dockerfile)
         version = re.search(r"(?m)^ENV RUSTUP_TOOLCHAIN=(\d+\.\d+\.\d+)\s*$", dockerfile)
         self.assertIsNotNone(version)
         self.assertIn(f"--default-toolchain {version.group(1)}", dockerfile)
